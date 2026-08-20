@@ -15,9 +15,9 @@
     "audit": "npm audit --omit=dev --audit-level=high",
     "lint": "biome lint ./src ./test",
     "typecheck": "tsc --noEmit",
-    "test": "node --test --experimental-test-module-mocks --test-force-exit test/*.test.ts",
-    "test:cov": "node --test --experimental-test-module-mocks --experimental-test-coverage --test-coverage-exclude='test/**' --test-coverage-lines=75 --test-coverage-branches=72 --test-coverage-functions=75 --test-force-exit test/*.test.ts",
-    "ci": "npm run lint && npm run typecheck && npm run test:cov"
+    "test": "node --test --experimental-test-module-mocks test/*.test.ts",
+    "test:cov": "node --test --experimental-test-module-mocks --experimental-test-coverage --test-coverage-exclude='test/**' --test-coverage-lines=75 --test-coverage-branches=72 --test-coverage-functions=75 test/*.test.ts",
+    "ci": "npm run lint && npm run typecheck && tools/test-with-floor.sh npm run test:cov"
   },
   "engines": {
     "node": ">=24"
