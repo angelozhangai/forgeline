@@ -1,8 +1,7 @@
 import { readFileSync, existsSync } from 'node:fs';
-import { resolve } from 'node:path';
 import YAML from 'yaml';
 import { z } from 'zod';
-import { CONFIG_DIR, ENV_FILE } from './root.ts';
+import { configFile, ENV_FILE } from './root.ts';
 import { DEFAULT_PROJECT_ID } from './project.ts';
 import { AUTONOMY_MAX_LEVEL } from './statemachine/autonomyPolicy.ts';
 
@@ -382,7 +381,7 @@ export const ProjectsSchema = z
   });
 
 function loadYaml<T>(name: string, schema: z.ZodType<T>): T {
-  const p = resolve(CONFIG_DIR, name);
+  const p = configFile(name);
   let raw: unknown;
   try {
     raw = YAML.parse(readFileSync(p, 'utf8'));
@@ -431,7 +430,7 @@ export function loadConfig(): Config {
     if (process.env[k]) env[k] = process.env[k];
   }
   // projects.yaml 可选：有则启用多项目注册表，无则单默认项目（配置取自 runtime.yaml）。
-  const projectsPath = resolve(CONFIG_DIR, 'projects.yaml');
+  const projectsPath = configFile('projects.yaml');
   const projects = existsSync(projectsPath) ? loadYaml('projects.yaml', ProjectsSchema) : null;
   cached = {
     runtime: loadYaml('runtime.yaml', RuntimeSchema),

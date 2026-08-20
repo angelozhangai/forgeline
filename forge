@@ -1,7 +1,34 @@
 #!/usr/bin/env bash
 # forge — Forge 入口（通用服务；运行时指向目标项目仓，默认兄弟目录 example-project）。
-# 先载入 config/forge.env（含 FORGE_PROJECT_ROOT / 飞书 webhook，私有 gitignore），再跑。
+# 先载入 forge.env（含 FORGE_PROJECT_ROOT / 飞书 webhook，私有 gitignore），再跑。
+#
+# forge.env 的位置必须与 TS 侧的 ENV_FILE（src/root.ts 的 configFile）一致，否则
+# 「配置搬到了 FORGE_HOME，但 CLI 还在读检出目录里的旧 env」会静默跑错项目。
+# 注意 FORGE_HOME / FORGE_CONFIG_DIR 本身**不能**写在 forge.env 里 —— 是它们决定
+# 去哪儿找 forge.env，鸡生蛋。它们必须来自真实环境（shell / launchd plist）。
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
-if [ -f "$HERE/config/forge.env" ]; then set -a; . "$HERE/config/forge.env"; set +a; fi
+
+config_dir() {
+  if [ -n "${FORGE_CONFIG_DIR:-}" ]; then printf '%s\n' "$FORGE_CONFIG_DIR"; return; fi
+  if [ -n "${FORGE_HOME:-}" ]; then printf '%s\n' "$FORGE_HOME/config"; return; fi
+  printf '%s\n' "$HERE/config"
+}
+
+ENV_FILE="$(config_dir)/forge.env"
+# 逐文件回落，与 configFile 同规则：叠加目录没有 forge.env 就用检出里的那份。
+[ -f "$ENV_FILE" ] || ENV_FILE="$HERE/config/forge.env"
+if [ -f "$ENV_FILE" ]; then
+  # 写在 forge.env 里的这两个变量对「去哪儿找 forge.env」已经太晚，但仍会被 TS 侧
+  # 采纳 —— shell 读了 A 份 env、Node 却按 B 份目录找配置。不静默，直接喊。
+  if grep -qE '^[[:space:]]*(FORGE_HOME|FORGE_CONFIG_DIR)=' "$ENV_FILE"; then
+    echo "forge: $ENV_FILE 里定义了 FORGE_HOME/FORGE_CONFIG_DIR —— 它们决定去哪儿找本文件，" >&2
+    echo "       写在这里为时已晚，会让 shell 与 Node 用上不同的配置目录。请改到 shell/launchd 环境里。" >&2
+  fi
+  set -a
+  # shellcheck source=/dev/null
+  . "$ENV_FILE"
+  set +a
+fi
+
 exec node --no-warnings "$HERE/src/index.ts" "$@"

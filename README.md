@@ -92,6 +92,25 @@ export FORGE_PROMPTS_DIR=/path/to/your/private-prompts
 
 Point it at a private repo checkout and your tuned review methodology stays yours, while tracking this core. Golden evals (`./forge eval`) run against whichever set is active — fixtures in [fixtures/eval/](fixtures/eval/) pin the expected *shape* of gate output so prompt changes can't silently degrade the review.
 
+## Keep the checkout clean (`FORGE_HOME`)
+
+Config, state, and logs default to living **inside** the checkout. That's fine for a quick try, but it means your real `routing.yaml` sits on top of a tracked file — the checkout goes dirty and `git pull` starts conflicting.
+
+`FORGE_HOME` moves all three out, so the core checkout stays read-only and disposable:
+
+```bash
+export FORGE_HOME=/path/to/your/forge-home    # → $FORGE_HOME/{config,state,logs}
+
+# or move them individually (these win over FORGE_HOME):
+export FORGE_CONFIG_DIR=/path/to/config
+export FORGE_STATE_DIR=/var/lib/forge
+export FORGE_LOGS_DIR=/var/log/forge
+```
+
+Config resolves **per file**: a name present in your config dir wins, anything missing falls back to the repo's default in [config/](config/). Override only `routing.yaml` and the other three keep tracking this repo. With none of these set, every path is byte-for-byte what it was before — nothing to migrate.
+
+> ⚠️ The fallback is silent by design. A typo in an overridden filename means you quietly run the repo default, not an error. If you keep a private overlay, have it reconcile its filenames against this repo's `config/` and `prompts/` trees.
+
 ## Repository layout
 
 ```
@@ -99,6 +118,7 @@ src/         statemachine · orchestrator · gates · review engine · llm drive
              messaging port + feishu adapter · daemon · health/watchdog · drift · eval · project adapters
 prompts/     externalized gate templates (override via FORGE_PROMPTS_DIR)
 config/      runtime.yaml · routing.yaml · permissions.yaml · assignment.yaml (+ .example files)
+             per-file fallback target when FORGE_CONFIG_DIR / FORGE_HOME is set
 deploy/      launchd daemon + watchdog + bootstrap/install scripts
 docs/        rationale · overview · control-plane architecture · downstream validation runbook
 fixtures/    golden eval inputs + expected-shape assertions
