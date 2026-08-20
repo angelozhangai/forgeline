@@ -141,3 +141,52 @@ describe('configFile 的逐文件回落', () => {
     assert.equal(r.ENV_FILE, resolve(withEnv, 'forge.env'));
   });
 });
+
+// FORGE_EVAL_FIXTURES_DIR：把 golden 样本整体换成仓外的私有集。
+// 与 config 不同,这里是**替换**不是叠加 —— 混算通过率没有意义。
+describe('golden fixtures 目录接缝', () => {
+  const EXP_TS = pathToFileURL(resolve(import.meta.dirname, '../src/eval/expectations.ts')).href;
+  let n = 0;
+  async function loadExp(value?: string) {
+    const saved = process.env.FORGE_EVAL_FIXTURES_DIR;
+    if (value === undefined) delete process.env.FORGE_EVAL_FIXTURES_DIR;
+    else process.env.FORGE_EVAL_FIXTURES_DIR = value;
+    try {
+      return await import(`${EXP_TS}?eval-dir=${n++}`);
+    } finally {
+      if (saved === undefined) delete process.env.FORGE_EVAL_FIXTURES_DIR;
+      else process.env.FORGE_EVAL_FIXTURES_DIR = saved;
+    }
+  }
+
+  test('未设置：用仓内 fixtures/eval,且那批样本必须真的加载得出来', async () => {
+    const m = await loadExp(undefined);
+    assert.equal(m.EVAL_ROOT, resolve(import.meta.dirname, '../fixtures/eval'));
+    // 仅断言路径等于自己会变成镜像测试;真正的合约是「默认路径能加载出样本」。
+    assert.ok(m.loadFixtures().length > 0, '仓内 golden 样本应当非空');
+  });
+
+  test('设置后整体替换,仓内样本一个都不带进来', async () => {
+    const priv = resolve(tmp, 'private-fixtures');
+    mkdirSync(resolve(priv, 'only-mine'), { recursive: true });
+    writeFileSync(resolve(priv, 'only-mine', 'prd.md'), '# private\n');
+    writeFileSync(
+      resolve(priv, 'only-mine', 'expect.yaml'),
+      'gate: a\ndesc: private-only golden sample\nsize_in: [S, M]\n',
+    );
+    const m = await loadExp(priv);
+    assert.equal(m.EVAL_ROOT, priv);
+    const names = m.loadFixtures().map((f: { name: string }) => f.name);
+    assert.deepEqual(names, ['only-mine']);
+  });
+
+  for (const [label, value] of [
+    ['空串', ''],
+    ['纯空格', '  '],
+  ] as const) {
+    test(`${label}视同未设置 —— 不能把 golden 集指到 cwd`, async () => {
+      const m = await loadExp(value);
+      assert.equal(m.EVAL_ROOT, resolve(import.meta.dirname, '../fixtures/eval'));
+    });
+  }
+});
