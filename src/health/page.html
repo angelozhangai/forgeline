@@ -1,0 +1,297 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>Forge · 状态</title>
+<style>
+  :root {
+    --bg: #0e1116; --panel: #161b22; --panel2: #1c232c; --border: #2b333d;
+    --fg: #e6edf3; --mut: #8b949e; --green: #2ea043; --yellow: #d29922; --red: #da3633;
+    --green-dim: #1a3a26; --yellow-dim: #3a3014; --red-dim: #3a1d1d;
+  }
+  @media (prefers-color-scheme: light) {
+    :root { --bg:#f6f8fa; --panel:#fff; --panel2:#f0f3f6; --border:#d0d7de; --fg:#1f2328; --mut:#636c76;
+            --green-dim:#dafbe1; --yellow-dim:#fff8c5; --red-dim:#ffebe9; }
+  }
+  * { box-sizing: border-box; }
+  body { margin:0; background:var(--bg); color:var(--fg); font:14px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Helvetica,Arial,sans-serif; }
+  .wrap { max-width: 980px; margin: 0 auto; padding: 28px 20px 64px; }
+  h1 { font-size: 18px; margin: 0 0 2px; }
+  .sub { color: var(--mut); font-size: 12px; margin-bottom: 20px; }
+  .banner { border-radius: 12px; padding: 20px 22px; margin-bottom: 22px; display:flex; align-items:center; gap:14px; border:1px solid var(--border); }
+  .banner .dot { width:14px; height:14px; border-radius:50%; flex:0 0 auto; }
+  .banner .big { font-size: 18px; font-weight: 600; }
+  .banner .meta { color: var(--mut); font-size: 12px; margin-top: 2px; }
+  .ok  { background: var(--green-dim); } .ok  .dot { background: var(--green); }
+  .deg { background: var(--yellow-dim); } .deg .dot { background: var(--yellow); }
+  .dn  { background: var(--red-dim); } .dn  .dot { background: var(--red); }
+  .sec { margin: 22px 0 10px; font-size: 12px; text-transform: uppercase; letter-spacing: .06em; color: var(--mut); }
+  .grid { display:grid; grid-template-columns: repeat(auto-fill,minmax(220px,1fr)); gap:10px; }
+  .card { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:12px 14px; }
+  .card .name { display:flex; align-items:center; gap:8px; font-weight:600; }
+  .card .d { color:var(--mut); font-size:12px; margin-top:4px; }
+  .pill { width:9px; height:9px; border-radius:50%; flex:0 0 auto; }
+  .p-healthy{background:var(--green)} .p-degraded{background:var(--yellow)} .p-down{background:var(--red)} .p-na{background:var(--mut)}
+  .bars { display:flex; gap:2px; height:34px; align-items:stretch; margin-top:6px; }
+  .bars i { flex:1 1 0; border-radius:2px; background:var(--green); opacity:.85; }
+  .bars i.degraded{background:var(--yellow)} .bars i.down{background:var(--red)} .bars i.empty{background:var(--border);opacity:.5}
+  .hrow { display:flex; justify-content:space-between; color:var(--mut); font-size:12px; margin-top:6px; }
+  table { width:100%; border-collapse: collapse; font-size:13px; }
+  th,td { text-align:left; padding:7px 10px; border-bottom:1px solid var(--border); }
+  th { color:var(--mut); font-weight:500; font-size:12px; }
+  .tag { display:inline-block; padding:1px 7px; border-radius:20px; font-size:11px; border:1px solid var(--border); }
+  .tag.failed{ background:var(--red-dim); color:var(--red); border-color:transparent; }
+  .tag.awaiting{ background:var(--yellow-dim); color:var(--yellow); border-color:transparent; }
+  .chips { display:flex; flex-wrap:wrap; gap:6px; }
+  .chip { background:var(--panel2); border:1px solid var(--border); border-radius:6px; padding:3px 9px; font-size:12px; }
+  .chip b { font-weight:700; }
+  .muted { color: var(--mut); }
+  .evt { font-size:12px; color:var(--mut); padding:3px 0; }
+  .err { color: var(--red); }
+  footer { margin-top:28px; color:var(--mut); font-size:12px; }
+  a { color: inherit; }
+  tr.srow:hover td { background: var(--panel2); }
+  select { background:var(--panel2); color:var(--fg); border:1px solid var(--border); border-radius:6px; padding:2px 6px; font-size:12px; }
+  #detail { background:var(--panel); border:1px solid var(--border); border-radius:10px; padding:14px 16px; margin-top:12px; }
+  .evtlist { max-height:340px; overflow:auto; }
+  .btn { background:var(--panel2); color:var(--fg); border:1px solid var(--border); border-radius:6px; padding:4px 12px; font-size:13px; cursor:pointer; }
+  .btn:hover { border-color:var(--mut); }
+  .btn.danger { color:var(--red); }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <h1>Forge <span style="color:var(--mut);font-weight:400;font-size:13px">· PRD 评审/技术方案自动化</span></h1>
+  <div class="sub">PRD 评审 → 技术方案 自动化 · 本地状态页 · 每 5s 刷新</div>
+
+  <div id="banner" class="banner deg">
+    <div class="dot"></div>
+    <div><div class="big" id="banner-text">加载中…</div><div class="meta" id="banner-meta"></div></div>
+  </div>
+
+  <div class="sec">组件健康</div>
+  <div class="grid" id="checks"></div>
+
+  <div class="sec">近 72 小时在线率 · <span id="uptime" class="muted"></span></div>
+  <div class="bars" id="bars"></div>
+  <div class="hrow"><span>72h 前</span><span id="incidents"></span><span>现在</span></div>
+
+  <div class="sec">PRD 流水线看板</div>
+  <div class="chips" id="board" style="margin-bottom:12px"></div>
+  <table id="attn-tbl" style="display:none">
+    <thead><tr><th>需求</th><th>状态</th><th>标题</th><th></th></tr></thead>
+    <tbody id="attn"></tbody>
+  </table>
+  <div id="attn-empty" class="muted" style="font-size:13px">无停泊/待决项 🎉</div>
+
+  <div class="sec">全部需求 · <select id="project-filter"><option value="">全部项目</option></select> · <select id="state-filter"><option value="">全部状态</option></select></div>
+  <table id="sessions-tbl" style="display:none">
+    <thead><tr><th>需求</th><th>状态</th><th>标题</th><th>项目</th><th></th></tr></thead>
+    <tbody id="sessions"></tbody>
+  </table>
+  <div id="sessions-empty" class="muted" style="font-size:13px">（无 session）</div>
+  <div id="detail" style="display:none"></div>
+
+  <footer>
+    数据源 <a href="/health">/health</a> · <a href="/api/board">/api/board</a> · <a href="/api/sessions">/api/sessions</a> · <a href="/api/history">/api/history</a>
+    　守护 PID <span id="pid">—</span> · 运行 <span id="uptime2">—</span> · 周期 <span id="cycles">—</span> · 活跃 gate <span id="gates">—</span>
+  </footer>
+</div>
+
+<script>
+const STATE_LABEL = {
+  healthy: '全部正常', degraded: '部分降级', down: '服务异常',
+};
+const STATE_CLASS = { healthy: 'ok', degraded: 'deg', down: 'dn' };
+
+function fmtDur(sec) {
+  if (sec == null) return '—';
+  if (sec < 60) return sec + 's';
+  if (sec < 3600) return Math.floor(sec/60) + 'm';
+  if (sec < 86400) return Math.floor(sec/3600) + 'h' + Math.floor((sec%3600)/60) + 'm';
+  return Math.floor(sec/86400) + 'd' + Math.floor((sec%86400)/3600) + 'h';
+}
+function ago(ts) {
+  if (!ts) return '—';
+  return fmtDur(Math.round((Date.now() - ts)/1000)) + '前';
+}
+function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
+
+async function getJSON(u){ const r = await fetch(u, {cache:'no-store'}); if(!r.ok) throw new Error(u+' '+r.status); return r.json(); }
+
+async function tick() {
+  let h;
+  try { h = await getJSON('/health'); }
+  catch (e) {
+    const b = document.getElementById('banner');
+    b.className = 'banner dn';
+    document.getElementById('banner-text').textContent = '状态页无法连接守护';
+    document.getElementById('banner-meta').textContent = String(e);
+    return;
+  }
+  // banner
+  const b = document.getElementById('banner');
+  b.className = 'banner ' + (STATE_CLASS[h.status] || 'deg');
+  document.getElementById('banner-text').textContent = STATE_LABEL[h.status] || h.status;
+  const wedged = h.daemon.wedged ? ' · ⚠️ 卡死' : '';
+  document.getElementById('banner-meta').textContent =
+    `运行 ${fmtDur(h.uptimeSec)} · 上次周期 ${ago(h.daemon.lastCycleAt)} · liveness ${h.daemon.livenessAgeSec ?? '—'}s 前${wedged}`;
+  // footer
+  document.getElementById('pid').textContent = h.daemon.pid ?? '—';
+  document.getElementById('uptime2').textContent = fmtDur(h.uptimeSec);
+  document.getElementById('cycles').textContent = h.daemon.cycleCount;
+  document.getElementById('gates').textContent = h.daemon.activeGates;
+  // checks
+  document.getElementById('checks').innerHTML = h.checks.map(c => `
+    <div class="card">
+      <div class="name"><span class="pill p-${c.status}"></span>${esc(c.name)}</div>
+      <div class="d">${esc(c.detail)}</div>
+    </div>`).join('');
+
+  // history
+  try {
+    const hist = await getJSON('/api/history?hours=72');
+    renderHistory(hist);
+  } catch {}
+
+  // board（跟随项目过滤：选中项目后看板/需关注也只统计该项目，不再混入他项目）
+  try { await loadBoard(); } catch {}
+
+  // 全部需求列表
+  try { await loadSessions(); } catch {}
+}
+
+async function loadBoard() {
+  const board = await getJSON('/api/board' + (curProject ? '?project=' + encodeURIComponent(curProject) : ''));
+  renderBoard(board);
+}
+
+let curFilter = '';
+let curProject = '';
+let lastStatesKey = '';
+let lastProjectsKey = '';
+async function loadSessions() {
+  const qs = [curProject ? 'project=' + encodeURIComponent(curProject) : '', curFilter ? 'state=' + encodeURIComponent(curFilter) : ''].filter(Boolean).join('&');
+  const data = await getJSON('/api/sessions' + (qs ? '?' + qs : ''));
+  // 状态集变了才重建过滤下拉（免每 5s 打断选择），重建后恢复当前选择
+  const key = (data.states || []).join(',');
+  if (key !== lastStatesKey) {
+    lastStatesKey = key;
+    const sel = document.getElementById('state-filter');
+    sel.innerHTML = '<option value="">全部状态</option>' + (data.states || []).map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
+    sel.value = curFilter;
+  }
+  // 项目集变了才重建项目下拉（始终是全库项目，不随当前过滤收窄）
+  const pkey = (data.projects || []).join(',');
+  if (pkey !== lastProjectsKey) {
+    lastProjectsKey = pkey;
+    const psel = document.getElementById('project-filter');
+    psel.innerHTML = '<option value="">全部项目</option>' + (data.projects || []).map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join('');
+    psel.value = curProject;
+  }
+  renderSessions(data.sessions || []);
+}
+function renderSessions(rows) {
+  const tbl = document.getElementById('sessions-tbl'), empty = document.getElementById('sessions-empty');
+  if (!rows.length) { tbl.style.display = 'none'; empty.style.display = 'block'; return; }
+  tbl.style.display = 'table'; empty.style.display = 'none';
+  document.getElementById('sessions').innerHTML = rows.map(r => `
+    <tr class="srow" data-slug="${esc(r.slug)}" style="cursor:pointer">
+      <td>${esc(r.ref)}</td>
+      <td>${esc(r.label)}${r.autonomy > 0 ? ` <span class="chip" title="项目自治等级">🤖L${r.autonomy}</span>` : ''}</td>
+      <td>${esc(r.title)}</td>
+      <td class="muted">${esc(r.project)}</td>
+      <td class="muted">${ago(r.updatedAt)}</td>
+    </tr>`).join('');
+  document.querySelectorAll('#sessions .srow').forEach(tr => { tr.onclick = () => showDetail(tr.dataset.slug); });
+}
+const ACTION_LABEL = {
+  confirm: '强制通过', gateb: '出技术方案', force_go: '强制立项', go: 'GO 立项', deny: '打回',
+  implement: '起实现', review_pr: '开 PR 复审', merged: '确认已合并', retry: '重试',
+};
+async function postAction(action, slug) {
+  if (!confirm(`确认对 ${slug} 执行「${ACTION_LABEL[action] || action}」？`)) return;
+  let j;
+  try {
+    const r = await fetch('/api/action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, slug }) });
+    j = await r.json();
+  } catch (e) { j = { ok: false, msg: '请求失败：' + String(e) }; }
+  await showDetail(slug);          // 刷新详情（状态/可用按钮已变）
+  const msg = document.getElementById('act-msg');
+  if (msg) { msg.textContent = j.msg || (j.ok ? '已执行' : '失败'); msg.className = j.ok ? 'muted' : 'err'; }
+  loadSessions().catch(() => {});  // 刷新列表
+}
+async function showDetail(slug) {
+  const d = document.getElementById('detail');
+  d.style.display = 'block';
+  d.innerHTML = '<div class="muted">加载中…</div>';
+  try {
+    const x = await getJSON('/api/session?id=' + encodeURIComponent(slug) + (curProject ? '&project=' + encodeURIComponent(curProject) : ''));
+    d.innerHTML = `
+      <div class="sec" style="margin-top:0">${esc(x.ref)} · ${esc(x.title)} <a href="#" id="detail-close" class="muted" style="float:right;font-size:12px">收起 ✕</a></div>
+      <div class="chips" style="margin-bottom:10px">
+        <span class="chip">${esc(x.label)}</span>
+        <span class="chip">项目 ${esc(x.project)}</span>
+        <span class="chip">分支 ${esc(x.branch)}</span>
+        ${x.assignee ? `<span class="chip">DRI ${esc(x.assignee)}</span>` : ''}
+        ${x.size ? `<span class="chip">${esc(x.size)}</span>` : ''}
+        ${x.autonomy > 0 ? `<span class="chip">自治 L${x.autonomy}</span>` : ''}
+        ${x.prUrl ? `<span class="chip"><a href="${esc(x.prUrl)}" target="_blank" rel="noopener">PR ↗</a></span>` : ''}
+        <span class="chip muted">建 ${ago(x.createdAt)} · 更 ${ago(x.updatedAt)}</span>
+      </div>
+      ${(x.actions || []).length ? `<div style="margin:4px 0 8px">${x.actions.map(a => `<button class="btn ${a === 'deny' ? 'danger' : ''}" data-act="${esc(a)}" data-slug="${esc(x.slug)}">${esc(ACTION_LABEL[a] || a)}</button>`).join(' ')}</div>` : ''}
+      <div id="act-msg" class="muted" style="font-size:12px;margin-bottom:8px"></div>
+      <div class="evtlist">${(x.events || []).slice().reverse().map(e => `
+        <div class="evt"><span class="muted">${ago(e.ts)}</span> · <b>${esc(e.kind)}</b>${e.detail ? ` <span class="muted">${esc(String(e.detail).slice(0, 200))}</span>` : ''}</div>`).join('') || '<div class="muted">无事件</div>'}</div>`;
+    document.getElementById('detail-close').onclick = (ev) => { ev.preventDefault(); d.style.display = 'none'; };
+    d.querySelectorAll('.btn[data-act]').forEach(b => { b.onclick = () => postAction(b.dataset.act, b.dataset.slug); });
+    d.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
+  } catch (e) {
+    d.innerHTML = '<div class="err">加载失败：' + esc(String(e)) + '</div>';
+  }
+}
+
+function renderHistory(hist) {
+  document.getElementById('uptime').textContent =
+    `在线 ${hist.uptimePct}% · 正常 ${hist.healthyPct}% · 降级 ${hist.degradedPct}% · 异常 ${hist.downPct}%（${hist.count} 个采样）`;
+  // 72 个时段（每段 1h），落到对应桶取最坏状态
+  const buckets = 72, span = 72*3600*1000, start = hist.now - span;
+  const slot = new Array(buckets).fill('empty');
+  const rank = { healthy:1, degraded:2, down:3, empty:0 };
+  for (const s of hist.samples) {
+    let i = Math.floor((s.ts - start) / (span/buckets));
+    if (i < 0 || i >= buckets) continue;
+    if (rank[s.status] > rank[slot[i]]) slot[i] = s.status;
+  }
+  document.getElementById('bars').innerHTML = slot.map(s =>
+    `<i class="${s==='empty'?'empty':s}" title="${s}"></i>`).join('');
+  const evs = hist.events.slice(-3).map(e => `${e.from}→${e.to}`).join(' · ');
+  document.getElementById('incidents').textContent = hist.events.length ? `${hist.events.length} 次状态翻转` : '无翻转';
+}
+
+function renderBoard(board) {
+  const order = Object.entries(board.byState).sort((a,b)=>b[1]-a[1]);
+  document.getElementById('board').innerHTML = order.length
+    ? order.map(([st,n]) => `<span class="chip">${esc(st)} <b>${n}</b></span>`).join('')
+    : '<span class="muted">（无 session）</span>';
+  const attn = board.attention || [];
+  const tbl = document.getElementById('attn-tbl'), empty = document.getElementById('attn-empty');
+  if (!attn.length) { tbl.style.display='none'; empty.style.display='block'; return; }
+  tbl.style.display='table'; empty.style.display='none';
+  document.getElementById('attn').innerHTML = attn.map(a => `
+    <tr>
+      <td>${esc(a.ref)}</td>
+      <td><span class="tag ${a.kind}">${esc(a.state)}</span></td>
+      <td>${esc(a.title)}</td>
+      <td class="muted">${ago(a.updatedAt)}</td>
+    </tr>`).join('');
+}
+
+document.getElementById('state-filter').addEventListener('change', (e) => { curFilter = e.target.value; loadSessions().catch(() => {}); });
+document.getElementById('project-filter').addEventListener('change', (e) => { curProject = e.target.value; curFilter = ''; document.getElementById('state-filter').value = ''; loadBoard().catch(() => {}); loadSessions().catch(() => {}); });
+tick();
+setInterval(tick, 5000);
+</script>
+</body>
+</html>

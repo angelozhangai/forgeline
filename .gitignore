@@ -1,0 +1,22 @@
+# 依赖/构建/运行期产物
+node_modules/
+dist/
+
+# 状态 + 日志（含 PRD 原文 / LLM transcript，不入库）
+state/
+logs/
+
+# 私有环境（FORGE_PROJECT_ROOT / 飞书 webhook 等）；只提交 *.env.example，换机走仓库外安全迁移
+config/forge.env
+# 多项目注册表：含机器绝对路径（root: /Users/...），同 forge.env 不入库；只提交 *.yaml.example
+config/projects.yaml
+# 周度负载人工校正：主观的按人评分，绝不入库；只提交 *.tsv.example
+config/weekly-overrides.tsv
+
+# 噪声
+.DS_Store
+*.log
+
+# Claude Code 工作树(临时,不入库) + 本机私有设置（只提交共享的 .claude/skills/）
+.claude/worktrees/
+.claude/settings.local.json

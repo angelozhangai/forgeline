@@ -1,0 +1,7 @@
+#!/usr/bin/env bash
+# forge — Forge 入口（通用服务；运行时指向目标项目仓，默认兄弟目录 example-project）。
+# 先载入 config/forge.env（含 FORGE_PROJECT_ROOT / 飞书 webhook，私有 gitignore），再跑。
+set -euo pipefail
+HERE="$(cd "$(dirname "$0")" && pwd)"
+if [ -f "$HERE/config/forge.env" ]; then set -a; . "$HERE/config/forge.env"; set +a; fi
+exec node --no-warnings "$HERE/src/index.ts" "$@"

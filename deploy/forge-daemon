@@ -1,0 +1,14 @@
+#!/bin/zsh
+# Forge — 守护启动器（launchd KeepAlive 调它）：常驻 forge listen（飞书长连接 + 周期 tick + 本地状态页）。
+# plist 直接指向本脚本（非 /bin/zsh），故 macOS「登录项与扩展」后台活动里显示 forge-daemon 而非 zsh。
+# 自定位仓根；补 PATH（launchd 环境极简，缺 node/claude/codex/gh 路径）。
+set -e
+DIR="${0:A:h}"          # 本脚本所在目录 = <repo>/deploy
+SVC="${DIR:h}"          # 仓根 = forge
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.bun/bin:$HOME/.local/bin:$PATH"
+cd "$SVC" || exit 1
+mkdir -p logs
+echo "──── Forge listen 启动 @ $(date '+%Y-%m-%d %H:%M:%S') ────" >> logs/launchd.log
+# caffeinate -is：daemon 运行期间阻止「系统休眠 + 空闲休眠」→ Mac 醒着就一直响应。
+# 注：合盖入包仍会睡（系统级）；醒来后 backfill 把离线期间的群消息补回，不漏需求。
+exec caffeinate -is ./forge listen >> logs/launchd.log 2>&1

@@ -1,0 +1,17 @@
+# 权限闸：闸B 触发 + 一键 GO（真正建 issue/提交）的允许名单（短码，大小写不敏感）
+# 越权尝试 → 记 permission_denied + 提示，session 不前进。
+
+gate_b_allowed: [M, BD]   # 谁能触发闸B（出技术方案）
+go_approvers: [M]         # 谁能一键 GO（建 issue + 提交 tech-design）
+
+# 下游（缺省都回退 go_approvers）：
+gate_c_allowed: [M]       # 谁能触发闸C（在隔离 worktree 实现 + 本地 CI）
+pr_create_approvers: [M]  # 谁能触发开 PR + 闸D（外向写动作，需人工）
+merge_ack_allowed: [M]    # 谁能确认 PR 已人工合并（→ SHIPPED，接漂移闭环）
+
+# 多人用（可选）：飞书 open_id → 短码，让卡片按钮按真实点击人裁决，而非一律当 M。
+# 不配（留空/删掉）= 单人 dogfood，所有卡片操作沿用旧行为（一律视作 M）。
+# 配了但某 open_id 不在表里 = 该点击人落不进任何允许名单 → 权限校验自然拒绝（绝不冒充 M 提权）。
+# operators:
+#   ou_xxxxxxxxxxxxxxxx: M
+#   ou_yyyyyyyyyyyyyyyy: BD

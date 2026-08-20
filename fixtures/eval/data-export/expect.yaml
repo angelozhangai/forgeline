@@ -1,0 +1,19 @@
+# Golden expectation: this user-data-export PRD is deliberately underspecified (WHICH data / PII
+# scope, file format, frequency/rate limits, async generation for large accounts, and auth against
+# pulling someone else's data are all unwritten). Gate A should surface the key blanks from an
+# engineering/privacy angle, size it above S, and flag at least one data/privacy risk — instead of
+# waving it through as "just add a button".
+# Complements recharge-expiry (money domain) by extending golden coverage to the data/privacy
+# domain; thresholds are deliberately conservative (tolerate LLM jitter, avoid false regressions).
+gate: a
+desc: User data export (missing PII scope/format/frequency/authorization) — should ask the key blanks, size above S, flag a privacy risk
+
+open_questions:
+  min: 1 # conservative floor: at least one blank needing a decision (this PRD has plenty — PII scope/format/rate limits)
+  topics:
+    - data # "which data gets exported" is this PRD's central blank and will almost always be asked
+
+size_in: [M, L, XL] # user data/privacy/export/async generation must never be sized trivial S
+risks_min: 1 # data/privacy domain: at least one risk (pulling others' data / PII leak / large exports)
+confidence_range: [0, 1]
+prd_score_range: [0, 100]

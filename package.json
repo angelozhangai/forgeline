@@ -1,0 +1,38 @@
+{
+  "name": "forgeline",
+  "private": true,
+  "version": "0.1.0",
+  "type": "module",
+  "description": "Forgeline — governed AI delivery, on rails: PRD review → tech design → implementation → PR, orchestrating Claude Code and Codex CLIs through adversarial cross-review, deterministic gates, and human-in-the-loop approvals. Never auto-merges.",
+  "license": "Apache-2.0",
+  "author": "Angelo Zhang",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/angelozhangai/forgeline.git"
+  },
+  "scripts": {
+    "forge": "node --no-warnings src/index.ts",
+    "audit": "npm audit --omit=dev --audit-level=high",
+    "lint": "biome lint ./src ./test",
+    "typecheck": "tsc --noEmit",
+    "test": "node --test --experimental-test-module-mocks --test-force-exit test/*.test.ts",
+    "test:cov": "node --test --experimental-test-module-mocks --experimental-test-coverage --test-coverage-exclude='test/**' --test-coverage-lines=75 --test-coverage-branches=72 --test-coverage-functions=75 --test-force-exit test/*.test.ts",
+    "ci": "npm run lint && npm run typecheck && npm run test:cov"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "dependencies": {
+    "@larksuiteoapi/node-sdk": "^1.66.1",
+    "yaml": "^2.5.0",
+    "zod": "^3.23.8"
+  },
+  "devDependencies": {
+    "@biomejs/biome": "^2.5.0",
+    "@types/node": "^24.0.0",
+    "typescript": "^5.6.0"
+  },
+  "overrides": {
+    "axios": "^1.16.0"
+  }
+}
