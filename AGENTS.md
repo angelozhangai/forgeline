@@ -69,3 +69,11 @@ Red never gets committed.**
 - **Private prompt overlays**: the repo ships generic default prompts; deployments may point
   `FORGE_PROMPTS_DIR` at a private directory to override any template without forking
   (see [src/util/render.ts](src/util/render.ts)).
+- **Deployment dirs are a seam, not a constant**: config/state/logs resolve through
+  `FORGE_HOME` (or `FORGE_CONFIG_DIR` / `FORGE_STATE_DIR` / `FORGE_LOGS_DIR`) in
+  [src/root.ts](src/root.ts); config additionally falls back **per file** to the repo's `config/`.
+  Two rules when touching this: **(a)** never read `CONFIG_DIR` directly to build a config path —
+  use `configFile(name)`, or you break the fallback for everyone with a partial overlay;
+  **(b)** with none of the vars set, every path must stay byte-identical to the in-checkout
+  layout — that backward-compat case is pinned by [test/deploy-dirs.test.ts](test/deploy-dirs.test.ts)
+  and is what lets a fresh clone just work.
