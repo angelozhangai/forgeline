@@ -41,12 +41,20 @@ Red never gets committed.**
 - Remote runs the same checks: GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml)) on PRs
   and pushes to main, plus `npm run audit` (dependency vulnerability gate; needs registry access, so remote-only).
 - Emergency bypass requires an explicit `git commit --no-verify` with the reason stated in the PR/commit.
+- **Green is only meaningful if everything actually ran.** `npm run ci` puts `test:cov` behind
+  [tools/test-with-floor.sh](tools/test-with-floor.sh), which fails when the reported test count drops
+  below `TEST_COUNT_FLOOR`. This exists because `--test-force-exit` used to kill the runner before some
+  files reported — the same commit reported 875 / 875 / 856 tests on consecutive runs and said `fail 0`
+  every time. **Never add `--test-force-exit` back**, and never "fix" a floor failure by lowering the
+  floor: the floor is a ratchet, raise it when you add tests, lower it only deliberately with a stated
+  reason. If the runner ever hangs instead, that's the leak this flag was hiding — find the open handle;
+  a loud hang beats a silent green.
 
 ## Commands
 
 | Command | Purpose |
 | --- | --- |
-| `npm run ci` | **Pre-commit gate**: lint + typecheck + test:cov (same set as remote CI) |
+| `npm run ci` | **Pre-commit gate**: lint + typecheck + test:cov behind a test-count floor (same set as remote CI) |
 | `npm run lint` | Biome lint (incl. `noFloatingPromises`; curated rules in `biome.json`) |
 | `npm run typecheck` | `tsc --noEmit` (strict) |
 | `npm test` | `node:test` unit + integration (fast, no coverage) |
