@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!-- Forge 守护。模板：__SVC__ 由 deploy/install.sh 替换为本仓绝对路径后装到 ~/Library/LaunchAgents/。别直接 cp。
+     LaunchAgent（用户级 = 登录态有 keychain → claude/codex/gh 可用）。RunAtLoad → 登录自启。
+     KeepAlive=true：进程退出自动拉起；ThrottleInterval=30：防崩溃重启风暴。
+     ProgramArguments 直接指向 forge-daemon（脚本自带 #!/bin/zsh）→ BTM 后台活动显示 forge-daemon 而非 zsh。
+     注意：KeepAlive 只救「进程退出」，救不了「卡死」——卡死由 com.forge.watchdog 负责（见同目录 README）。 -->
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+  <key>Label</key>
+  <string>com.forge.daemon</string>
+  <key>ProgramArguments</key>
+  <array>
+    <string>__SVC__/deploy/forge-daemon</string>
+  </array>
+  <key>WorkingDirectory</key>
+  <string>__SVC__</string>
+  <key>RunAtLoad</key>
+  <true/>
+  <key>KeepAlive</key>
+  <true/>
+  <key>ThrottleInterval</key>
+  <integer>30</integer>
+  <key>ProcessType</key>
+  <string>Background</string>
+  <key>StandardOutPath</key>
+  <string>__SVC__/logs/launchd.out</string>
+  <key>StandardErrorPath</key>
+  <string>__SVC__/logs/launchd.err</string>
+</dict>
+</plist>

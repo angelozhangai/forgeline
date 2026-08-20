@@ -1,0 +1,15 @@
+# Golden expectation: a pure copy tweak with clear boundaries and no ambiguity.
+# Guards "gate A doesn't over-question and sizes small correctly" — a one-line copy change
+# must not be judged a big requirement or drown in fake open questions.
+gate: a
+desc: Pure copy tweak (clear boundaries) — should size S/M and not over-question
+
+open_questions:
+  # The golden threshold flags *real* over-questioning (6+ means gate A went off the rails on a
+  # trivial change) without being flaky on ±1 LLM jitter.
+  # Pairs with gate-a.md's "ask with restraint" constraint (only the four question categories).
+  max: 5
+
+size_in: [S, M] # one line of copy must never be sized L/XL
+confidence_range: [0, 1]
+prd_score_range: [0, 100]

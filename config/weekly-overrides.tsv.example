@@ -1,0 +1,16 @@
+# weekly-overrides.tsv — manual size/quality overrides for weekly-load.sh (labels on GitHub stay untouched)
+# Copy to config/weekly-overrides.tsv and edit (the real file is gitignored — it holds subjective
+# per-person scoring and must never be committed).
+#
+# One line = 4 TAB-separated columns: <requirement-key>  <size|->  <quality-multiplier|->  <note>
+#   requirement-key : "epic:<slug>" for epics; "C#164" / "U#545" / "A#98" for single-repo issues
+#   size            : S|M|L|XL, or "-" = no override (fall back to size:* label or default M)
+#   quality         : 0.5–1.2 decimal, or "-" = no override (derived from issue status)
+#                     convention: caused an incident/hotfix → 0.6 · bounced in review repeatedly → 0.8
+#                                 clean reusable shared work → 1.2
+#
+# Examples (remove the leading # to activate):
+# epic:settings-revamp	XL	0.7	settings overhaul, in testing
+# A#12	L	-	notifications backend, cross-cutting
+# epic:sso-login	L	1.0	cross-repo, security sensitive, shipped clean
+# C#34	S	1.2	logging cleanup, reusable helper

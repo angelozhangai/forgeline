@@ -1,0 +1,43 @@
+name: CI
+
+# 两道闸口合一：
+#  - pull_request：PR CI（合并前必须绿；配 branch protection 设为 required check 即成硬门）
+#  - push 到 main：主干 CI（合并后回归，守护 main 始终可跑）
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+# 同一 PR/分支的新推送取消尚在跑的旧 run，省 runner、给快反馈
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  ci:
+    name: lint + typecheck + test
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          # 与本机开发 runtime 对齐；node:sqlite / node:test 在该版本免 flag 可用
+          node-version: '26'
+          cache: npm
+
+      # 干净、可复现安装（按 lockfile，禁止隐式改 lock）
+      - run: npm ci
+
+      # 与本地 `npm run ci` 同一组检查：biome lint + tsc strict + node:test（带覆盖率下限闸，防覆盖率静默退化）
+      - run: npm run lint
+      - run: npm run typecheck
+      - run: npm run test:cov
+
+      # 依赖漏洞闸（high+）：只在远端跑——audit 要查 registry（联网），本地 pre-commit 须能离线工作不放进 ci。
+      - run: npm run audit

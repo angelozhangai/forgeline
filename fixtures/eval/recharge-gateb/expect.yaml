@@ -1,0 +1,25 @@
+# Golden expectation (gate B): the source of truth is clarified, so the tech design should slice
+# executable issues + produce a **testable outer-loop acceptance contract**.
+# Guards "gate B doesn't degrade into a hollow design / un-reconcilable acceptance" — acceptance is
+# the drift-reconciliation baseline and must not be empty.
+# Written as floors/ranges to tolerate LLM wording variance.
+gate: b
+desc: Recharge source of truth → should slice issues and give a testable acceptance contract (acceptance is the drift baseline)
+
+# The source of truth states "repos touched: demo (backend) + example-web (user frontend)" —
+# degrading into single-repo/single-issue is a real regression and must be caught.
+multi_repo: true # a cross-repo requirement must not be judged single-repo
+issue_specs_min: 2 # at least one backend + one frontend issue
+issue_repos_include: [C, U] # must **actually cover** demo (backend) + example-web (frontend) — count>=2 alone can't catch "both piled on the backend"
+acceptance_contracts_min: 1 # at least one interface/contract (recharge/deduction/refund must land at least one surface)
+acceptance_scenarios_min: 1 # at least one Given/When/Then scenario (outer-loop testable)
+tech_design_min_chars: 200 # the design body must not be a hollow shell
+confidence_range: [0, 1]
+
+# Semantic guard (#3): LLM-judge scores acceptance quality — a correct shape (contracts+scenarios)
+# doesn't mean good content. Expiry/refund/concurrency are all clarified in the source of truth, so
+# acceptance should cover those key paths, declaratively and testably. ⚠️ Costs one extra claude call.
+acceptance_judge:
+  min_coverage: 55 # covers the PRD's key paths ≥55 (headroom for LLM jitter)
+  min_testability: 55 # testability ≥55
+  require_declarative: true # must be declarative (no imperative "click the button" steps)

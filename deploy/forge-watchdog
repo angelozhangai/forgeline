@@ -1,0 +1,10 @@
+#!/bin/zsh
+# Forge — 看门狗启动器（launchd StartInterval 每 60s 调它）：跑一次 forge watchdog（探活+自愈+告警）跑完即退。
+# plist 直接指向本脚本，故 BTM 后台活动里显示 forge-watchdog 而非 zsh。
+set -e
+DIR="${0:A:h}"          # <repo>/deploy
+SVC="${DIR:h}"          # 仓根
+export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.bun/bin:$HOME/.local/bin:$PATH"
+cd "$SVC" || exit 1
+mkdir -p logs
+exec ./forge watchdog >> logs/watchdog.log 2>&1

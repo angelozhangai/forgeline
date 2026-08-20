@@ -1,0 +1,17 @@
+# Golden expectation: this wallet-recharge PRD deliberately leaves key blanks (expiry / refunds /
+# concurrent deduction), and gate A should ask them from a PM's viewpoint (not silently assume),
+# and size it above S.
+# Expectations are written as "range/topic hits", not exact matches — tolerating LLM wording
+# variance while guarding that the review method hasn't degraded.
+gate: a
+desc: Wallet recharge (missing expiry/refund/concurrency semantics) — should ask the key blanks, size M/L
+
+open_questions:
+  min: 2 # at least two points needing a PM decision (this PRD has plenty of blanks)
+  topics:
+    - expir # balance expiry / validity period — never mentioned in the PRD, a canonical must-ask
+
+size_in: [M, L] # payments/balance/ledger involvement must never be sized S
+risks_min: 1 # money is involved: at least one risk (concurrent deduction / reconciliation / fund safety)
+confidence_range: [0, 1]
+prd_score_range: [0, 100]
