@@ -107,6 +107,12 @@ export FORGE_STATE_DIR=/var/lib/forge
 export FORGE_LOGS_DIR=/var/log/forge
 ```
 
+Golden eval samples move the same way, but as a **whole set** rather than per file — mixing your private PRDs with this repo's demo ones would make the pass rate meaningless:
+
+```bash
+export FORGE_EVAL_FIXTURES_DIR=/path/to/your/golden-prds   # replaces fixtures/eval entirely
+```
+
 Config resolves **per file**: a name present in your config dir wins, anything missing falls back to the repo's default in [config/](config/). Override only `routing.yaml` and the other three keep tracking this repo. With none of these set, every path is byte-for-byte what it was before — nothing to migrate.
 
 > ⚠️ The fallback is silent by design. A typo in an overridden filename means you quietly run the repo default, not an error. If you keep a private overlay, have it reconcile its filenames against this repo's `config/` and `prompts/` trees.

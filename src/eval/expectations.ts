@@ -9,7 +9,15 @@ import { z } from 'zod';
 import type { GateAEnvelope, GateBEnvelope } from '../gates/envelopes.ts';
 
 // fixtures/eval/<name>/{prd.md, expect.yaml} 的根目录（相对本文件 → 仓库根）。
-export const EVAL_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '../../fixtures/eval');
+// FORGE_EVAL_FIXTURES_DIR 指向仓外的私有 golden 集（真实 PRD 不该进公开仓）。
+//
+// 与 config 的逐文件回落不同，这里是**整体替换**：eval 报告的意义在于「这一组样本
+// 上评审方法没退化」，把私有样本和仓内 demo 样本混在一起算通过率是没有意义的数字。
+// 空串/纯空格视同未设置，理由同 src/root.ts 的 envDir。
+const evalOverride = process.env.FORGE_EVAL_FIXTURES_DIR?.trim();
+export const EVAL_ROOT = evalOverride
+  ? resolve(evalOverride)
+  : resolve(dirname(fileURLToPath(import.meta.url)), '../../fixtures/eval');
 
 // 一条期望写成「范围/主题命中」而非精确匹配——LLM 非确定，eval 只守「评审方法/产出形状没退化」。
 const RangeSchema = z.tuple([z.number(), z.number()]);
