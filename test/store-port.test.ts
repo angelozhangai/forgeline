@@ -1,5 +1,6 @@
 // 单测：SessionStore 接缝（store/port.ts 接口 + store/index.ts 选择点 + localSqlite adapter）。
-// 守两条：① 选择点 `store` 就是 localSqlite 自由函数的 bundle（引用相等 → 零行为漂移）；
+// 守两条：① 选择点 `store` 就是 localSqlite 自由函数的 bundle（引用相等 → 零行为漂移），
+//            **例外只有 WRAPPED 里明确列名的那几个**（扩展钩子装饰器）；
 //         ② 经 `store.*` 走真实 sqlite 的 create/get/patch/transition/event 全链与直调一致。
 // 必须在导入前设 FORGE_DB（真 node:sqlite，:memory: 隔离）。
 process.env.FORGE_DB = ':memory:';
@@ -9,25 +10,45 @@ import assert from 'node:assert/strict';
 const sessions = await import('../src/store/sessions.ts');
 const { store } = await import('../src/store/index.ts');
 
-// ① 选择点 = localSqlite 自由函数 bundle：方法引用相等（绝非另写一份会漂移的实现）。
-test('store 选择点：方法即 sessions 自由函数（引用相等，零漂移）', () => {
-  assert.equal(store.get, sessions.get);
-  assert.equal(store.create, sessions.create);
-  assert.equal(store.patch, sessions.patch);
-  assert.equal(store.transition, sessions.transition);
-  assert.equal(store.appendEvent, sessions.appendEvent);
-  assert.equal(store.leaseClaim, sessions.leaseClaim);
-  assert.equal(store, sessions.localSqliteStore);
+// 接缝上每个公开操作。漏一个 → 消费方迁移到 store.* 时才暴雷。
+const SEAM_METHODS = [
+  'create', 'findByIssueRef', 'isDuplicateTokenError', 'isDuplicateIssueRefError',
+  'get', 'getBySlug', 'findByPrdUrl', 'findByDocToken', 'resolve',
+  'listByStates', 'listAll', 'distinctProjects', 'countByState', 'countByStates',
+  'patch', 'transition', 'appendEvent', 'events', 'lastEventTs', 'leaseClaim',
+] as const;
+
+// 选择点上被装饰器包过一层的方法。**这是一张白名单，不是豁免**：
+// transition 被 withTransitionHook 包了（扩展生命周期钩子，见 src/store/index.ts）。
+// 谁再悄悄包第二个方法而不更新这张表，下面那条断言当场红——比原来「全都必须引用相等」更严，
+// 因为它同时守住了「不该被包的方法一个都没被包」。
+const WRAPPED = new Set<string>(['transition']);
+
+// ① 选择点 = localSqlite 自由函数 bundle（+ 明确列名的装饰器）。
+test('store 选择点：未列名的方法一律与 sessions 自由函数引用相等（零漂移）', () => {
+  for (const m of SEAM_METHODS) {
+    const free = (sessions as unknown as Record<string, unknown>)[m];
+    if (typeof free !== 'function') continue; // 该操作不是自由函数导出，跳过引用比对
+    if (WRAPPED.has(m)) {
+      assert.notEqual(store[m], free, `${m} 在 WRAPPED 名单里却没被包——名单过期了`);
+    } else {
+      assert.equal(store[m], free, `${m} 被悄悄换成了另一份实现（会漂移）；确属有意包装请加进 WRAPPED 并写清理由`);
+    }
+  }
 });
 
-// 接口面完整性：消费方迁移到 store.* 前，确认每个公开 store 操作都在接缝上（漏一个 → 迁移时才暴雷）。
+test('store 选择点：装饰器不得增删接缝上的方法', () => {
+  // `...inner` 展开只复制自有可枚举属性：将来 adapter 改用 class / 原型方法就会在这里丢方法，
+  // 而症状是运行时 "store.xxx is not a function"，离改动点很远。这条把它挡在提交前。
+  assert.deepEqual(
+    Object.keys(store).sort(),
+    Object.keys(sessions.localSqliteStore).sort(),
+    '选择点的方法集合必须与 adapter 完全一致',
+  );
+});
+
 test('store 接缝面完整：覆盖 sessions 全部公开 store 操作', () => {
-  for (const m of [
-    'create', 'findByIssueRef', 'isDuplicateTokenError', 'isDuplicateIssueRefError',
-    'get', 'getBySlug', 'findByPrdUrl', 'findByDocToken', 'resolve',
-    'listByStates', 'listAll', 'distinctProjects', 'countByState', 'countByStates',
-    'patch', 'transition', 'appendEvent', 'events', 'lastEventTs', 'leaseClaim',
-  ] as const) {
+  for (const m of SEAM_METHODS) {
     assert.equal(typeof store[m], 'function', `store.${m} 缺失`);
   }
 });

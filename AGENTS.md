@@ -31,6 +31,40 @@ they actually modify — never hardcoded to "the first repo", never piled into t
   [src/gates/gateC.ts](src/gates/gateC.ts) (`resolveTargetRepos`/`primaryTargetRepo`/setup). Change those +
   their tests together.
 
+## 🔌 Top rule: this repo is upstream — downstream products extend it, they never patch it
+
+Forgeline is the **open core**. Products built on it (private deployments, commercial layers) live in their
+own repos and attach through the extension seam ([src/ext/port.ts](src/ext/port.ts)) — never by editing files
+in here. That direction is one-way and non-negotiable: the moment downstream code starts patching core files,
+the two sides fork permanently and every upgrade becomes a merge. That is the GitLab CE/EE bill.
+
+When a downstream need shows up, it lands in exactly one of four places — in this order:
+
+| | Downstream need | What changes here |
+| --- | --- | --- |
+| **L0** | Lives *outside* the core, calling it as a CLI/library (a UI, a gateway, a billing service) | **nothing** |
+| **L1** | Hangs off an existing seam (prompts, config, `ExtensionPack` command/hook) | **nothing** |
+| **L2** | Needs a *new neutral mount point* | add a **generic** hook here; the implementation stays downstream |
+| **L3** | Needs to change existing core behaviour | abstract into a replaceable strategy; the default ships here |
+
+Most things are L0/L1. **Frequent L3 means the abstraction is wrong, not that the rule is inconvenient.**
+
+Self-check for anything added at L2: **the name must not encode the downstream intent.**
+`registerBillingHook` ❌ — it advertises someone's product. `onTransition` ✅ — it describes the core's own
+lifecycle and is useful to everyone. If you can't name it without naming the business need, it isn't L2.
+
+Seam invariants, all machine-guarded (see [test/ext-seam.test.ts](test/ext-seam.test.ts)):
+
+- Hooks **notify, never intercept** — no return value is honoured; failures and timeouts are logged and
+  stepped over. A vetoing hook would be a way to switch the governance rails off.
+- **Core commands win** on name collision — downstream can't shadow `go`/`merged`.
+- **Present but unloadable → hard error.** Silent fallback is this architecture's #1 failure mode: a hook that
+  didn't load has no symptom at all.
+- **State machine / transition table are not extensible** — they carry the red lines (a stalled Gate C can only
+  go back for revision). New gates go through an issue here, not a downstream override.
+- This repo ships **no `ext/`**, and its suite must pass with none present. Run `npm run ci` in a shell with
+  `FORGE_HOME`/`FORGE_EXT_DIR` unset — otherwise a private pack on your machine may be what's making it green.
+
 ## 🚦 Top rule: local CI must be green before every commit
 
 **Run `npm run ci` (= `lint` + `typecheck` + `test:cov`, with coverage floors) before `git commit`.
