@@ -71,10 +71,21 @@ Seam invariants, all machine-guarded (see [test/ext-seam.test.ts](test/ext-seam.
 Red never gets committed.**
 
 - Mechanical backstop: `.githooks/pre-commit` runs `npm run ci` on every commit and rejects red.
-- Enable once per clone: `git config core.hooksPath .githooks`.
+- **Enable once per clone: `npm run hooks`.** Not optional bookkeeping — hooks live in `.githooks/`, which
+  git ignores until `core.hooksPath` points at it, so an un-run clone has *no* backstop and says nothing
+  about it. That is exactly what happened in the maintainer's own checkout: `core.hooksPath` was empty and
+  the pre-commit gate had never fired. Check yours with `git config core.hooksPath`.
 - Remote runs the same checks: GitHub Actions ([.github/workflows/ci.yml](.github/workflows/ci.yml)) on PRs
   and pushes to main, plus `npm run audit` (dependency vulnerability gate; needs registry access, so remote-only).
 - Emergency bypass requires an explicit `git commit --no-verify` with the reason stated in the PR/commit.
+- **`main` moves only by merging a PR.** Server side: a ruleset on `main` blocks deletion and force-push,
+  requires a PR, and requires the `lint + typecheck + test` check to pass. Local side:
+  `.githooks/pre-push` refuses a direct push to `main`. Both are needed and neither is redundant — the
+  ruleset lets Repository admin bypass (an escape hatch for "CI is wedged, fix it first"), so on the
+  maintainer's own machine a stray `git push origin main` would otherwise succeed silently. The hook is
+  what catches muscle memory; the bypass is what prevents a lockout. Overriding the hook takes an explicit
+  `FORGELINE_ALLOW_MAIN=1` (force-push needs `FORGELINE_ALLOW_FORCE_MAIN=1` on top — there is no combined
+  switch, on purpose).
 - **Green is only meaningful if everything actually ran.** `npm run ci` puts `test:cov` behind
   [tools/test-with-floor.sh](tools/test-with-floor.sh), which fails when the reported test count drops
   below `TEST_COUNT_FLOOR`. This exists because `--test-force-exit` used to kill the runner before some
