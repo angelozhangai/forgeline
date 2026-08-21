@@ -12,7 +12,7 @@
 # 地板是**棘轮**，只许往上，往下调必须是一次有意的、写清楚理由的改动。
 set -euo pipefail
 
-FLOOR="${TEST_COUNT_FLOOR:-875}"
+FLOOR="${TEST_COUNT_FLOOR:-933}"
 LOG="$(mktemp)"
 trap 'rm -f "$LOG"' EXIT
 
