@@ -11,7 +11,11 @@ import { join } from 'node:path';
 
 const notifyCalls: string[] = [];
 let syncCardCalls = 0; // Bug A 回归：进运行态须刷群卡（让团队看到「评审中」而非滞后的「排队」）
-mock.module('../src/notify.ts', { namedExports: { notify: async (kind: string) => { notifyCalls.push(kind); }, syncGroupCard: async () => { syncCardCalls++; } } });
+// notifyThrows：让通知层抛错，用来制造「tick 内部真的炸了」—— remindStuck 里的 notify 不带 try/catch，
+// 异常会一路冒出 tick。ESM 命名空间是冻结的（mock.method 会报 Cannot redefine property），改不动 worker
+// 已解析的绑定，所以只能从 mock 自身下手。与本文件既有的 gateAThrows 同一套路。
+let notifyThrows = false;
+mock.module('../src/notify.ts', { namedExports: { notify: async (kind: string) => { if (notifyThrows) throw new Error('通知层炸了'); notifyCalls.push(kind); }, syncGroupCard: async () => { syncCardCalls++; } } });
 
 // 闸A：模拟成功（写入 routing），可切换为抛错；outcome 决定 afterGateA 的转移分支。
 let gateAThrows = false;
@@ -960,4 +964,137 @@ test('remindStuck：已排程自动重试的 *_FAILED 不算停泊（不打扰�
   await worker.remindStuck(future);
   assert.ok((await sessions.events(id)).some((e) => e.kind === 'stuck_reminded'));
   assert.ok(notifyCalls.includes('failed'));
+});
+
+// ── tick 生命周期钩子（扩展接缝）──
+//
+// 合约（先列场景再写断言）：
+//   T1 真正跑了的那一轮：onTickStart / onTickEnd 各发一次；
+//   T2 **被锁挡掉的那次一个都不发** —— 否则下游按 tick 事件对账时，
+//      会把「被别的 tick 挤掉」误算成一轮空转，跑批数量凭空多出来；
+//   T3 onTickEnd 带本轮实际推进数；空转是 processed=0 且 ok=true（空转不是失败）；
+//   T4 tick 内部抛错 → onTickEnd 仍要发且 ok=false，错误照常抛给调用方（钩子不吞异常）；
+//   T5 onTickEnd 在**放锁之后**才发 —— 慢钩子不能把下一轮 tick 挡在门外；
+//   T6 钩子自己抛错 → tick 的返回值与推进结果一律不受影响。
+const ext = await import('../src/ext/index.ts');
+const extTmp = mkdtempSync(join(tmpdir(), 'forge-worker-ext-'));
+
+/** 装一个把 tick 事件记到 globalThis 的包；body 允许在钩子里再做点别的（如 T5 探锁）。 */
+async function loadTickProbe(extra = '', preamble = ''): Promise<Array<Record<string, unknown>>> {
+  ext.resetExtensionsForTest();
+  const seen: Array<Record<string, unknown>> = [];
+  (globalThis as unknown as { __tickSeen: unknown[] }).__tickSeen = seen;
+  const dir = mkdtempSync(join(extTmp, 'pack-'));
+  writeFileSync(
+    join(dir, 'index.ts'),
+    `${preamble}
+     export default {
+       name: 'tick-probe',
+       hooks: {
+         onTickStart: (e) => { globalThis.__tickSeen.push({ k: 'start', ...e }); },
+         onTickEnd: (e) => { globalThis.__tickSeen.push({ k: 'end', ...e }); ${extra} },
+       },
+     };\n`,
+  );
+  await ext.loadExtensions(dir);
+  return seen;
+}
+
+test('tick 钩子：跑了的那一轮 start/end 各发一次，空转是 processed=0 且 ok=true', async () => {
+  benignMocks();
+  const seen = await loadTickProbe();
+  try {
+    for (const s of await sessions.listAll()) await sessions.patch(s.id, { state: 'SHIPPED' }); // 清场 → 本轮必然空转
+    const n = await worker.tick();
+    assert.equal(n, 0);
+    assert.deepEqual(seen.map((e) => e.k), ['start', 'end']);
+    assert.equal(seen[1].processed, 0);
+    assert.equal(seen[1].ok, true, '空转不是失败');
+    assert.equal(typeof seen[0].at, 'number');
+  } finally {
+    ext.resetExtensionsForTest();
+  }
+});
+
+test('tick 钩子：被锁挡掉的那一轮一个事件都不发（否则下游会把「被挤掉」算成一轮空转）', async () => {
+  benignMocks();
+  const seen = await loadTickProbe();
+  const lock = process.env.FORGE_LOCK as string;
+  try {
+    // 造一把「活锁」：本进程 pid + 当下时间戳 —— acquireLock 判定为有人正在跑，让路。
+    writeFileSync(lock, `${process.pid}\n${Date.now()}`);
+    const n = await worker.tick();
+    assert.equal(n, 0);
+    assert.deepEqual(seen, [], '没拿到锁就等于这一轮根本没跑，不该有任何生命周期事件');
+  } finally {
+    rmSync(lock, { force: true });
+    ext.resetExtensionsForTest();
+  }
+});
+
+test('tick 钩子：内部抛错时 onTickEnd 仍发且 ok=false，错误照常抛给调用方', async () => {
+  benignMocks();
+  const seen = await loadTickProbe();
+  const { db } = await import('../src/store/db.ts');
+  try {
+    // 造一个「停泊 7h 没人管」的 session：tick 的 remindStuck 会给它发提醒，而那句 notify 不带 try/catch。
+    // patch() 永远把 updated_at 写成当下，backdate 只能直写 SQL（本文件已有「直写 state 绕状态机」的先例）。
+    const id = await mk('tkh-boom', 'INTAKE');
+    await sessions.transition(id, 'GATE_A_RUNNING');
+    await sessions.transition(id, 'GATE_A_FAILED', { dead_letter: 1, next_retry_at: null });
+    db().prepare('UPDATE session SET updated_at = ? WHERE id = ?').run(Date.now() - 7 * 3600 * 1000, id);
+
+    notifyThrows = true;
+    await assert.rejects(() => worker.tick(), /通知层炸了/, '钩子不该把 tick 的异常吞掉');
+    assert.deepEqual(seen.map((e) => e.k), ['start', 'end'], '炸了也必须收尾');
+    assert.equal(seen[1].ok, false, '死在半路的一轮不能报成正常结束');
+    assert.equal(seen[1].processed, 0);
+  } finally {
+    notifyThrows = false;
+    for (const s of await sessions.listAll()) await sessions.patch(s.id, { state: 'SHIPPED' });
+    ext.resetExtensionsForTest();
+  }
+});
+
+test('tick 钩子：onTickEnd 发的时候锁已经放了（慢钩子不能把下一轮挡在门外）', async () => {
+  benignMocks();
+  // 钩子里探一眼锁文件还在不在：在 = 放锁排在钩子后面，一个卡住的钩子会一直堵着下一轮 tick。
+  const seen = await loadTickProbe(
+    `globalThis.__tickSeen.push({ k: 'lockHeld', v: fs.existsSync(process.env.FORGE_LOCK) });`,
+    `import * as fs from 'node:fs';`, // 扩展包是 ESM，没有 require
+  );
+  try {
+    for (const s of await sessions.listAll()) await sessions.patch(s.id, { state: 'SHIPPED' });
+    await worker.tick();
+    const probe = seen.find((e) => e.k === 'lockHeld');
+    assert.ok(probe, '探针没跑到');
+    assert.equal(probe.v, false, 'onTickEnd 触发时锁应已释放');
+  } finally {
+    ext.resetExtensionsForTest();
+  }
+});
+
+test('tick 钩子：钩子自己抛错不影响 tick 的返回值与推进结果', async () => {
+  benignMocks();
+  ext.resetExtensionsForTest();
+  const dir = mkdtempSync(join(extTmp, 'boom-'));
+  writeFileSync(
+    join(dir, 'index.ts'),
+    `export default { name: 'boom', hooks: {
+       onTickStart: () => { throw new Error('start boom'); },
+       onTickEnd: () => { throw new Error('end boom'); },
+     } };\n`,
+  );
+  await ext.loadExtensions(dir);
+  try {
+    const id = await mk('tkh1', 'INTAKE');
+    await parkLeftoverReady(id);
+    const n = await worker.tick();
+    assert.equal(n, 1, '钩子抛错不该让本轮少推进一个 session');
+    // 只断言「确实被推进了」，不钉具体落到哪个态 —— 那取决于本文件里被前序用例改过的
+    // gateAOutcome，钉死它就变成了在测 mock 的当前配置，不是在测钩子。
+    assert.notEqual((await sessions.get(id))!.state, 'INTAKE', '钩子抛错不该让 session 原地不动');
+  } finally {
+    ext.resetExtensionsForTest();
+  }
 });
