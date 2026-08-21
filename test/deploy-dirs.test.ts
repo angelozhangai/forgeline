@@ -8,17 +8,19 @@
 //   4. 空串 / 纯空格 == 没设（否则会静默锚到进程 cwd，症状极难追）；
 //   5. 配置文件逐个回落：叠加目录有就用叠加的，没有就用仓内默认 —— 私有部署
 //      只覆盖它在乎的那几个，其余跟着仓库升级；
-//   6. 指向不存在的目录不抛异常，按「该文件没被覆盖」处理。
+//   6. 指向不存在的目录不抛异常，按「该文件没被覆盖」处理；
+//   7. EXT_DIR（扩展包目录）走同一套规则：FORGE_EXT_DIR > $FORGE_HOME/ext > 检出目录内 ext/ ——
+//      下游产品的扩展包跟着部署根一起搬，不必再记一个新约定。
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from 'node:fs';
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 import { pathToFileURL } from 'node:url';
 
 const ROOT_TS = pathToFileURL(resolve(import.meta.dirname, '../src/root.ts')).href;
 
-const VARS = ['FORGE_HOME', 'FORGE_CONFIG_DIR', 'FORGE_STATE_DIR', 'FORGE_LOGS_DIR'] as const;
+const VARS = ['FORGE_HOME', 'FORGE_CONFIG_DIR', 'FORGE_STATE_DIR', 'FORGE_LOGS_DIR', 'FORGE_EXT_DIR'] as const;
 
 let bust = 0;
 /** 用带 query 的 URL 绕开 ESM 模块缓存，让 root.ts 在给定 env 下重新求值。 */
@@ -102,6 +104,38 @@ describe('部署目录接缝', () => {
       const r = await loadRoot({ FORGE_HOME: value, FORGE_CONFIG_DIR: value });
       assert.equal(r.CONFIG_DIR, resolve(r.SVC_DIR, 'config'));
       assert.equal(r.STATE_DIR, resolve(r.SVC_DIR, 'state'));
+    });
+  }
+
+  // 扩展包目录：合约 7。核心不认识任何下游产品，只认这个位置。
+  test('都不设：EXT_DIR 落在检出目录内，且本仓不自带 ext/ —— 缺省就是「没有扩展」', async () => {
+    const r = await loadRoot({});
+    assert.equal(r.EXT_DIR, resolve(r.SVC_DIR, 'ext'));
+    // 公开核心一旦自带 ext/，纯 OSS 用户就会莫名其妙装上一个包。这条守的是「开源仓自洽」。
+    assert.equal(existsSync(r.EXT_DIR), false, '公开核心不应自带 ext/ 目录');
+  });
+
+  test('FORGE_HOME 把扩展包目录一起搬走 —— 下游不必再记一个新约定', async () => {
+    const r = await loadRoot({ FORGE_HOME: home });
+    assert.equal(r.EXT_DIR, resolve(home, 'ext'));
+  });
+
+  test('FORGE_EXT_DIR 优先于 FORGE_HOME，且不影响 config/state/logs', async () => {
+    const solo = resolve(tmp, 'solo-ext');
+    const r = await loadRoot({ FORGE_HOME: home, FORGE_EXT_DIR: solo });
+    assert.equal(r.EXT_DIR, solo);
+    assert.equal(r.CONFIG_DIR, resolve(home, 'config'));
+    assert.equal(r.STATE_DIR, resolve(home, 'state'));
+    assert.equal(r.LOGS_DIR, resolve(home, 'logs'));
+  });
+
+  for (const [label, value] of [
+    ['空串', ''],
+    ['纯空格', ' \t '],
+  ] as const) {
+    test(`FORGE_EXT_DIR 为${label}视同未设置 —— 不能把扩展包目录锚到 cwd`, async () => {
+      const r = await loadRoot({ FORGE_EXT_DIR: value });
+      assert.equal(r.EXT_DIR, resolve(r.SVC_DIR, 'ext'));
     });
   }
 });

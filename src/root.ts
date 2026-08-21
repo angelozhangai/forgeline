@@ -45,6 +45,15 @@ export const CONFIG_DIR = svcDir('FORGE_CONFIG_DIR', 'config');
 export const PROMPTS_DIR = resolve(SVC_DIR, 'prompts');
 export const STATE_DIR = svcDir('FORGE_STATE_DIR', 'state');
 export const LOGS_DIR = svcDir('FORGE_LOGS_DIR', 'logs');
+/**
+ * 扩展包目录（见 src/ext/）。下游产品在这里放 `index.ts` 默认导出一个 ExtensionPack，
+ * 就能加自己的 CLI 命令与生命周期钩子，**不必 fork、不必改核心任何文件**。
+ *
+ * 与 config/state/logs 同一套接缝规则：`FORGE_EXT_DIR` 显式指定 > `$FORGE_HOME/ext` >
+ * 检出目录内 `ext/`（本仓不自带，所以缺省就是「没有扩展」= 纯 OSS 行为逐字节不变）。
+ * 复用 FORGE_HOME 而不发明新约定：下游的部署根本来就已经用它搬走 config/state/logs。
+ */
+export const EXT_DIR = svcDir('FORGE_EXT_DIR', 'ext');
 
 /**
  * 配置文件的实际路径：叠加目录里有就用叠加的，没有就回落到仓内默认。

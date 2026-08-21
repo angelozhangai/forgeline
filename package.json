@@ -3,6 +3,9 @@
   "private": true,
   "version": "0.1.0",
   "type": "module",
+  "exports": {
+    "./ext": "./src/ext/port.ts"
+  },
   "description": "Forgeline — governed AI delivery, on rails: PRD review → tech design → implementation → PR, orchestrating Claude Code and Codex CLIs through adversarial cross-review, deterministic gates, and human-in-the-loop approvals. Never auto-merges.",
   "license": "Apache-2.0",
   "author": "Angelo Zhang",

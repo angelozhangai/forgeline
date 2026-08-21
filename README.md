@@ -117,11 +117,58 @@ Config resolves **per file**: a name present in your config dir wins, anything m
 
 > ⚠️ The fallback is silent by design. A typo in an overridden filename means you quietly run the repo default, not an error. If you keep a private overlay, have it reconcile its filenames against this repo's `config/` and `prompts/` trees.
 
+## Building on Forgeline (extension pack)
+
+Prompts, config, and eval fixtures cover *tuning* the pipeline. Building a **product** on top of it needs
+code — your own CLI commands, your own reaction to state changes. That's what an extension pack is:
+
+```bash
+export FORGE_HOME=/path/to/your/deployment     # pack is discovered at $FORGE_HOME/ext/index.ts
+# or point at it directly:
+export FORGE_EXT_DIR=/path/to/your/ext
+```
+
+```ts
+// $FORGE_HOME/ext/index.ts
+import type { ExtensionPack } from 'forgeline/ext';
+
+export default {
+  name: 'acme',
+  commands: [
+    { name: 'acme-report', summary: 'Weekly delivery report', run: async (ctx) => { /* ... */ } },
+  ],
+  hooks: {
+    onTransition: (e) => syncToYourTracker(e.id, e.from, e.to),
+    onTickEnd: (e) => recordRunMetrics(e.processed),
+  },
+} satisfies ExtensionPack;
+```
+
+Your pack lives in **your own repo**, checked out beside this one and linked with
+`"forgeline": "file:../forgeline"`. Nothing in here needs to know it exists. Full contract in
+[src/ext/port.ts](src/ext/port.ts); the rules that matter:
+
+- **Hooks notify, they never intercept.** Return values are ignored; a throwing, rejecting, or hanging hook
+  is logged and stepped over. A hook that could veto a gate would be a way to switch the governance rails
+  off — the one thing this project exists to prevent.
+- **Core commands always win** on a name collision. An extension cannot quietly take over `go` or `merged`.
+- **Only plain data and functions cross the boundary.** Your pack has its own `node_modules`, so a `zod`
+  schema or class instance from your side fails `instanceof` on this side — silently taking a wrong branch
+  rather than crashing.
+- **Present but unloadable is a hard error**, never a silent fallback to "no extension". A billing hook that
+  failed to load leaves no trace until you reconcile the month.
+- **State machine and transition table are not extensible.** They encode the safety red lines (a stalled
+  Gate C can only go back for revision — never forward to opening a PR). Need a new gate? Open an issue here.
+
+With no pack configured every path above is byte-for-byte what it was before, and the test suite
+[asserts this core runs green with no extension present](test/ext-seam.test.ts).
+
 ## Repository layout
 
 ```
 src/         statemachine · orchestrator · gates · review engine · llm drivers · store (SQLite)
              messaging port + feishu adapter · daemon · health/watchdog · drift · eval · project adapters
+             ext/ = extension seam (ExtensionPack port + loader) for downstream products
 prompts/     externalized gate templates (override via FORGE_PROMPTS_DIR)
 config/      runtime.yaml · routing.yaml · permissions.yaml · assignment.yaml (+ .example files)
              per-file fallback target when FORGE_CONFIG_DIR / FORGE_HOME is set

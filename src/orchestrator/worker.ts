@@ -34,6 +34,7 @@ import { log } from '../util/log.ts';
 import { notify, syncGroupCard } from '../notify.ts';
 import type { NotifyKind } from '../notify.ts';
 import type { Session } from '../types.ts';
+import { fireTickStart, fireTickEnd } from '../ext/index.ts';
 
 // ── 节点失败统一停泊：分类 → 瞬时则排程退避自动重试（耗尽转死信），永久则立即停泊等人 ──
 // 替换原先「一律 transition(*_FAILED) + notify」，把瞬时基础设施抖动与语义失败分流（落实 P0-A/B）。
@@ -840,7 +841,12 @@ export async function tick(): Promise<number> {
     log.info('tick：已有一个 tick 在跑，跳过本次');
     return 0;
   }
+  // 扩展钩子（onTickStart/onTickEnd）：只在**真正拿到锁的这一轮**发，跳过的那次不发——
+  // 否则下游按 tick 事件对账时会把「被别的 tick 挤掉」误算成一轮空转。
+  let processed = 0;
+  let ok = false;
   try {
+    await fireTickStart({ at: Date.now() });
     const cfg = loadConfig();
     const now = Date.now();
     // ── 控制面编排策略（reclaim/retry/autonomy/remind/sweep/drift）：**只在控制面 / all-in-one 跑** ──
@@ -872,12 +878,16 @@ export async function tick(): Promise<number> {
     const ready = await jobSource.claimDueJobs(cfg.runtime.max_parallel);
     if (ready.length === 0) {
       log.info('tick：无待处理 session');
+      ok = true;
       return 0;
     }
     log.info(`tick：${ready.length} 个待处理（并发上限 ${cfg.runtime.max_parallel}）`);
     await runLimited(ready, cfg.runtime.max_parallel, step);
-    return ready.length;
+    processed = ready.length;
+    ok = true;
+    return processed;
   } finally {
-    releaseLock();
+    releaseLock(); // 先放锁再发钩子：钩子最多拖 HOOK_TIMEOUT_MS，不能让它把下一轮 tick 挡在门外
+    await fireTickEnd({ at: Date.now(), processed, ok });
   }
 }

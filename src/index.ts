@@ -1,7 +1,7 @@
 import { existsSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { resolve } from 'node:path';
-import { SVC_DIR, SCRIPTS_DIR, ENV_FILE } from './root.ts';
+import { SVC_DIR, SCRIPTS_DIR, ENV_FILE, EXT_DIR } from './root.ts';
 import { loadConfig } from './config.ts';
 import { project, defaultProjectId } from './projects.ts';
 import { parseHumanAsks } from './gates/envelopes.ts';
@@ -26,6 +26,7 @@ import { initHeartbeat, pingLiveness } from './health/heartbeat.ts';
 import { startHealthServer } from './health/server.ts';
 import { startControlServer } from './control/server.ts';
 import { ACTIVE_GATE_STATES } from './statemachine/states.ts';
+import { loadExtensions, extCommands, activePackName } from './ext/index.ts'; // 扩展接缝：下游产品的 CLI 命令与生命周期钩子
 
 type Flags = Record<string, string | boolean>;
 
@@ -99,9 +100,15 @@ function help(): void {
       闸B 多轮：Codex 审、Claude 改技术方案各自 resume 续接；改方遇拿不准的点→AWAITING_GATE_B_INPUT 待 M 答复(gateb-answer)；到上限仍未决→GATE_B_STALLED 待 M 裁决(gateb-go 强制立项/gateb-answer 再修)
       下游：DONE→(implement)→闸C 实现⇄本地CI 至绿→AWAITING_GATE_D→(review-pr)→开 PR→闸D codex审diff⇄claude修(CI 须绿才推)→GATE_D_HARDENING(补内环测试+CI绿+出 merge-readiness)→AWAITING_HUMAN_MERGE(人工合并·永不自动)→(merged)→SHIPPED→漂移对账
       闸C/D 多轮：升级→AWAITING_GATE_C/D_INPUT 待 M 答复(gatec/gated-answer)；到上限→GATE_C/D_STALLED 待裁决（闸C stall=CI 未绿，只能再修，绝不放行）`);
+  // 扩展包提供的命令（见 src/ext/）。未装扩展时整段不出现——纯 OSS 的 help 输出逐字节不变。
+  const ext = extCommands();
+  if (ext.length > 0) {
+    out(`\n  ── 扩展命令（来自扩展包 ${activePackName()}）──`);
+    for (const c of ext) out(`  ${c.name.padEnd(36)}${c.summary}`);
+  }
 }
 
-function doctor(): void {
+function doctor(extError: string | null): void {
   let bad = 0;
   const ck = (label: string, ok: boolean, note = ''): void => {
     out(`${ok ? '✓' : '✗'} ${label}${note ? `  — ${note}` : ''}`);
@@ -185,6 +192,10 @@ function doctor(): void {
   } catch (e) {
     ck('SQLite 状态库', false, String(e).slice(0, 120));
   }
+  // 扩展包：没配就是没配（纯 OSS 正常路径，不算问题）；配了却装不起来必须显式亮红——
+  // 这正是 doctor 存在的意义：装载失败时其它命令都退非零，只有 doctor 还能告诉你为什么。
+  if (extError) ck('扩展包', false, extError.slice(0, 160));
+  else out(`· 扩展包：${activePackName()}${activePackName() === '(none)' ? `（未配置，纯核心运行；见 ${EXT_DIR}）` : ''}`);
   out(bad === 0 ? '\n全部就绪。' : `\n${bad} 项需处理。`);
   process.exitCode = bad === 0 ? 0 : 1;
 }
@@ -386,9 +397,24 @@ async function showCmd(idOrSlug: string): Promise<void> {
 async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   const { pos, flags } = parseArgs(rest);
+  // 扩展包先装：help 要列它的命令、doctor 要报它的状态、default 分支要分派到它。
+  // 装载失败**不在这里抛**——那会让 `forge doctor`（唯一能告诉你为什么失败的命令）自己也跑不起来。
+  // 改为记下来：doctor 显示它，其它任何命令都拒绝执行并退非零（存在即必须装成功，绝不静默降级）。
+  let extError: string | null = null;
+  try {
+    await loadExtensions();
+  } catch (e) {
+    extError = String(e instanceof Error ? e.message : e);
+  }
+  if (extError && cmd !== 'doctor') {
+    log.err(`扩展包装载失败，已拒绝执行「${cmd ?? '(空)'}」：${extError}`);
+    log.err('跑 `forge doctor` 看详情；确实不想要扩展就清掉 FORGE_EXT_DIR / 移走 $FORGE_HOME/ext。');
+    process.exitCode = 1;
+    return;
+  }
   switch (cmd) {
     case 'doctor':
-      doctor();
+      doctor(extError);
       break;
     case 'add': {
       const r = await addPrd({
@@ -615,10 +641,18 @@ async function main(): Promise<void> {
     case '--help':
       help();
       break;
-    default:
+    // 核心命令没有匹配上，才轮到扩展命令——**同名时核心永远优先**。
+    // 这是刻意的单向优先：下游不能靠重名悄悄改掉 `go` / `merged` 这类带权限与红线的核心动作。
+    default: {
+      const ext = extCommands().find((c) => c.name === cmd);
+      if (ext) {
+        await ext.run({ argv: rest, pos, flags });
+        break;
+      }
       log.err(`未知命令：${cmd}`);
       help();
       process.exitCode = 1;
+    }
   }
 }
 
