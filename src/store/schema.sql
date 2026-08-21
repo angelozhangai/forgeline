@@ -128,7 +128,7 @@ CREATE INDEX IF NOT EXISTS idx_event_session ON event_log(session_id);
 CREATE INDEX IF NOT EXISTS idx_event_session_kind_ts ON event_log(session_id, kind, ts);
 
 -- 群消息补拉游标：每群一行，last_ts = 已处理到的消息 create_time(毫秒)。
--- 离线→开机后从 last_ts 拉群历史，补回漏掉的 PRD（详见 feishu/backfill.ts）。
+-- 离线→开机后从 last_ts 拉群历史，补回漏掉的 PRD（详见 messaging/backfill.ts）。
 CREATE TABLE IF NOT EXISTS chat_cursor (
   chat_id  TEXT PRIMARY KEY,
   last_ts  INTEGER NOT NULL

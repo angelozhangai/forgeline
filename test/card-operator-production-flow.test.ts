@@ -106,7 +106,7 @@ mock.module('../src/orchestrator/worker.ts', {
 });
 
 mock.module('../src/intake.ts', { namedExports: { addPrd: async () => ({ ok: true, msg: 'mocked intake' }) } });
-mock.module('../src/feishu/backfill.ts', { namedExports: { backfillAll: async () => {} } });
+mock.module('../src/messaging/backfill.ts', { namedExports: { backfillAll: async () => {} } });
 mock.module('../src/health/alert.ts', { namedExports: { sendHealthAlert: async () => {} } });
 mock.module('../src/writes.ts', {
   namedExports: {
