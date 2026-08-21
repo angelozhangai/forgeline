@@ -9,7 +9,7 @@ import { confirm, submitPmAnswers, requestGateB, submitGateBAnswers, forceGateBG
 import { readFileSync, existsSync } from 'node:fs';
 import { parseHumanAsks, parseOpenQuestions, openQuestionsToDecisions, composeDecisionAnswer } from '../gates/envelopes.ts';
 import { addPrd } from '../intake.ts';
-import { backfillAll } from '../feishu/backfill.ts';
+import { backfillAll } from '../messaging/backfill.ts'; // provider 无关的补拉循环（历史那一次 API 往返在 adapter 里）
 import { maybeBackup } from '../store/backup.ts';
 import { notify, syncGroupCard } from '../notify.ts';
 import { port } from '../messaging/index.ts';
@@ -399,7 +399,7 @@ export async function listen(): Promise<void> {
   try {
     await channel.connect();
     markWs(true, Date.now());
-    log.ok('飞书长连接已建立（卡片按钮回调 + 群消息入口已就绪）');
+    log.ok(`${port.id} 长连接已建立（卡片按钮回调 + 群消息入口已就绪）`);
     void runCycle(); // 开机首次：立即捞离线期间 PM 发的需求
   } catch (e) {
     markWs(false, Date.now());

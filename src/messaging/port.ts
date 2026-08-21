@@ -35,6 +35,10 @@ export interface InboundProbe {
 }
 
 export interface MessagingPort {
+  // provider 标识（'feishu' / 'slack' / …）。核心只拿它做**展示与日志**（健康检查项名、启动日志），
+  // 绝不据此分支业务逻辑——一旦出现 `if (port.id === 'feishu')`，这条缝就白开了。
+  readonly id: string;
+
   // ── 出站：决策/通知卡 ──
   // M 私聊卡（裁决/出方案/立项/失败重试…）。返回是否送达（失败由调用方决定降级）。
   sendDmCard(card: CardModel): Promise<boolean>;
@@ -61,6 +65,15 @@ export interface MessagingPort {
   inboundConfigured(): boolean;
   // 起入站长连接：adapter 建 channel、把自家原始事件转发给 handlers，返回可 connect 的句柄。
   startInbound(handlers: InboundHandlers): InboundChannel;
+
+  // ── 入站：历史补拉（长连接断开期间的群消息，provider 不会重连补推）──
+  // 「读哪些群/频道」是 provider 专属配置（飞书 FEISHU_WATCH_CHATS / Slack SLACK_WATCH_CHANNELS…），
+  // adapter 各自读自家 env；核心只拿这份 id 列表去种子化游标。
+  watchedChats(): string[];
+  // 拉某群自 sinceMs（毫秒水位）**之后**的历史，按时间升序返回。分页、鉴权、错误兜底全在 adapter 内部：
+  // 这是 best-effort 通道（拉不动就返回已拿到的部分 + 记日志），绝不抛——补拉失败不该拖垮周期循环。
+  // 边界语义由核心复核：adapter 可因秒级 start_time 精度多返回边界那条，核心按 createTime 再过滤一次。
+  listHistorySince(chatId: string, sinceMs: number): Promise<InboundMessage[]>;
 
   // 入站传输契约探针：只读往返验自家 IM API 信封（feishu im/v1/messages 分页字段等）。
   probe(): Promise<InboundProbe>;

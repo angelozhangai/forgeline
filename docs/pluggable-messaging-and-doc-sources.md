@@ -19,7 +19,7 @@ An audit of the actual coupling found the seam holds — with four residual leak
 | --- | --- | --- |
 | 1 | **The document layer was never abstracted at all.** PRD read-in and machine-review comment write-back are wired straight to Feishu Docs. | [src/intake.ts](../src/intake.ts), [src/feishu/doc.ts](../src/feishu/doc.ts), [src/workspace.ts](../src/workspace.ts), [src/gates/gateA.ts](../src/gates/gateA.ts), [src/actions.ts](../src/actions.ts) |
 | 2 | `extractFeishuLinks` — a Feishu URL regex — lives in the core. | [src/util/links.ts](../src/util/links.ts) |
-| 3 | **Offline backfill bypasses the port entirely**; `MessagingPort` has no history method. | [src/daemon/listen.ts](../src/daemon/listen.ts) → [src/feishu/backfill.ts](../src/feishu/backfill.ts) |
+| 3 | ~~**Offline backfill bypasses the port entirely**; `MessagingPort` has no history method.~~ **Closed in Phase 0** — the loop is core-side, the API call is behind `listHistorySince`. | [src/messaging/backfill.ts](../src/messaging/backfill.ts) |
 | 4 | Feishu names baked into config, DB columns, probe enum and health labels. | [src/config.ts](../src/config.ts), [src/store/schema.sql](../src/store/schema.sql), [src/llm/probes.ts](../src/llm/probes.ts), [src/health/check.ts](../src/health/check.ts) |
 
 Leak 3 is why README's "A Slack adapter is one file away, with the core untouched" is a slight
@@ -217,12 +217,22 @@ Ordering principle: each phase ends green, and Feishu behaviour is unchanged unl
 | | Task | Files |
 | --- | --- | --- |
 | 0.1 | Add `id`, `watchedChats()`, `listHistorySince()` to `MessagingPort`; implement on the Feishu adapter | `messaging/port.ts`, `messaging/feishu.ts` |
-| 0.2 | Move the backfill **loop** into a core-side `messaging/backfill.ts`; the Feishu side keeps only the `im/v1/messages` call | new `messaging/backfill.ts`, `feishu/backfill.ts` |
+| 0.2 | Move the backfill **loop** into a core-side `messaging/backfill.ts`; the Feishu side keeps only the `im/v1/messages` call | new `messaging/backfill.ts`, `feishu/backfill.ts` → `feishu/history.ts` |
 | 0.3 | `daemon/listen.ts` stops importing `../feishu/backfill.ts` | `daemon/listen.ts` |
 | 0.4 | Drop the `daemon/listen.ts` entry from the arch-boundary whitelist | `test/arch-boundary.test.ts` |
 
 **DoD**: whitelist down from 3 entries to 2; identical chats still backfilled; `npm run ci` green;
 `TEST_COUNT_FLOOR` raised.
+
+**Landed** ([#9](https://github.com/angelozhangai/forgeline/pull/9)). Two notes for later phases:
+
+- **D1 stays open, but the evidence is now cheap to collect.** The adapter maps `mentions` faithfully
+  (absent field → `null`, which is *not* the same as "nobody was mentioned"), and the core loop
+  deliberately does not read it. Whether Feishu history items actually carry the field is one live-tenant
+  run away, and `test/messaging-feishu-history.test.ts` already pins both branches.
+- **Backfilled sessions still lose `posterId` / `intakeMsgId`.** The loop now *sees* the full
+  `InboundMessage`, so passing them through is a two-line change — but it would alter Feishu behaviour
+  (offline-registered sessions would start replying in-thread), and Phase 0 was a pure refactor. Follow-up.
 
 ### Phase 1 — `DocSourcePort`
 
@@ -318,7 +328,7 @@ Tracked in [#2](https://github.com/angelozhangai/forgeline/issues/2).
 
 | Phase | Issue | Status |
 | --- | --- | --- |
-| 0 — transport seam | [#3](https://github.com/angelozhangai/forgeline/issues/3) | not started |
+| 0 — transport seam | [#3](https://github.com/angelozhangai/forgeline/issues/3) | ✅ done |
 | 1 — `DocSourcePort` | [#4](https://github.com/angelozhangai/forgeline/issues/4) | not started |
 | 2 — plaintext source | [#5](https://github.com/angelozhangai/forgeline/issues/5) | not started |
 | 3 — Slack adapter | [#6](https://github.com/angelozhangai/forgeline/issues/6) | not started |
