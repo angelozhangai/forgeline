@@ -2,8 +2,11 @@
 // 所有 IM 传输细节必须收敛在 messaging/feishu.ts adapter 后，核心只依赖 provider 无关的 MessagingPort。
 // 这是 README「接 Slack 核心一行不动」论断的机器守护：任何人再把 feishu/lark import 漏进核心 → CI 红。
 //
-// 关键：白名单按 **「文件 → 允许的 specifier」** 精确控制，而非整文件放行——否则 daemon/listen.ts 因合法
-// import feishu/backfill 被整体放行后，未来在它里面直 import lark SDK 仍能过 CI（正是 P2 要堵的洞）。
+// 关键：白名单按 **「文件 → 允许的 specifier」** 精确控制，而非整文件放行——否则一个文件因某一条合法
+// import 被整体放行后，未来在它里面直 import lark SDK 仍能过 CI。
+//
+// 白名单是**棘轮，只许变短**：daemon/listen.ts 那条（离线补拉直连 feishu/backfill）已在 Phase 0 拿掉——
+// 补拉循环上移到 provider 无关的 messaging/backfill.ts，历史那一次 API 往返收进 adapter。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
@@ -13,11 +16,9 @@ import { fileURLToPath } from 'node:url';
 const SRC = join(fileURLToPath(new URL('..', import.meta.url)), 'src');
 
 // 每个文件允许直连的飞书/lark import specifier 子串。未列出的文件：一律不许出现 feishu/ 或 larksuiteoapi。
-// 注意 daemon/listen.ts 只许 feishu/backfill——**不含** lark SDK：未来在它里面直 import lark 会被逮。
 const ALLOW: Record<string, string[]> = {
-  'messaging/feishu.ts': ['feishu/', 'larksuiteoapi'], // 唯一 adapter：lark 长连接 + feishu/* 收发渲染 + im 探针
-  'intake.ts': ['feishu/doc'], // 读飞书文档（doc 层，README 明确豁免）
-  'daemon/listen.ts': ['feishu/backfill'], // 离线补拉（auth/doc 豁免）——仅此一项，绝不含 larksuiteoapi
+  'messaging/feishu.ts': ['feishu/', 'larksuiteoapi'], // 唯一 adapter：lark 长连接 + feishu/* 收发渲染 + 群历史 + im 探针
+  'intake.ts': ['feishu/doc'], // 读飞书文档（doc 层，README 明确豁免）——Phase 1 收进 docs/feishu.ts 后一并拿掉
 };
 // feishu/* 目录本就是飞书 provider 层：内部互相 import + 可用 lark SDK。
 function allowedFor(rel: string): string[] {
@@ -89,7 +90,10 @@ test('架构边界：真实 src 上线闸不允许核心层直连 feishu/* 或 l
   );
 });
 
-test('架构边界：listen 合法补拉不能掩护动态 import lark SDK 回流核心层', () => {
+// Phase 0 关缝：listen 连「离线补拉」这条唯一合法豁免都不再有了。补拉循环走 messaging/backfill.ts，
+// 群历史那一次 API 往返收在 adapter 里（port.listHistorySince）。这条用例钉死缝已合上——
+// 谁再把 feishu/* 拉回 listen（哪怕是当年那条合法的 backfill），闸就红。
+test('架构边界：Phase 0 后 listen 连合法补拉都不许直连 feishu/*', () => {
   const offenders = boundaryOffenders([
     {
       rel: 'daemon/listen.ts',
@@ -102,7 +106,12 @@ test('架构边界：listen 合法补拉不能掩护动态 import lark SDK 回�
       `,
     },
   ]);
-  assert.deepEqual(offenders, ['daemon/listen.ts → @larksuiteoapi/node-sdk']);
+  assert.deepEqual(offenders, ['daemon/listen.ts → ../feishu/backfill.ts', 'daemon/listen.ts → @larksuiteoapi/node-sdk']);
+});
+
+// 白名单是棘轮：加一条豁免 = 往缝里开一个洞，必须是有意的（改这个断言）而非顺手加一行。
+test('架构边界：飞书豁免白名单只剩 adapter + intake 两条（只许变短）', () => {
+  assert.deepEqual(Object.keys(ALLOW).sort(), ['intake.ts', 'messaging/feishu.ts']);
 });
 
 test('架构边界：核心层用副作用 import 或 require 偷接 lark SDK 时发布闸必须红', () => {

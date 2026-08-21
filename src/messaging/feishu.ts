@@ -8,6 +8,7 @@
 // 这是「散文内容」而非「结构」，未来 Slack adapter 对散文块统一做 <font>→自家强调的转换即可。
 import * as lark from '@larksuiteoapi/node-sdk';
 import { sendBotCardObject, sendBotCard, botTenantToken, botOpenId, botOpenIdCached, FEISHU_BASE } from '../feishu/dm.ts';
+import { listMessages, type FeishuHistMsg } from '../feishu/history.ts';
 import { replyCard, patchCard, sendCardToChat } from '../feishu/group.ts';
 import { postCard } from '../feishu/notify.ts';
 import { petImageKey } from '../feishu/petAssets.ts';
@@ -209,7 +210,48 @@ export function formValue(evt: Record<string, unknown>): Record<string, string> 
   return fv ?? {};
 }
 
+// 观察群列表（补拉遍历 + 契约探针取样共用同一份解析，避免两处各写一遍逗号切分而漂移）。
+function watchChats(): string[] {
+  const env = loadConfig().env;
+  return (env.FEISHU_WATCH_CHATS || env.FEISHU_REVIEW_CHAT_ID || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+}
+
+// 历史条目 → provider 无关 InboundMessage。与 parseMessage 保持同样的兜底口径：
+// 正文取 body.content 里的 text，另附整条序列化文本块供核心兜底抽链接（分享卡/富文本的链接不在正文）。
+function histToInbound(m: FeishuHistMsg, chatId: string): InboundMessage {
+  let text = '';
+  if (m.body?.content) {
+    try {
+      text = (JSON.parse(m.body.content) as { text?: string }).text ?? '';
+    } catch {
+      text = m.body.content;
+    }
+  }
+  const n = Number(m.create_time) || 0;
+  const createTime = n > 0 && n < 1e12 ? n * 1000 : n; // 飞书历史给秒级，live 事件给毫秒 → 统一成毫秒
+  const botId = botOpenIdCached();
+  // mentions 缺失（信封没这个字段）与「真的没人 @」不可区分 → 前者只能报 null（无法确认）。
+  // 核心的补拉循环 Phase 0 不读这个字段（见 messaging/backfill.ts 里的 D1 说明），此处如实映射，
+  // 让「历史条目到底带不带 mentions」在真实租户上一验即知，而不是靠猜。
+  const mentionedBot = m.mentions === undefined || botId === null ? null : m.mentions.some((mn) => mn?.id?.open_id === botId);
+  return {
+    type: 'message',
+    chatId: m.chat_id || chatId,
+    senderId: m.sender?.id,
+    messageId: m.message_id,
+    text,
+    searchTexts: [JSON.stringify(m)],
+    createTime,
+    isGroup: true, // 补拉只针对群/频道历史
+    mentionedBot,
+  };
+}
+
 const feishuPort: MessagingPort = {
+  id: 'feishu',
   async sendDmCard(card) {
     return sendBotCardObject(renderFeishuCard(card));
   },
@@ -304,11 +346,19 @@ const feishuPort: MessagingPort = {
     channel.on('reconnected', () => handlers.onReconnected());
     return { connect: () => channel.connect() };
   },
+  watchedChats(): string[] {
+    return watchChats();
+  },
+  async listHistorySince(chatId: string, sinceMs: number): Promise<InboundMessage[]> {
+    // 飞书 start_time 是**秒**级：向下取整可能把水位那一秒的消息带回来，核心按 createTime 毫秒再滤一次。
+    const items = await listMessages(chatId, Math.floor(sinceMs / 1000));
+    return items.map((m) => histToInbound(m, chatId));
+  },
   async probe(): Promise<InboundProbe> {
-    // 只读、page_size=1、无副作用：验的正是 backfill.ts 依赖的 im/v1/messages 分页信封。
+    // 只读、page_size=1、无副作用：验的正是 listHistorySince 依赖的 im/v1/messages 分页信封。
     // 飞书 IM API 细节（base/token/分页字段）收敛在 adapter，不泄进 llm/health 层。
     const { env } = loadConfig();
-    const chat = (env.FEISHU_WATCH_CHATS || env.FEISHU_REVIEW_CHAT_ID || '').split(',').map((s) => s.trim()).filter(Boolean)[0];
+    const chat = watchChats()[0];
     if (!env.FEISHU_BOT_APP_ID || !env.FEISHU_BOT_APP_SECRET || !chat) {
       return { available: false, ok: false, detail: '飞书 bot/观察群未配齐（跳过）' };
     }
