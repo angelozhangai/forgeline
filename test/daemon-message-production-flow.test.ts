@@ -67,7 +67,7 @@ mock.module('../src/orchestrator/worker.ts', {
     },
   },
 });
-mock.module('../src/feishu/backfill.ts', { namedExports: { backfillAll: async () => {} } });
+mock.module('../src/messaging/backfill.ts', { namedExports: { backfillAll: async () => {} } });
 mock.module('../src/health/alert.ts', { namedExports: { sendHealthAlert: async () => {} } });
 
 const { __handleMessageForTest } = await import('../src/daemon/listen.ts');

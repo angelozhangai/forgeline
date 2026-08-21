@@ -48,8 +48,8 @@ PM posts PRD ─▶ Gate A (review requirements against the code source of truth
 | Feature | Status | Source of truth |
 | --- | --- | --- |
 | Manual `add --prd` (register a PRD link) | ✅ | [src/intake.ts](../src/intake.ts) |
-| Auto-intake from group chat (paste a link → `addPrd`) | 🟡 requires an "@bot" mention / bot-token trigger | [src/feishu/backfill.ts](../src/feishu/backfill.ts), [daemon/listen.ts](../src/daemon/listen.ts) |
-| Offline backfill after disconnect/sleep (incremental per-chat cursor) | ✅ | [src/feishu/backfill.ts](../src/feishu/backfill.ts) |
+| Auto-intake from group chat (paste a link → `addPrd`) | 🟡 requires an "@bot" mention / bot-token trigger | [src/messaging/backfill.ts](../src/messaging/backfill.ts), [daemon/listen.ts](../src/daemon/listen.ts) |
+| Offline backfill after disconnect/sleep (incremental per-chat cursor) | ✅ | [src/messaging/backfill.ts](../src/messaging/backfill.ts) (provider-agnostic loop) |
 | **PRD-level idempotency** (doc-token normalization for dedupe + partial unique index as a concurrency backstop) | ✅ | [src/intake.ts](../src/intake.ts), [src/store/sessions.ts](../src/store/sessions.ts) |
 
 ### 3.2 Upstream: Gate A (requirements review)

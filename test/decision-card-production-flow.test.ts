@@ -69,7 +69,7 @@ mock.module('../src/feishu/group.ts', {
   },
 });
 
-mock.module('../src/feishu/backfill.ts', {
+mock.module('../src/messaging/backfill.ts', {
   namedExports: {
     backfillAll: async () => {},
   },
