@@ -102,7 +102,16 @@ test('parseRef：飞书链接认；非飞书链接不认（留给别的源/兜�
 });
 
 test('parseRef：裸 token 也收（CLI 允许直接贴 token，沿用旧行为），无 url', () => {
-  assert.deepEqual(fs.feishuDocs.parseRef('KRKfwhzDbiwnc'), { source: 'feishu', token: 'KRKfwhzDbiwnc', url: undefined });
+  assert.deepEqual(fs.feishuDocs.parseRef('KRKfwhzDbiwnc'), { source: 'feishu', token: 'KRKfwhzDbiwnc' });
+});
+
+// 「任何不含 / 的字符串都算裸 token」曾经会把一整句需求收成飞书文档：既登记出一条读不出正文的需求，
+// 又把本该轮到兜底源（plaintext）的消息半路截走。裸 token 必须长得像 token。
+test('parseRef：一句话不是裸 token——不认，留给兜底源', () => {
+  assert.equal(fs.feishuDocs.parseRef('把退款按钮挪到订单详情页顶部'), null);
+  assert.equal(fs.feishuDocs.parseRef('help me review this'), null, '带空格的一律不是 token');
+  assert.equal(fs.feishuDocs.parseRef('ABC123'), null, '太短，不像真 token');
+  assert.equal(fs.feishuDocs.parseRef('tok_with_underscore_x'), null, '非字母数字');
 });
 
 test('read：/docx/ 直链走 docx raw_content，不走 feishu-doc.js read（旧坑：doc_id 会被当 wiki 节点解析失败）', async () => {
