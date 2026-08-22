@@ -21,6 +21,9 @@ import type { InboundChannel, InboundHandlers, InboundProbe, MessagingPort } fro
 
 export const SLACK_PROVIDER_ID = 'slack';
 
+// 鉴权失效时给操作者的处置指引（随探针结果上浮到告警里）。
+const SLACK_AUTH_FIX = '检查 Slack token 与权限（SLACK_BOT_TOKEN 是否失效、bot 是否已 /invite 进该频道、channels:history scope 是否授予）';
+
 // 语义色 → attachment 左侧色条。Slack 只吃 hex，没有模板色的概念。
 const COLOR_HEX: Record<CardColor, string> = {
   red: '#e01e5a',
@@ -375,7 +378,7 @@ const slackPort: MessagingPort = {
     const r = await slackApi('conversations.history', { channel: chat, limit: 1 });
     const raw = JSON.stringify(r).slice(0, 400);
     if (!r.ok) {
-      return { available: true, ok: false, kind: 'auth', detail: `conversations.history error=${r.error}（凭据/权限/未加频道）`, raw };
+      return { available: true, ok: false, kind: 'auth', detail: `conversations.history error=${r.error}（凭据/权限/未加频道）`, raw, authFix: SLACK_AUTH_FIX };
     }
     // 验的正是 listHistorySince 依赖的信封：messages 数组 + has_more。
     const hasMessages = Array.isArray(r.messages);

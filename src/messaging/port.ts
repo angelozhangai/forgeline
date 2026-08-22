@@ -22,16 +22,20 @@ export interface InboundChannel {
 }
 
 // 入站传输的契约探针结果（provider 无关）：对自家 IM API 跑一发最便宜的只读往返，断言我们依赖的
-// 信封字段还在。available=凭据齐能探；ok=信封完好。adapter 内部实现（feishu im/v1/messages 等细节
-// 不泄进 llm/health 层）；llm/probes 的 probeFeishu 只做薄壳映射成统一 ProbeResult。
+// 信封字段还在。available=凭据齐能探；ok=信封完好。adapter 内部实现（飞书的 im/v1/messages、
+// Slack 的 conversations.history 等细节不泄进 llm/health 层）；llm/probes 的 probeIm 只做薄壳映射。
 export interface InboundProbe {
   available: boolean;
   ok: boolean;
   detail: string;
   raw?: string;
-  // !ok 归因（同 ProbeResult.kind，由 probeFeishu 透传到 health/contract 告警分流）：
+  // !ok 归因（同 ProbeResult.kind，由 probeIm 透传到 health/contract 告警分流）：
   // auth=凭据/权限/网络（重新登录·查权限·加群，非改 contract.ts）；drift=信封字段缺失（改 contract.ts）。
   kind?: 'auth' | 'drift';
+  // kind='auth' 时的**处置指引**（"去哪儿改什么"）。由 adapter 提供而非核心硬编码：
+  // 「飞书 token 怎么续」和「Slack 要哪个 scope」是 provider 知识，核心写死一份就等于替所有 provider 说话，
+  // 而且加一个 provider 就得回来改核心。缺省时 health/contract 会退到一句通用文案。
+  authFix?: string;
 }
 
 export interface MessagingPort {

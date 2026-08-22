@@ -39,6 +39,7 @@ assert.equal((legacy.prepare('PRAGMA user_version').get() as { user_version: num
 legacy.close();
 
 const sessions = await import('../src/store/sessions.ts');
+const { latestMigrationVersion, MIGRATIONS } = await import('../src/store/db.ts');
 
 test('存量老库有重复 doc token：v1 迁移照常完成（改名 + 补源前缀），服务可启动', async () => {
   // 第一次 listAll 触发 db() → 跑 v1。重复值只让唯一索引建不上，绝不能让迁移回滚。
@@ -61,7 +62,8 @@ test('迁移把旧唯一索引摘干净了（列已改名，留着必然坏）',
     const names = (d.prepare("SELECT name FROM sqlite_master WHERE type='index' AND name LIKE 'idx_%'").all() as { name: string }[]).map((r) => r.name);
     assert.ok(!names.includes('idx_session_doc_token'), '旧索引应已 DROP');
     assert.ok(!names.includes('idx_session_doc_ref'), '存量重复值仍在 → 新唯一索引这次不该建上（待人工清理）');
-    assert.equal((d.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, 1);
+    // 版本推到最新（迁移是 forward-only 的棘轮；具体到几由 MIGRATIONS 说了算，别在这儿写死数字）。
+    assert.equal((d.prepare('PRAGMA user_version').get() as { user_version: number }).user_version, latestMigrationVersion(MIGRATIONS));
   } finally {
     d.close();
   }

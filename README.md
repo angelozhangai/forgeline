@@ -50,7 +50,10 @@ Any gate can **park** (`*_STALLED` / `*_FAILED`) instead of guessing: unresolved
 - **Code-anchored review** — every gate fetches the target repos, pins ref+sha in the prompt, and verifies the working checkout actually sits on that sha (`anchorCheck`); drift is disclosed to the model or blocks the gate. No confident conclusions about stale code.
 - **Session-resume token economics** — multi-round loops resume the same Claude/Codex sessions (`--resume` / `codex exec resume`), resending only deltas.
 - **A reusable review⇄fix engine** ([src/review/reviewFixLoop.ts](src/review/reviewFixLoop.ts)) — the "reviewer judges → fixer revises → human escalation → round caps" loop is one generic engine, reused by Gates A, B, and D.
-- **Messaging as a thin port** — the core depends on a provider-agnostic `MessagingPort` + semantic `CardModel`; Feishu (Lark) is the bundled adapter (long-connection daemon, interactive cards, offline backfill). A Slack adapter is one file away, with the core untouched.
+- **Two independent pluggable axes — the IM and the document source.**
+  - *Messaging*: the core depends on a provider-agnostic `MessagingPort` + semantic `CardModel`. **Feishu (Lark) and Slack both ship**; pick one with `FORGE_MESSAGING_PROVIDER` (default `feishu`). An unknown value is a hard startup error — never a silent fallback, because a typo that quietly keeps sending everything to the old provider has no symptom at all. Slack needs no extra npm dependency: raw `fetch` for the Web API, Node's native `WebSocket` for Socket Mode.
+  - *Documents*: requirement docs come through a `DocSourcePort` **registry** — not a selection point, because one message may legitimately carry links from several sources. Feishu Docs ships; a `plaintext` fallback source (the message body *is* the requirement) ships **default-off**, so Slack can run with no document service at all. Adding a source is one file plus one line in `src/docs/index.ts`.
+  - Both seams are machine-guarded: [test/arch-boundary.test.ts](test/arch-boundary.test.ts) fails CI if core code imports a provider's raw layer or a concrete document source directly.
 - **Ops for a real service** — launchd daemon + watchdog (distinguishes *dead* from *wedged*, grace-periods active gates before force-restart), hourly SQLite backups, a localhost status page + web action panel that reuses the same permission gates as the CLI and cards.
 - **Progressive autonomy** (default 0 = fully manual) — levels that auto-advance only *authorization-only* stops, with red lines no level can cross: never auto-merge, never skip a red CI, never answer a human-escalation on a human's behalf.
 - **Multi-project / multi-tenant** — per-project permissions, routing, assignment pools, and prompt variants; one daemon serves them all.
@@ -76,7 +79,7 @@ cp config/forge.env.example config/forge.env   # point FORGE_PROJECT_ROOT at you
 ./forge show <slug>               # state, event timeline, cost
 ```
 
-For the always-on experience — Feishu long connection, chat-message intake, card buttons for the whole flow, watchdog, status page — see [deploy/README.md](deploy/README.md) (`./forge listen`, `./deploy/install.sh`).
+For the always-on experience — IM long connection (Feishu or Slack), chat-message intake, card buttons for the whole flow, watchdog, status page — see [deploy/README.md](deploy/README.md) (`./forge listen`, `./deploy/install.sh`). Setup for both providers and for document sources: [docs/pluggable-messaging-and-doc-sources.md](docs/pluggable-messaging-and-doc-sources.md); the env keys are documented inline in [config/forge.env.example](config/forge.env.example).
 
 Forge treats the **target project as pluggable**: mechanical actions (creating issues, publishing docs, running CI) are delegated to the project's own scripts, or to the built-in native GitHub adapter (`gh`) for projects without them. Register multiple projects via `config/projects.yaml` ([example](config/projects.yaml.example)).
 
@@ -167,7 +170,8 @@ With no pack configured every path above is byte-for-byte what it was before, an
 
 ```
 src/         statemachine · orchestrator · gates · review engine · llm drivers · store (SQLite)
-             messaging port + feishu adapter · daemon · health/watchdog · drift · eval · project adapters
+             messaging port (feishu / slack adapters) · docs port (doc-source registry)
+             daemon · health/watchdog · drift · eval · project adapters
              ext/ = extension seam (ExtensionPack port + loader) for downstream products
 prompts/     externalized gate templates (override via FORGE_PROMPTS_DIR)
 config/      runtime.yaml · routing.yaml · permissions.yaml · assignment.yaml (+ .example files)

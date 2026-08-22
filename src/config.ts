@@ -115,7 +115,7 @@ export interface PermissionsConfig {
   gate_c_allowed?: string[]; // 谁能触发闸C（实现）；缺省回退 go_approvers
   pr_create_approvers?: string[]; // 谁能触发开 PR + 闸D；缺省回退 go_approvers
   merge_ack_allowed?: string[]; // 谁能确认已人工合并（→ SHIPPED）；缺省回退 go_approvers
-  operators?: Record<string, string>; // 飞书 open_id → 短码（多人用：卡片回调按真实点击人裁决；缺省=单人，一律当 M）
+  operators?: Record<string, string>; // IM 用户 id（飞书 open_id / Slack user id）→ 短码（多人用：卡片回调按真实点击人裁决；缺省=单人，一律当 M）
 }
 
 export interface AssignmentConfig {

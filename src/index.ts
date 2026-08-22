@@ -64,13 +64,13 @@ function help(): void {
 
   doctor                              环境自检（主仓/三仓/claude/codex/gh/配置/DB）·静态
   health  [--json]                    运行时活检（守护心跳/长连接/DB/备份/依赖/磁盘）+ 状态页地址
-  status-page                         独立预览状态页（只起健康服务，不跑 tick/不连飞书/不花钱；Ctrl-C 退出）
+  status-page                         独立预览状态页（只起健康服务，不跑 tick/不连 IM/不花钱；Ctrl-C 退出）
   watchdog                            看门狗一次性探活+自愈+告警（launchd StartInterval 调，人工很少手敲）
-  contract-check                      主动探外部 CLI/API 输出契约（codex/claude 各一发付费 trivial + gh/飞书免费）→ 落库+漂移告警
-  add --prd <飞书链接> [--slug s]      登记一个 PRD（读文档建 session）
+  contract-check                      主动探外部 CLI/API 输出契约（codex/claude 各一发付费 trivial + gh/IM 免费）→ 落库+漂移告警
+  add --prd <需求文档链接> [--slug s]  登记一个 PRD（读文档建 session；链接归哪个文档源由注册表判定）
       [--title t] [--branch prod|dev] [--chat <chatId>] [--project <id>]
   tick                                推进所有 ready session（闸A / 闸B+对抗）
-  listen                              常驻守护：飞书长连接(卡片按钮+群消息入口) + 周期 tick
+  listen                              常驻守护：IM 长连接(卡片按钮+群消息入口) + 周期 tick
   control [--port N] [--host H]        控制面 HTTP server（只 /jobs+/store，不跑编排）；要编排+服务一体用 listen 配 FORGE_CONTROL_PORT（FORGE_CONTROL_* 配端口/鉴权；非回环须 token）
   list | board  [--project <id>]      列出所有 session 及状态（--project 按项目过滤）
   show <id|slug>                      查看某 session 详情 + 事件链

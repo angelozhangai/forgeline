@@ -84,6 +84,8 @@ function legacyDb(): DatabaseSync {
     issue_ref TEXT
   );`);
   d.exec('CREATE UNIQUE INDEX idx_session_doc_token ON session(feishu_doc_token) WHERE feishu_doc_token IS NOT NULL;');
+  // v2 要动这张表；真老库里它一定在（schema.sql 建库时就有）。
+  d.exec('CREATE TABLE contract_probe (dep TEXT PRIMARY KEY, ok INTEGER, detail TEXT, raw TEXT, checked_at INTEGER);');
   return d;
 }
 const cols = (d: DatabaseSync): string[] =>
@@ -139,4 +141,26 @@ test('v1：升级后仍能按 doc_ref 去重——两条相同 ref 的行会被�
   // 无文档的行不受约束（部分索引）：手动 add 可以有很多条
   d.prepare('INSERT INTO session (id, doc_ref) VALUES (?,?)').run('m1', null);
   d.prepare('INSERT INTO session (id, doc_ref) VALUES (?,?)').run('m2', null);
+});
+
+// ── v2：契约探针的 dep 'feishu' → 'im' ──
+// 这一项探的是**当前生效的那个 IM provider**，不是某一家。不改的话，换到 Slack 的部署会盯着
+// 一行叫「feishu」的探针结果，而它其实探的是 Slack。
+test('v2：存量 contract_probe 的 feishu 行改名成 im，其余行不动', () => {
+  const d = legacyDb();
+  const ins = d.prepare('INSERT INTO contract_probe (dep, ok, detail, checked_at) VALUES (?,?,?,?)');
+  ins.run('feishu', 1, '飞书 im/v1/messages 分页信封完好', 100);
+  ins.run('codex', 0, '缺 thread.started', 100);
+  applyMigrations(d, MIGRATIONS);
+  const rows = (d.prepare('SELECT dep, detail FROM contract_probe ORDER BY dep').all() as Record<string, unknown>[]).map((r) => ({ ...r }));
+  assert.deepEqual(rows, [
+    { dep: 'codex', detail: '缺 thread.started' },
+    { dep: 'im', detail: '飞书 im/v1/messages 分页信封完好' },
+  ]);
+});
+
+test('v2：库里本来就没有 feishu 行也不出错（全新装 / 从没探测过）', () => {
+  const d = legacyDb();
+  assert.equal(applyMigrations(d, MIGRATIONS), latestMigrationVersion(MIGRATIONS));
+  assert.equal((d.prepare('SELECT count(*) AS n FROM contract_probe').get() as { n: number }).n, 0);
 });

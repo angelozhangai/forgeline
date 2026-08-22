@@ -36,6 +36,9 @@ mock.module('../src/docs/feishu.ts', {
   },
 });
 
+// 没给来源群时的兜底走 port.watchedChats()（Phase 4：不再写死 FEISHU_REVIEW_CHAT_ID）。
+mock.module('../src/messaging/index.ts', { namedExports: { port: { id: 'fake', watchedChats: () => ['oc_default'] } } });
+
 mock.module('../src/llm/runClaude.ts', {
   namedExports: {
     runClaudeBare: async () => slugProposal,
@@ -113,6 +116,13 @@ test('addPrd：显式 slug/branch 优先，文档读取失败不创建 session',
   assert.match(fail.msg, /读需求文档失败/);
   assert.match(fail.msg, /文档无权限/); // 原始错因透传，不含糊
   assert.equal((await sessions.listAll()).length, before);
+});
+
+test('addPrd：没给来源群 → 回落到当前 provider 的第一个观察群（不写死某一家的 env）', async () => {
+  prdOk = true;
+  slugProposal = 'chat-fallback';
+  const r = await addPrd({ doc: ref('https://x.feishu.cn/docx/CHATFALLBACK') });
+  assert.equal(r.session?.chat_id, 'oc_default');
 });
 
 test('addPrd：未注册的文档源直接拒收（登记进去也读不出正文，只会变成一条永远停泊的需求）', async () => {
