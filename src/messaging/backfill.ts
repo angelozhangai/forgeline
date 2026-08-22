@@ -3,10 +3,12 @@
 // 群聊历史本身就是「队列」：chat_cursor 记我们处理到哪条水位，addPrd 按文档去重，重复补拉无害。
 //
 // 为什么这段留在核心、只有那一次 API 往返在 adapter：这里的每一行都是「离线不漏需求」的正确性逻辑
-// ——水位只前进、边界那条再过滤一次、防重入、抽链接的兜底顺序。它跟用哪个 IM 无关。换 Slack 时
-// 只需 slack adapter 实现 listHistorySince（conversations.history），本文件一行不动。
+// ——水位只前进、边界那条再过滤一次、防重入、抽链接的兜底顺序、入口闸怎么处置「确认不了」。
+// 它跟用哪个 IM 无关。换 Slack 时只需 slack adapter 实现 listHistorySince（conversations.history），
+// 本文件一行不动。
 import { log } from '../util/log.ts';
 import { claimDocs, type DocRef } from '../docs/index.ts';
+import { mentionGate } from './gate.ts';
 import { addPrd } from '../intake.ts';
 import * as cursors from '../store/cursors.ts';
 import { port } from './index.ts';
@@ -25,23 +27,36 @@ export async function backfillChat(chatId: string): Promise<number> {
   const msgs = await port.listHistorySince(chatId, cursorMs);
   let maxTs = cursorMs;
   let n = 0;
+  let unconfirmable = 0;
   for (const m of msgs) {
     const ts = m.createTime;
     // adapter 的时间过滤可能是秒级精度（飞书 start_time 就是秒），边界那条会重复返回 → 核心按毫秒再滤一次。
     if (ts <= cursorMs) continue;
-    // 注意（对应设计文档 D1）：这里**不**做 live 群消息那道「必须 @机器人」的入口闸。
-    // 今天的补拉本就没有这道闸，Phase 0 是纯内部重构，绝不顺手改行为——历史条目是否带服务端 mentions
-    // 需要在真实租户上验过才能统一（验不过就等于补拉静默失效）。统一与否走单独的 follow-up。
-    for (const doc of docsIn(m)) {
-      // 发起人 / 原消息 id 一并带上——补拉登记的需求这才与 live 登记的**长得一样**：
-      // 状态卡回复到 PM 那条消息下面、卡里能 @ 到人。缺任一项照常登记（补拉本就可能拿不全）。
-      const r = await addPrd({ doc, chatId, posterId: m.senderId, intakeMsgId: m.messageId });
-      if (r.ok && r.session && r.created) {
-        n++;
-        log.ok(`补拉登记：${r.session.slug}（离线期间群消息）`);
+    // 群入口闸（与 live 消息入口**同一个判据**，见 messaging/gate.ts）：群里随手分享的文档不该白跑一次闸A。
+    // 但第三态在这里**取与 live 相反的处置**——确认不了就照常登记。理由是这条消息已经过去了：
+    // 忽略它等于离线期间的需求被静默吞掉，而那正是补拉唯一的存在理由。宁可白跑一次闸A，不可漏需求。
+    const gate = mentionGate(m);
+    if (gate === 'unconfirmable') unconfirmable++;
+    if (gate !== 'ignore') {
+      for (const doc of docsIn(m)) {
+        // 发起人 / 原消息 id 一并带上——补拉登记的需求这才与 live 登记的**长得一样**：
+        // 状态卡回复到 PM 那条消息下面、卡里能 @ 到人。缺任一项照常登记（补拉本就可能拿不全）。
+        const r = await addPrd({ doc, chatId, posterId: m.senderId, intakeMsgId: m.messageId });
+        if (r.ok && r.session && r.created) {
+          n++;
+          log.ok(`补拉登记：${r.session.slug}（离线期间群消息）`);
+        }
       }
     }
-    if (ts > maxTs) maxTs = ts;
+    if (ts > maxTs) maxTs = ts; // 被闸挡掉的也推水位，否则每轮都重扫同一批
+  }
+  // 「确认不了」是本轮唯一没被闸住的口子——出现即说明该 provider 的历史信封不带 mentions（或未配 bot 自身 id），
+  // 离线路径事实上仍是敞开的。这条日志就是那个观察：不用手动去捞一条历史 payload，跑一轮就知道。
+  if (unconfirmable > 0) {
+    log.warn(
+      `补拉：${unconfirmable} 条群历史消息无法确认是否 @ 了机器人（${port.id} 的历史信封未带 mentions，或未配 bot 自身 id）` +
+        '→ 按「不漏需求」照常登记。该 provider 的离线入口闸事实上未生效。',
+    );
   }
   cursors.advanceCursor(chatId, maxTs);
   return n;

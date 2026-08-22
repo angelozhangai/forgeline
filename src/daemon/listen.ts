@@ -16,6 +16,7 @@ import { port } from '../messaging/index.ts';
 import { resolveActor } from '../messaging/operators.ts';
 import type { CardModel } from '../messaging/index.ts';
 import { claimDocs } from '../docs/index.ts';
+import { mentionGate } from '../messaging/gate.ts'; // 群入口闸判据：与离线补拉共用，见该文件
 import { ACTIVE_GATE_STATES } from '../statemachine/states.ts';
 import { healthConfig } from '../health/config.ts';
 import { initHeartbeat, pingLiveness, markCycle, markWs } from '../health/heartbeat.ts';
@@ -184,12 +185,14 @@ async function handleMessage(evt: Record<string, unknown>): Promise<void> {
   const posterId = m.senderId;
   const intakeMsgId = m.messageId;
   const text = m.text;
-  // 群消息入口闸：群里**只有 @机器人**才入流程——否则群内随手分享/转发的飞书文档会被误当 PRD 吃进闸A（白花钱）。
-  // 判定材料由 adapter 从事件里**服务端填充的 mentions** 算好（isGroup/mentionedBot，独立于 SDK 正文 @ normalize）。
-  // p2p 私聊（isGroup 假）天然定向，不要求 @。无法确认 bot 身份（mentionedBot=null）→ 保守忽略并 warn（不静默放过）。
-  if (m.isGroup && m.mentionedBot !== true) {
-    if (m.mentionedBot === null) {
-      log.warn(`消息入口：群消息但无法确认 bot 身份（${port.id} 未配 bot 自身 id）→ 保守忽略此消息`);
+  // 群消息入口闸：群里**只有 @机器人**才入流程——否则群内随手分享/转发的文档会被误当 PRD 吃进闸A（白花钱）。
+  // 判定材料由 adapter 从事件里**服务端填充的 mentions** 算好（isGroup/mentionedBot，独立于 SDK 正文 @ normalize）；
+  // 判据本身收在 messaging/gate.ts——与离线补拉**共用同一个**，两条路径不会对「什么算一条需求」各说各话。
+  // live 侧对「确认不了」取忽略：这条消息还在群里，人再 @ 一次即可，代价只是一次重发（补拉侧取反，理由见 gate.ts）。
+  const gate = mentionGate(m);
+  if (gate !== 'admit') {
+    if (gate === 'unconfirmable') {
+      log.warn(`消息入口：群消息但无法确认是否 @ 了机器人（${port.id} 未配 bot 自身 id）→ 保守忽略此消息`);
     } else {
       log.info('消息入口：群消息未 @机器人 → 按规则忽略（不入流程）');
     }
