@@ -20,10 +20,12 @@ An audit of the actual coupling found the seam holds — with four residual leak
 | 1 | ~~**The document layer was never abstracted at all.**~~ **Closed in Phase 1** — `DocSourcePort` + registry; the core only ever sees a `DocRef`. | [src/docs/port.ts](../src/docs/port.ts), [src/docs/index.ts](../src/docs/index.ts) |
 | 2 | ~~`extractFeishuLinks` — a Feishu URL regex — lives in the core.~~ **Closed in Phase 1** — the regex moved into the Feishu source; the core calls `claimDocs`. | [src/docs/feishu.ts](../src/docs/feishu.ts) |
 | 3 | ~~**Offline backfill bypasses the port entirely**; `MessagingPort` has no history method.~~ **Closed in Phase 0** — the loop is core-side, the API call is behind `listHistorySince`. | [src/messaging/backfill.ts](../src/messaging/backfill.ts) |
-| 4 | Feishu names baked into config, DB columns, probe enum and health labels. | [src/config.ts](../src/config.ts), [src/store/schema.sql](../src/store/schema.sql), [src/llm/probes.ts](../src/llm/probes.ts), [src/health/check.ts](../src/health/check.ts) |
+| 4 | Feishu names baked into config, DB columns, probe enum and health labels. **DB columns closed in Phase 1** (migration v1); probe enum + health labels remain for Phase 4. | [src/llm/probes.ts](../src/llm/probes.ts), [src/health/check.ts](../src/health/check.ts) |
 
-Leak 3 is why README's "A Slack adapter is one file away, with the core untouched" is a slight
-overclaim today. Leaks 1–2 are a whole second seam that has never been opened.
+Leak 3 is why README's "A Slack adapter is one file away, with the core untouched" was a slight
+overclaim when this was written. Leaks 1–2 were a whole second seam that had never been opened.
+Phases 0–3 closed 1–3 and shipped the Slack adapter; the claim now holds literally — Slack landed
+without a single core file changing behaviour for it.
 
 **Goal**: two independent, pluggable axes — IM provider and document source — with Slack shipped as the
 second IM provider and a `plaintext` document source that lets Slack run with no document service at all.
@@ -299,6 +301,29 @@ re-pasting identical text hits the dedup path.
 answers via modal → GO → issues created. Feishu regression-free. Rendering covered by unit tests in the
 style of [test/messaging-feishu.test.ts](../test/messaging-feishu.test.ts).
 
+**Landed** ([#12](https://github.com/angelozhangai/forgeline/pull/12)).
+
+**What the spike (3.0) actually settled — and what it could not.** No Slack workspace was available, so
+the spike was split:
+
+- **Socket Mode: verified for real.** A throwaway script stood up a local WebSocket server (`node:http` +
+  a hand-computed `Sec-WebSocket-Accept`, no external network) and drove Node's native `WebSocket`
+  through connect → receive envelope → ack → server-side hard disconnect → reconnect. It passed, and it
+  surfaced a detail worth the whole exercise: an abrupt disconnect fires **`error` and then `close`**.
+  Treating both as reconnect triggers opens two connections, and every envelope then arrives twice. The
+  production channel settles each connection exactly once, and a test pins that sequence.
+- **Modal round-trip: not verified live.** `private_metadata` carrying `{action, slug, round}` and one
+  `view_submission` returning every field is implemented against the documented payload shapes and pinned
+  by a build → simulated-submit → parse round-trip test. That validates *our* handling, not Slack's
+  behaviour. It remains the one assumption needing a real workspace.
+
+**The modal's hidden state problem.** Slack forms live in a modal, but the modal's *contents* (which
+decisions, which DRI pool) are only known when the card is rendered — and the click can come much later.
+The adapter caches the built view in memory at render time. A daemon restart empties that cache while the
+card is still sitting in Slack, so the fallback matters more than the happy path: instead of a button that
+does nothing when clicked, it opens a degraded free-text modal that still carries the full
+`private_metadata` context. The answer is less structured; it still reaches the right requirement.
+
 ### Phase 4 — de-Feishu the names + docs
 
 > The `session` column renames moved into Phase 1: that phase already rewrites `store/*` for `doc_ref`, so the same migration covers them at nearly zero cost. A separate cosmetic tail phase is the classic casualty of a long tracking issue.
@@ -354,5 +379,5 @@ Tracked in [#2](https://github.com/angelozhangai/forgeline/issues/2).
 | 0 — transport seam | [#3](https://github.com/angelozhangai/forgeline/issues/3) | ✅ done |
 | 1 — `DocSourcePort` | [#4](https://github.com/angelozhangai/forgeline/issues/4) | ✅ done |
 | 2 — plaintext source | [#5](https://github.com/angelozhangai/forgeline/issues/5) | ✅ done |
-| 3 — Slack adapter | [#6](https://github.com/angelozhangai/forgeline/issues/6) | not started |
+| 3 — Slack adapter | [#6](https://github.com/angelozhangai/forgeline/issues/6) | ✅ done |
 | 4 — naming + docs | [#7](https://github.com/angelozhangai/forgeline/issues/7) | not started |

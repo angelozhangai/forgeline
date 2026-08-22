@@ -18,11 +18,13 @@ const SRC = join(fileURLToPath(new URL('..', import.meta.url)), 'src');
 
 // 每个文件允许直连的飞书/lark import specifier 子串。未列出的文件：一律不许出现 feishu/ 或 larksuiteoapi。
 const ALLOW: Record<string, string[]> = {
-  'messaging/feishu.ts': ['feishu/', 'larksuiteoapi'], // 唯一 IM adapter：lark 长连接 + feishu/* 收发渲染 + 群历史 + im 探针
+  'messaging/feishu.ts': ['feishu/', 'larksuiteoapi'], // 飞书 adapter：lark 长连接 + feishu/* 收发渲染 + 群历史 + im 探针
+  'messaging/slack.ts': ['slack/'], // Slack adapter：slack/* 的 Web API + Socket Mode + 模态
 };
 // feishu/* 目录本就是飞书 provider 层：内部互相 import + 可用 lark SDK。
 function allowedFor(rel: string): string[] {
   if (rel.startsWith('feishu/')) return ['feishu/', 'larksuiteoapi'];
+  if (rel.startsWith('slack/')) return ['slack/']; // slack/* 目录本就是 Slack provider 层：内部可互相 import
   return ALLOW[rel] ?? [];
 }
 
@@ -45,6 +47,8 @@ function walk(dir: string, rel = ''): string[] {
 //  · CJS：require('...')
 // 只匹配真正的 import 字符串字面量，不误伤散落字符串（如 index.ts doctor 探测 node_modules 路径的字面量）。
 // 注意：'messaging/feishu.ts'（子串 'feishu.'，非 'feishu/'）= adapter 自身路径，不算直连。
+// provider raw 层的目录前缀：核心层一律不许直连，只能经各自的 messaging/<provider>.ts adapter。
+// feishu/ 与 lark SDK 由 feishuImports 管；slack/ 由 slackImports 管（两条对称的闸）。
 const SPEC_RES = [
   /\bfrom\s*['"]([^'"]+)['"]/g, // import X from '...' / export ... from '...'
   /\bimport\s*\(\s*['"]([^'"]+)['"]/g, // dynamic import('...')
@@ -110,8 +114,46 @@ test('架构边界：Phase 0 后 listen 连合法补拉都不许直连 feishu/*'
 });
 
 // 白名单是棘轮：加一条豁免 = 往缝里开一个洞，必须是有意的（改这个断言）而非顺手加一行。
-test('架构边界：飞书豁免白名单只剩 IM adapter 一条（只许变短）', () => {
-  assert.deepEqual(Object.keys(ALLOW).sort(), ['messaging/feishu.ts']);
+test('架构边界：豁免白名单只有各 IM adapter 自己（每个 provider 一条，不许有别的）', () => {
+  assert.deepEqual(Object.keys(ALLOW).sort(), ['messaging/feishu.ts', 'messaging/slack.ts']);
+});
+
+// ── 第三条边界（Phase 3 新增）：Slack raw 层对称守护 ─────────────────────
+// 飞书那条闸是事后补的（核心一度直连 feishu/backfill）。Slack 从第一天就上闸，
+// 免得再走一遍「先漏进去、再花一个 phase 收回来」。
+function slackImports(content: string): string[] {
+  const specs = new Set<string>();
+  for (const re of SPEC_RES) {
+    for (const m of content.matchAll(re)) {
+      if (/(^|\/)slack\/[A-Za-z0-9_-]+\.ts$/.test(m[1])) specs.add(m[1]);
+    }
+  }
+  return [...specs];
+}
+function slackOffenders(files: { rel: string; content: string }[]): string[] {
+  const out: string[] = [];
+  for (const { rel, content } of files) {
+    if (rel.startsWith('slack/') || rel === 'messaging/slack.ts') continue;
+    for (const spec of slackImports(content)) out.push(`${rel} → ${spec}`);
+  }
+  return out;
+}
+
+test('架构边界：真实 src 里只有 messaging/slack.ts 能碰 slack/*', () => {
+  const offenders = slackOffenders(srcFiles());
+  assert.deepEqual(offenders, [], `这些直连 Slack raw 层的 import 应改走 MessagingPort：\n  ${offenders.join('\n  ')}`);
+});
+
+test('架构边界：核心层直连 slack/web 或 slack/socket 会被逮；adapter 自己放行', () => {
+  assert.deepEqual(
+    slackOffenders([
+      { rel: 'daemon/listen.ts', content: `import { slackApi } from '../slack/web.ts';` },
+      { rel: 'notify.ts', content: `await import('./slack/socket.ts');` },
+      { rel: 'messaging/slack.ts', content: `import { slackApi } from '../slack/web.ts';` },
+      { rel: 'slack/socket.ts', content: `import { appToken } from './web.ts';` },
+    ]),
+    ['daemon/listen.ts → ../slack/web.ts', 'notify.ts → ./slack/socket.ts'],
+  );
 });
 
 test('架构边界：核心层用副作用 import 或 require 偷接 lark SDK 时发布闸必须红', () => {
