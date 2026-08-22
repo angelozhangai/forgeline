@@ -269,6 +269,18 @@ upgraded old DB has every `doc_ref` prefixed and still dedups.
 **DoD**: a session can be created from a bare IM message with no document service configured;
 re-pasting identical text hits the dedup path.
 
+**Landed** ([#11](https://github.com/angelozhangai/forgeline/pull/11)). Two deviations from the plan, both deliberate:
+
+- **It ships default-off**, behind `runtime.yaml` `doc_sources.plaintext.enabled`. Registering it
+  unconditionally would change existing Feishu deployments in the most expensive possible direction: today
+  an @-mention with no document link is ignored, and afterwards it would create a requirement and run
+  Gate A. The @-mention gate exists precisely to stop casual messages from costing money; turning
+  plaintext on silently would reopen that hole from the other side.
+- **It exposed a real bug in the Feishu source and fixed it.** `parseRef` accepted *any* string without a
+  `/` as a bare token, so a whole sentence of Chinese became a Feishu doc ref — a requirement that can
+  never be read, and a message intercepted before the fallback source ever got a turn. Bare tokens now
+  have to look like tokens (`[A-Za-z0-9]{10,}`).
+
 ### Phase 3 — Slack adapter (the focus)
 
 | | Task | Files |
@@ -341,6 +353,6 @@ Tracked in [#2](https://github.com/angelozhangai/forgeline/issues/2).
 | --- | --- | --- |
 | 0 — transport seam | [#3](https://github.com/angelozhangai/forgeline/issues/3) | ✅ done |
 | 1 — `DocSourcePort` | [#4](https://github.com/angelozhangai/forgeline/issues/4) | ✅ done |
-| 2 — plaintext source | [#5](https://github.com/angelozhangai/forgeline/issues/5) | not started |
+| 2 — plaintext source | [#5](https://github.com/angelozhangai/forgeline/issues/5) | ✅ done |
 | 3 — Slack adapter | [#6](https://github.com/angelozhangai/forgeline/issues/6) | not started |
 | 4 — naming + docs | [#7](https://github.com/angelozhangai/forgeline/issues/7) | not started |

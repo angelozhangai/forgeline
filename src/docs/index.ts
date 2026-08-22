@@ -6,13 +6,15 @@
 // 靠内容寻址（谁认得出就归谁）而不是靠配置选一个。
 import { log } from '../util/log.ts';
 import { feishuDocs } from './feishu.ts';
+import { plaintextDocs } from './plaintext.ts';
 import { formatRef, parseStoredRef, type DocClaimInput, type DocReadResult, type DocRef, type DocSource } from './port.ts';
 
 export { formatRef, parseStoredRef };
 export type { DocRef, DocReadResult, DocSource, DocClaimInput } from './port.ts';
 
 // 已注册的文档源。加一个源 = 在这里加一行（外加它自己的 docs/<id>.ts），核心其余部分一行不动。
-const REGISTERED: DocSource[] = [feishuDocs];
+// plaintext 是**兜底源**（fallback:true）且默认关——它排在最后只是可读性，真正决定顺位的是那个标志位。
+const REGISTERED: DocSource[] = [feishuDocs, plaintextDocs];
 
 export function sources(): DocSource[] {
   return [...REGISTERED];
