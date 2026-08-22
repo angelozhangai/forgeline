@@ -18,6 +18,13 @@ tech_design_publish:
   enabled: true
   base: main
 
+# 文档源。飞书文档源始终在；plaintext = 把「@机器人 + 一段话」本身当成需求正文（无需任何文档服务）。
+# ⚠️ 默认关。开了之后，群里 @ 机器人写一段话（归一后 ≥20 字）就会真的建需求、跑闸A = **自动花钱**；
+# 今天这类没有文档链接的消息只会被忽略。接 Slack 这类无文档服务的场景才建议开。
+doc_sources:
+  plaintext:
+    enabled: false
+
 adversarial:
   reviewer: codex            # codex | claude
   on_missing: claude         # codex 不在时：claude(降级同引擎自审,独立性弱) | skip | error

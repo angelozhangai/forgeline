@@ -24,10 +24,10 @@ const B = src('beta', { claims: ['B1'], parses: ['beta.example'] });
 const F = src('fallback-src', { fallback: true, claims: ['A1', 'B1', 'anything'], parses: [''] });
 const docs = await import('../src/docs/index.ts');
 
-test('真实注册表：目前只注册飞书一个源，且它不是兜底源', () => {
-  const ids = docs.registeredIds();
-  assert.deepEqual(ids, ['feishu']);
-  assert.equal(docs.sources()[0].fallback, undefined, '飞书是主源，绝不能被标成兜底源——否则它会吞掉别人的链接');
+test('真实注册表：飞书是主源，plaintext 是兜底源', () => {
+  assert.deepEqual(docs.registeredIds(), ['feishu', 'plaintext']);
+  assert.equal(docs.sources().find((s) => s.id === 'feishu')?.fallback, undefined, '飞书绝不能被标成兜底源——否则它会吞掉别人的链接');
+  assert.equal(docs.sources().find((s) => s.id === 'plaintext')?.fallback, true);
 });
 
 test('formatRef / parseStoredRef：落库键带源前缀，且按第一个冒号切（token 里可以再有冒号）', () => {
@@ -109,5 +109,5 @@ test('接线：claimDocs / parseAnyRef 就是规则跑在真实注册表上（�
   const url = 'https://x.feishu.cn/docx/REALTOK';
   assert.deepEqual(docs.claimDocs({ text: `看下 ${url}` }).map(docs.formatRef), ['feishu:REALTOK']);
   assert.deepEqual(docs.parseAnyRef(url), { source: 'feishu', token: 'REALTOK', url });
-  assert.equal(docs.parseAnyRef('https://www.notion.so/page-1'), null, '现在没有兜底源 → 认不出就是认不出');
+  assert.equal(docs.parseAnyRef('https://www.notion.so/page-1'), null, '主源不认、兜底源不收链接 → 认不出就是认不出');
 });
