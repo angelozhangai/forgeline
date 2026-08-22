@@ -3,7 +3,7 @@
 //   ② 目标项目相关：ROOT / scripts / docs-delivery / 子仓。源自 src/project.ts 的 defaultProject()。
 // Stage 1：项目相关锚点改为委托 defaultProject()（默认项目），行为与旧实现完全一致；
 // Stage 2 起，需要按 session 解析的调用点改用 project(s.project_id)，这些全局默认锚点保留给非 session 场景。
-import { existsSync } from 'node:fs';
+import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { SVC_DIR, defaultProject } from './project.ts';
 
@@ -78,3 +78,27 @@ export const ENV_FILE = configFile('forge.env'); // 两侧都 gitignore
 export const HEARTBEAT_PATH = process.env.FORGE_HEARTBEAT || resolve(STATE_DIR, 'heartbeat.json');
 export const WATCHDOG_STATE_PATH = process.env.FORGE_WATCHDOG_STATE || resolve(STATE_DIR, 'watchdog.json');
 export const LAUNCHD_LOG = resolve(LOGS_DIR, 'launchd.log'); // forge-daemon 落盘的合并日志（看门狗轮转它）
+
+/**
+ * 解析 forge.env（`KEY=value`，支持 # 注释与成对引号）。**放在 root.ts 而不是 config.ts**：
+ * 传输层选择点（messaging/index.ts）需要在模块加载期读一个变量决定接哪个 IM，而它绝不能为此
+ * 把 config.ts 整条 yaml+zod 校验链拖进每一个 import 它的文件。root.ts 没有重依赖，正合适。
+ * config.ts 仍是 env 的**权威**入口（它在此之上叠加 process.env 覆盖）；这里只提供最朴素的一层。
+ */
+export function loadEnvFile(): Record<string, string> {
+  const env: Record<string, string> = {};
+  if (!existsSync(ENV_FILE)) return env;
+  for (const raw of readFileSync(ENV_FILE, 'utf8').split('\n')) {
+    const line = raw.trim();
+    if (!line || line.startsWith('#')) continue;
+    const eq = line.indexOf('=');
+    if (eq < 0) continue;
+    const key = line.slice(0, eq).trim();
+    let val = line.slice(eq + 1).trim();
+    if ((val.startsWith('"') && val.endsWith('"')) || (val.startsWith("'") && val.endsWith("'"))) {
+      val = val.slice(1, -1);
+    }
+    if (val !== '') env[key] = val;
+  }
+  return env;
+}
