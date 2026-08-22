@@ -232,7 +232,7 @@ Ordering principle: each phase ends green, and Feishu behaviour is unchanged unl
   (absent field → `null`, which is *not* the same as "nobody was mentioned"), and the core loop
   deliberately does not read it. Whether Feishu history items actually carry the field is one live-tenant
   run away, and `test/messaging-feishu-history.test.ts` already pins both branches.
-  *(Closed in [#18](https://github.com/angelozhangai/forgeline/pull/18) — the faithful `null` mapping is
+  *(Closed in [#19](https://github.com/angelozhangai/forgeline/pull/19) — the faithful `null` mapping is
   what made the three-state gate possible. See D1 in §6.)*
 - **Backfilled sessions still lose `posterId` / `intakeMsgId`.** The loop now *sees* the full
   `InboundMessage`, so passing them through is a two-line change — but it would alter Feishu behaviour
@@ -376,7 +376,7 @@ Feishu's `im/v1/messages` history items actually carry the server-filled `mentio
 silently stop working. **Default: preserve today's behaviour in Phase 0** (no silent change), verify the
 history envelope during implementation, and unify in a separate follow-up if the field is available.~~
 
-**Resolved** ([#15](https://github.com/angelozhangai/forgeline/issues/15) / [#18](https://github.com/angelozhangai/forgeline/pull/18)) — **yes, and without waiting for the tenant dump.**
+**Resolved** ([#15](https://github.com/angelozhangai/forgeline/issues/15) / [#19](https://github.com/angelozhangai/forgeline/pull/19)) — **yes, and without waiting for the tenant dump.**
 
 The question was framed as a blocking one: go look at a live Feishu history item, *then* decide. That
 framing was wrong, because it assumed both paths must treat `mentionedBot === null` the same way. They
