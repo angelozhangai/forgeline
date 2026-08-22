@@ -6,6 +6,7 @@
 process.env.FORGE_DB = ':memory:';
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
+import { readFileSync } from 'node:fs';
 import type { DocRef } from '../src/docs/port.ts';
 
 let readCalls = 0;
@@ -120,6 +121,37 @@ test('addPrd：未注册的文档源直接拒收（登记进去也读不出正�
   const r = await addPrd({ doc: { source: 'notion', token: 'p1' } });
   assert.equal(r.ok, false);
   assert.match(r.msg, /未注册的文档源/);
+  assert.equal((await sessions.listAll()).length, before);
+});
+
+// ── 无文档服务也能立项（plaintext 兜底源，Phase 2 的 DoD）──────────────
+// 这里用的是**真的** plaintext 源的 read()：它从 ref.raw 取正文，不联网、不需要任何文档服务配置。
+// （认领那一步要不要开由 runtime.yaml 决定，见 docs-plaintext.test.ts；建档这一步与开关无关。）
+test('addPrd：一段 IM 文本就能建需求——正文经 raw 落到 prd.txt，prd_url 为空', async () => {
+  slugProposal = 'refund-button-top';
+  const body = '把退款按钮挪到订单详情页顶部，并加一次二次确认弹窗';
+  const r = await addPrd({ doc: { source: 'plaintext', token: 'hash-abc', raw: body } });
+  assert.equal(r.ok, true);
+  assert.equal(r.created, true);
+  assert.equal(r.session?.doc_ref, 'plaintext:hash-abc');
+  assert.equal(r.session?.prd_url, null, '一段话没有可点开的链接');
+  assert.equal(r.session?.title, body.slice(0, 80), '标题取正文首行');
+  assert.equal(readFileSync(r.session!.prd_text_path!, 'utf8'), body, '正文必须落盘——下游各闸只读 prd_text_path');
+});
+
+test('addPrd：同一段文本再贴一遍 → 命中去重（内容即身份）', async () => {
+  const doc = { source: 'plaintext', token: 'hash-abc', raw: '把退款按钮挪到订单详情页顶部，并加一次二次确认弹窗' };
+  const again = await addPrd({ doc });
+  assert.equal(again.created, false);
+  assert.equal(again.duplicate, true);
+  assert.match(again.msg, /已经评审过|不会被再次评审/);
+});
+
+test('addPrd：存量 plaintext ref 没有 raw → 如实报读不了，不建 session', async () => {
+  const before = (await sessions.listAll()).length;
+  const r = await addPrd({ doc: { source: 'plaintext', token: 'hash-stale' } });
+  assert.equal(r.ok, false);
+  assert.match(r.msg, /不可回源/);
   assert.equal((await sessions.listAll()).length, before);
 });
 

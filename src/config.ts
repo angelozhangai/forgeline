@@ -31,6 +31,11 @@ export interface RuntimeConfig {
   delivery_doc_commit?: {
     enabled: boolean; // GO 后把 docs/delivery/<slug>/ 自动提交到目标项目「当前分支」（仅 doc 路径、不切分支、**绝不 push**）；默认关，人工提交
   };
+  doc_sources?: {
+    // 把「@机器人 + 一段话」本身当成需求正文（无需任何文档服务，见 src/docs/plaintext.ts）。
+    // **默认关**：开了之后这类消息会真的建需求、跑闸A = 自动花钱；今天它们只会被忽略。
+    plaintext?: { enabled: boolean };
+  };
   adversarial: {
     reviewer: 'codex' | 'claude';
     on_missing: 'claude' | 'skip' | 'error';
@@ -218,6 +223,12 @@ export const RuntimeSchema = z
       .strict()
       .optional(),
     delivery_doc_commit: z.object({ enabled: z.boolean() }).strict().optional(),
+    // 文档源开关。plaintext（把一段 IM 文本本身当需求）**默认关**：开了等于「@机器人 + 一段话」
+    // 就会真跑闸A（花钱），对既有部署是行为变化，必须显式打开。
+    doc_sources: z
+      .object({ plaintext: z.object({ enabled: z.boolean() }).strict().optional() })
+      .strict()
+      .optional(),
     adversarial: z
       .object({
         reviewer: z.enum(['codex', 'claude']),

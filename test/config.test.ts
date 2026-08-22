@@ -42,6 +42,10 @@ test('inAllowList：不在名单 → 拒绝', () => {
 
 // ── 配置 schema 校验（zod）────────────────────────────────
 // 真实 on-disk 配置必须始终过校验：这条把「yaml 改了但 schema 没跟上」之类漂移当场逮住。
+test('仓内真实 runtime.yaml：plaintext 文档源默认关（开=「@机器人+一段话」就自动跑闸A 花钱）', () => {
+  assert.equal(loadConfig().runtime.doc_sources?.plaintext?.enabled ?? false, false);
+});
+
 test('loadConfig：仓内真实 yaml 全部通过校验', () => {
   const c = loadConfig();
   assert.ok(c.runtime.poll_interval_sec > 0);

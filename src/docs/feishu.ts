@@ -11,6 +11,11 @@ import type { DocClaimInput, DocRef, DocReadResult, DocSource } from './port.ts'
 
 export const FEISHU_SOURCE = 'feishu';
 
+// 裸 token 的形状：纯字母数字、≥10 位（真实 wiki/docx token 是 24~27 位的 base62）。
+// 这道闸只为把「一句话」和「一个 token」分开，不追求精确——认宽了会把需求正文当 token，
+// 认窄了只是让人多贴一次完整链接。
+const BARE_TOKEN_RE = /^[A-Za-z0-9]{10,}$/;
+
 // 消息里的飞书文档链接（wiki/docx/docs）。live 消息入口与离线补拉共用。
 export function extractFeishuLinks(text: string): string[] {
   const re = /https?:\/\/[\w.-]*feishu\.[\w.-]+\/(?:wiki|docx|docs)\/[A-Za-z0-9]+/g;
@@ -107,11 +112,16 @@ export const feishuDocs: DocSource = {
   parseRef(urlOrToken: string): DocRef | null {
     const s = (urlOrToken ?? '').trim();
     if (!s) return null;
-    // 只认飞书域的链接；裸 token（无 '/'）也收——CLI 允许直接贴 token，沿用旧行为。
-    if (s.includes('/') && !/^https?:\/\/[\w.-]*feishu\.[\w.-]+\//.test(s)) return null;
-    const { token } = parseFeishuDoc(s);
-    if (!token) return null;
-    return { source: FEISHU_SOURCE, token, url: s.includes('/') ? s : undefined };
+    if (s.includes('/')) {
+      // 只认飞书域的链接。
+      if (!/^https?:\/\/[\w.-]*feishu\.[\w.-]+\//.test(s)) return null;
+      const { token } = parseFeishuDoc(s);
+      return token ? { source: FEISHU_SOURCE, token, url: s } : null;
+    }
+    // 裸 token 也收（CLI 允许直接贴 token），但**必须长得像 token**：纯字母数字、够长。
+    // 松到「任何不含 / 的字符串」是有害的——一整句需求会被当成飞书 token 收下，
+    // 于是登记出一条读不出正文的需求，而且把本该轮到兜底源的消息半路截走。
+    return BARE_TOKEN_RE.test(s) ? { source: FEISHU_SOURCE, token: s } : null;
   },
 
   async read(ref: DocRef): Promise<DocReadResult> {
