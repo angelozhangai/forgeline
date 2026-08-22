@@ -96,6 +96,6 @@ export function formatCost(rows: CostRow[], sum: CostSummary): string {
   lines.push(
     `合计 ${usd(sum.total)}（闸A ${usd(sum.gateA)} + 闸B ${usd(sum.gateB)} + 闸C ${usd(sum.gateC)} + 闸D ${usd(sum.gateD)}）· ${sum.count} 条需求，其中 ${sum.withCost} 条产生成本`,
   );
-  lines.push('（私有·管理面，仅本服务可见，不写进交付/飞书/issue）');
+  lines.push('（私有·管理面，仅本服务可见，不写进交付/IM/issue）');
   return lines.join('\n');
 }

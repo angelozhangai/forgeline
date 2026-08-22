@@ -38,6 +38,12 @@ test('classifyDaemon：liveness 过期 → down/wedged', () => {
   assert.equal(d.running, false);
 });
 
+test('classifyWs：项名跟着当前 provider 走（换到 Slack 的部署不该在状态页上看到"飞书"）', () => {
+  assert.equal(classifyWs(hb({ wsConfigured: true, wsConnected: true }), 'slack').name, 'slack 长连接');
+  assert.equal(classifyWs(null, 'feishu').name, 'feishu 长连接');
+  assert.equal(classifyWs(null).name, 'IM 长连接', '没给 provider 名时用中性兜底，不假设某一家');
+});
+
 test('classifyWs：未配 → na；配了断 → degraded；连上 → healthy', () => {
   assert.equal(classifyWs(null).status, 'na');
   assert.equal(classifyWs(hb({ wsConfigured: false })).status, 'na');

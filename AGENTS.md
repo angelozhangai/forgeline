@@ -65,6 +65,35 @@ Seam invariants, all machine-guarded (see [test/ext-seam.test.ts](test/ext-seam.
 - This repo ships **no `ext/`**, and its suite must pass with none present. Run `npm run ci` in a shell with
   `FORGE_HOME`/`FORGE_EXT_DIR` unset — otherwise a private pack on your machine may be what's making it green.
 
+## 🔀 Top rule: two provider seams — IM and document source. Adding one never touches the core
+
+Two axes are pluggable, and they are shaped **differently on purpose**:
+
+| | Seam | Shape | Why |
+| --- | --- | --- | --- |
+| **IM** | [src/messaging/port.ts](src/messaging/port.ts) | **Selection** — exactly one, via `FORGE_MESSAGING_PROVIDER` | Two IMs at once forks the approval trail |
+| **Documents** | [src/docs/port.ts](src/docs/port.ts) | **Registry** — many, resolved by content addressing | One message can legitimately carry links from several sources |
+
+Ships today: `feishu` / `slack` adapters; `feishu` / `plaintext` document sources (plaintext default-off —
+turning it on makes "@bot + a paragraph" cost a Gate A run).
+
+Rules, all machine-guarded by [test/arch-boundary.test.ts](test/arch-boundary.test.ts):
+
+- **Core code never imports a provider's raw layer** (`src/feishu/*`, `src/slack/*`) or a concrete
+  document source (`src/docs/<source>.ts`). It goes through `port` / `docs/index.ts`. The exemption
+  whitelist is a **ratchet — it may only get shorter**, and a test asserts its exact contents.
+- **`port.id` is for display and logging only.** The moment core code branches on it
+  (`if (port.id === 'feishu')`), the seam is pointless.
+- **An unknown `FORGE_MESSAGING_PROVIDER` is a hard startup error**, never a silent fallback — same rule
+  as the extension seam's "present but unloadable → hard error". A typo that quietly keeps sending
+  everything to the previous provider produces *no symptom at all*.
+- **Provider knowledge stays in the provider.** Auth-failure remediation text rides on the probe result
+  (`InboundProbe.authFix`) rather than living in a core lookup table; otherwise every new provider means
+  another core edit.
+
+Adding a provider = one adapter file + one line at the selection point / registry. If it needs more than
+that, the port is wrong — fix the port, don't special-case the core.
+
 ## 🚦 Top rule: local CI must be green before every commit
 
 **Run `npm run ci` (= `lint` + `typecheck` + `test:cov`, with coverage floors) before `git commit`.

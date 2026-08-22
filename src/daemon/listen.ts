@@ -189,7 +189,7 @@ async function handleMessage(evt: Record<string, unknown>): Promise<void> {
   // p2p 私聊（isGroup 假）天然定向，不要求 @。无法确认 bot 身份（mentionedBot=null）→ 保守忽略并 warn（不静默放过）。
   if (m.isGroup && m.mentionedBot !== true) {
     if (m.mentionedBot === null) {
-      log.warn('消息入口：群消息但无法确认 bot 身份（未配 FEISHU_BOT_OPEN_ID 且 bot/v3/info 未就绪）→ 保守忽略此消息');
+      log.warn(`消息入口：群消息但无法确认 bot 身份（${port.id} 未配 bot 自身 id）→ 保守忽略此消息`);
     } else {
       log.info('消息入口：群消息未 @机器人 → 按规则忽略（不入流程）');
     }
@@ -359,7 +359,7 @@ export async function listen(): Promise<void> {
   log.ok(`周期循环已启动（补拉 + tick，每 ${intervalMs / 1000}s）`);
 
   if (!port.inboundConfigured()) {
-    log.warn('未配置入站传输（飞书 bot 凭据缺失）→ 仅周期 tick，无长连接（卡片按钮/群消息入口不可用）');
+    log.warn(`未配置入站传输（${port.id} bot 凭据缺失）→ 仅周期 tick，无长连接（卡片按钮/群消息入口不可用）`);
     await new Promise(() => {}); // 常驻
     return;
   }
@@ -394,7 +394,7 @@ export async function listen(): Promise<void> {
     void runCycle(); // 开机首次：立即捞离线期间 PM 发的需求
   } catch (e) {
     markWs(false, Date.now());
-    log.err(`长连接建立失败：${String(e).slice(0, 200)}（检查飞书后台「事件订阅→长连接」已开）。仅周期 tick 继续。`);
+    log.err(`长连接建立失败：${String(e).slice(0, 200)}（检查 ${port.id} 后台的事件订阅/长连接是否已开，见 deploy/README）。仅周期 tick 继续。`);
   }
   // 常驻：长连接事件 + 周期 tick
   await new Promise(() => {});

@@ -33,13 +33,22 @@ test('kind=auth → 🔑 登录/鉴权告警 + 「重新登录」指引（非「
   assert.ok(!alerts[0].lines.some((l) => l.includes('contract.ts'))); // auth 不该误导去改信封
 });
 
-test('飞书 kind=auth → 🔑 告警给「查飞书凭据/权限/加群」指引（非「改 contract.ts」）', async () => {
+test('IM kind=auth → 🔑 告警用 **adapter 自报的** 处置指引（非「改 contract.ts」）', async () => {
   alerts.length = 0; stored = {};
-  await maybeAlertContractDrift([{ dep: 'feishu', available: true, ok: false, kind: 'auth', detail: 'im/v1/messages code=99991663（权限/群未加 bot）', at: 1 }]);
+  // authFix 由 provider 给：怎么修飞书 token 是飞书的知识，核心不替它说话（换 Slack 就是另一句）。
+  await maybeAlertContractDrift([
+    { dep: 'im', available: true, ok: false, kind: 'auth', authFix: '检查飞书 bot 凭据/权限（FEISHU_BOT_APP_ID/SECRET、群是否已加 bot）', detail: 'im/v1/messages code=99991663（权限/群未加 bot）', at: 1 },
+  ]);
   assert.equal(alerts.length, 1);
   assert.match(alerts[0].title, /登录\/鉴权/);
   assert.ok(alerts[0].lines.some((l) => l.includes('飞书 bot 凭据')));
-  assert.ok(!alerts[0].lines.some((l) => l.includes('contract.ts'))); // 飞书鉴权失败不该误导去改信封
+  assert.ok(!alerts[0].lines.some((l) => l.includes('contract.ts'))); // 鉴权失败不该误导去改信封
+});
+
+test('IM kind=auth 但 adapter 没给 authFix → 退到通用文案，不冒充知道怎么修', async () => {
+  alerts.length = 0; stored = {};
+  await maybeAlertContractDrift([{ dep: 'im', available: true, ok: false, kind: 'auth', detail: 'token 失效', at: 1 }]);
+  assert.ok(alerts[0].lines.some((l) => l.includes('检查该工具登录态')));
 });
 
 test('kind=drift → 契约漂移告警 + 改 contract.ts', async () => {

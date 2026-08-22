@@ -21,6 +21,9 @@ import type { InboundChannel, InboundHandlers, InboundProbe, MessagingPort } fro
 
 export const SLACK_PROVIDER_ID = 'slack';
 
+// 鉴权失效时给操作者的处置指引（随探针结果上浮到告警里）。
+const SLACK_AUTH_FIX = '检查 Slack token 与权限（SLACK_BOT_TOKEN 是否失效、bot 是否已 /invite 进该频道、channels:history scope 是否授予）';
+
 // 语义色 → attachment 左侧色条。Slack 只吃 hex，没有模板色的概念。
 const COLOR_HEX: Record<CardColor, string> = {
   red: '#e01e5a',
@@ -149,11 +152,18 @@ function renderBlock(b: CardBlock): Record<string, unknown>[] {
 
 // CardModel → chat.postMessage 的 body 片段（attachment 承载色条，blocks 在里面）。
 // text 是必给的：通知栏预览 + 不支持 blocks 的客户端全靠它。
+// Slack 单条消息最多 50 个块。超了必须截——但**绝不静默截**：一张被砍掉尾巴的评审卡看起来完全正常，
+// 只是少了几条待决项，那是最难发现的一类错。
+const MAX_BLOCKS = 50;
+
 export function renderSlackMessage(card: CardModel): { text: string; attachments: Record<string, unknown>[] } {
   const blocks: Record<string, unknown>[] = [{ type: 'header', text: plain(card.title) }];
   if (card.subtitle) blocks.push(context(card.subtitle));
   blocks.push(...card.blocks.flatMap(renderBlock));
-  return { text: card.title, attachments: [{ color: COLOR_HEX[card.color], blocks: blocks.slice(0, 50) }] };
+  if (blocks.length > MAX_BLOCKS) {
+    log.warn(`Slack 卡片超出 ${MAX_BLOCKS} 块上限（${blocks.length}），尾部被截断：「${card.title}」`);
+  }
+  return { text: card.title, attachments: [{ color: COLOR_HEX[card.color], blocks: blocks.slice(0, MAX_BLOCKS) }] };
 }
 
 // ── composite message id ────────────────────────────────────────────
@@ -375,7 +385,7 @@ const slackPort: MessagingPort = {
     const r = await slackApi('conversations.history', { channel: chat, limit: 1 });
     const raw = JSON.stringify(r).slice(0, 400);
     if (!r.ok) {
-      return { available: true, ok: false, kind: 'auth', detail: `conversations.history error=${r.error}（凭据/权限/未加频道）`, raw };
+      return { available: true, ok: false, kind: 'auth', detail: `conversations.history error=${r.error}（凭据/权限/未加频道）`, raw, authFix: SLACK_AUTH_FIX };
     }
     // 验的正是 listHistorySince 依赖的信封：messages 数组 + has_more。
     const hasMessages = Array.isArray(r.messages);
