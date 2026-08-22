@@ -18,14 +18,14 @@
 import type { Session } from '../types.ts';
 import type { State } from '../statemachine/states.ts';
 import type { SessionStore, NewSession, EventRow } from './port.ts';
-import { isDuplicateTokenError, isDuplicateIssueRefError } from './sessions.ts';
+import { isDuplicateDocRefError, isDuplicateIssueRefError } from './sessions.ts';
 
 const TIMEOUT_MS = 30_000;
 
 // 可经网络分发的 IO 方法白名单（server 侧据此拒绝任意 method 注入；纯谓词 isDuplicate*Error 不过网 → 不在内）。
 export const REMOTE_METHODS = [
   'create', 'findByIssueRef',
-  'get', 'getBySlug', 'findByPrdUrl', 'findByDocToken', 'resolve',
+  'get', 'getBySlug', 'findByPrdUrl', 'findByDocRef', 'resolve',
   'listByStates', 'listAll', 'distinctProjects', 'countByState', 'countByStates',
   'patch', 'transition', 'appendEvent', 'events', 'lastEventTs',
   'leaseClaim',
@@ -68,12 +68,12 @@ export function makeRemoteStore(baseUrl: string, token?: string): SessionStore {
   return {
     create: (s: NewSession) => rpc<Session>('create', s),
     findByIssueRef: (ref: string) => rpc<Session | null>('findByIssueRef', ref),
-    isDuplicateTokenError, // 纯谓词：对 rejected error 跑 message 正则，client 本地（不过网）。
+    isDuplicateDocRefError, // 纯谓词：对 rejected error 跑 message 正则，client 本地（不过网）。
     isDuplicateIssueRefError,
     get: (id: string) => rpc<Session | null>('get', id),
     getBySlug: (slug: string) => rpc<Session | null>('getBySlug', slug),
     findByPrdUrl: (url: string) => rpc<Session | null>('findByPrdUrl', url),
-    findByDocToken: (token: string) => rpc<Session | null>('findByDocToken', token),
+    findByDocRef: (ref: string) => rpc<Session | null>('findByDocRef', ref),
     resolve: (idOrSlug: string) => rpc<Session | null>('resolve', idOrSlug),
     listByStates: (states: State[]) => rpc<Session[]>('listByStates', states),
     listAll: (projectId?: string) => rpc<Session[]>('listAll', projectId),

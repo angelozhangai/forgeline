@@ -1,6 +1,7 @@
 // workspace.ts 是「调目标项目脚本、不重写」的类型化封装层——它的真实逻辑是**命令构造 + 输出解析**：
 // 参数拼装(flag/commonFlags)、parseIssues 去重/多仓抽取、issueStates/listEpicChildren 的 JSON 解析与
-// UNKNOWN 兜底、feishuEnv 剥代理。这些靠 mock proc.run 捕获 (bin,args,opts) 直接断言，不真 shell-out。
+// UNKNOWN 兜底。这些靠 mock proc.run 捕获 (bin,args,opts) 直接断言，不真 shell-out。
+// （飞书文档那几支已迁到 src/docs/feishu.ts，用例随之搬到 docs-feishu.test.ts。）
 // （commitDeliveryDocs 另有 commit-delivery-docs.test.ts 覆盖，此处不重复。）
 process.env.FORGE_DB = ':memory:';
 import { test, mock } from 'node:test';
@@ -188,61 +189,4 @@ test('owner 贯穿：newReqEpic/addLabel/listEpicChildren 按传入 owner 解析
   reset(() => ({ code: 0, stdout: '[]', stderr: '', timedOut: false }));
   await ws.listEpicChildren('your-monorepo', 'ep', 'acme');
   assert.equal(valOf(last().args, '-R'), 'acme/your-monorepo');
-});
-
-// ── feishu：剥代理 env ────────────────────────────────────────────────────────
-test('feishuRead：node feishu-doc.js read <token>，并剥离 http(s) 代理 env（飞书走国内代理会断）', async () => {
-  const saved = { ...process.env };
-  process.env.HTTPS_PROXY = 'http://p:1';
-  process.env.https_proxy = 'http://p:1';
-  process.env.HTTP_PROXY = 'http://p:1';
-  process.env.http_proxy = 'http://p:1';
-  reset(() => ({ code: 0, stdout: 'doc text', stderr: '', timedOut: false }));
-  const r = await ws.feishuRead('tok');
-  assert.equal(r.ok, true);
-  assert.equal(r.text, 'doc text');
-  assert.equal(last().bin, 'node');
-  assert.match(last().args[0], /feishu-doc\.js$/);
-  assert.deepEqual(last().args.slice(1), ['read', 'tok']);
-  const env = last().opts.env as NodeJS.ProcessEnv;
-  for (const k of ['https_proxy', 'http_proxy', 'HTTPS_PROXY', 'HTTP_PROXY']) {
-    assert.equal(env[k], undefined, `${k} 应被剥离`);
-  }
-  // 还原本进程 env（只删本测试加的，避免污染其它用例）
-  for (const k of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']) {
-    if (!(k in saved)) delete process.env[k];
-  }
-});
-
-test('feishuRead：feishu-doc.js 非零退出 → ok:false + error（不静默放过）', async () => {
-  reset(() => ({ code: 2, stdout: '', stderr: 'token expired', timedOut: false }));
-  const r = await ws.feishuRead('tok');
-  assert.equal(r.ok, false);
-  assert.match(r.error ?? '', /token expired/);
-});
-
-test('feishuCommentAdd：node feishu-doc.js comment-add <token> <text>；非零 → ok:false', async () => {
-  reset(() => ({ code: 0, stdout: '', stderr: '', timedOut: false }));
-  let r = await ws.feishuCommentAdd('tok', '评论内容');
-  assert.equal(r.ok, true);
-  assert.equal(last().bin, 'node');
-  assert.match(last().args[0], /feishu-doc\.js$/);
-  assert.deepEqual(last().args.slice(1), ['comment-add', 'tok', '评论内容']);
-
-  reset(() => ({ code: 1, stdout: '', stderr: 'boom', timedOut: false }));
-  r = await ws.feishuCommentAdd('tok', 'x');
-  assert.equal(r.ok, false);
-  assert.match(r.error ?? '', /boom/);
-});
-
-test('feishuUserToken：取 token（trim）；非零 → null；空输出 → null', async () => {
-  reset(() => ({ code: 0, stdout: '  utok-123\n', stderr: '', timedOut: false }));
-  assert.equal(await ws.feishuUserToken(), 'utok-123');
-  assert.deepEqual(last().args.slice(1), ['token']);
-
-  reset(() => ({ code: 1, stdout: 'utok', stderr: '', timedOut: false }));
-  assert.equal(await ws.feishuUserToken(), null, 'gh/node 非零 → null');
-
-  reset(() => ({ code: 0, stdout: '   \n', stderr: '', timedOut: false }));
-  assert.equal(await ws.feishuUserToken(), null, '空白输出 → null');
 });

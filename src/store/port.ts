@@ -22,9 +22,9 @@ export interface NewSession {
   state?: State; // 起始态（缺省 INTAKE；standalone 裸 issue 直起 GATE_C_REQUESTED）
   prd_url?: string | null;
   prd_text_path?: string | null;
-  feishu_chat_id?: string | null;
-  feishu_doc_token?: string | null;
-  poster_open_id?: string | null;
+  chat_id?: string | null;
+  doc_ref?: string | null; // '<source>:<token>'
+  poster_id?: string | null;
   intake_msg_id?: string | null;
   source_kind?: string | null; // 'prd' | 'issue'
   issue_ref?: string | null; // standalone 去重键
@@ -41,14 +41,14 @@ export interface SessionStore {
   // ── 建 / 去重 ──
   create(s: NewSession): Promise<Session>;
   findByIssueRef(ref: string): Promise<Session | null>; // standalone 实现任务去重键
-  isDuplicateTokenError(e: unknown): boolean; // create 撞 doc_token 唯一索引（并发竞态）→ 回退去重【纯谓词·同步】
+  isDuplicateDocRefError(e: unknown): boolean; // create 撞 doc_ref 唯一索引（并发竞态）→ 回退去重【纯谓词·同步】
   isDuplicateIssueRefError(e: unknown): boolean; // create 撞 issue_ref 唯一索引（并发竞态）→ 回退去重【纯谓词·同步】
 
   // ── 读 ──
   get(id: string): Promise<Session | null>;
   getBySlug(slug: string): Promise<Session | null>;
   findByPrdUrl(url: string): Promise<Session | null>;
-  findByDocToken(token: string): Promise<Session | null>; // PRD 级去重真源（URL 各变体归一到 doc token）
+  findByDocRef(ref: string): Promise<Session | null>; // PRD 级去重真源（'<source>:<token>'，URL 各变体已归一）
   resolve(idOrSlug: string): Promise<Session | null>; // CLI 用 id 或 slug 操作
 
   // ── 列表 / 聚合 ──

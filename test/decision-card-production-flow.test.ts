@@ -11,14 +11,25 @@ import { resolve } from 'node:path';
 const comments: { token: string; text: string }[] = [];
 let tickCalls = 0;
 
+// 文档回写走 docs 注册表（Phase 1）：这里替掉 commentDoc，断言核心到底往文档里写了什么。
+mock.module('../src/docs/index.ts', {
+  namedExports: {
+    commentDoc: async (ref: string, text: string) => {
+      comments.push({ token: ref, text });
+    },
+    readDoc: async () => ({ ok: true, text: '' }),
+    formatRef: (r: { source: string; token: string }) => `${r.source}:${r.token}`,
+    parseStoredRef: () => null,
+    registeredIds: () => ['feishu'],
+    parseAnyRef: () => null,
+    claimDocs: () => [],
+  },
+});
+
 mock.module('../src/workspace.ts', {
   namedExports: {
     commitDeliveryDocs: async () => ({ ok: true, committed: false, stderr: '' }),
     prMergeState: async () => ({ ok: true, merged: true, state: 'MERGED' }),
-    feishuCommentAdd: async (token: string, text: string) => {
-      comments.push({ token, text });
-      return { ok: true };
-    },
     reviewReqScaffold: async () => {},
     publishTechDesign: async () => ({ ok: true, stdout: '', stderr: '' }),
     newReqSingle: async () => ({ ok: true, stdout: '', stderr: '', issues: [] }),
@@ -88,7 +99,7 @@ function gateAPath(openQuestions: unknown[]): string {
 }
 
 async function awaitingPmSession(id: string, gateAOutputPath: string): Promise<void> {
-  await sessions.create({ id, slug: id, title: '充值规则', branch: 'main', feishu_doc_token: `doc-${id}` });
+  await sessions.create({ id, slug: id, title: '充值规则', branch: 'main', doc_ref: `doc-${id}` });
   await sessions.transition(id, 'GATE_A_RUNNING');
   await sessions.transition(id, 'AWAITING_PM_CONFIRM');
   await sessions.patch(id, { gate_a_output_path: gateAOutputPath, gate_a_round: 2 });

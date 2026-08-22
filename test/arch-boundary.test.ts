@@ -5,8 +5,9 @@
 // 关键：白名单按 **「文件 → 允许的 specifier」** 精确控制，而非整文件放行——否则一个文件因某一条合法
 // import 被整体放行后，未来在它里面直 import lark SDK 仍能过 CI。
 //
-// 白名单是**棘轮，只许变短**：daemon/listen.ts 那条（离线补拉直连 feishu/backfill）已在 Phase 0 拿掉——
-// 补拉循环上移到 provider 无关的 messaging/backfill.ts，历史那一次 API 往返收进 adapter。
+// 白名单是**棘轮，只许变短**：daemon/listen.ts 那条（离线补拉直连 feishu/backfill）在 Phase 0 拿掉，
+// intake.ts 那条（直读 feishu/doc）在 Phase 1 拿掉——读文档收进 docs/feishu.ts，核心只见 DocRef。
+// 现在只剩 messaging/feishu.ts 这一个 IM adapter。
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
@@ -17,8 +18,7 @@ const SRC = join(fileURLToPath(new URL('..', import.meta.url)), 'src');
 
 // 每个文件允许直连的飞书/lark import specifier 子串。未列出的文件：一律不许出现 feishu/ 或 larksuiteoapi。
 const ALLOW: Record<string, string[]> = {
-  'messaging/feishu.ts': ['feishu/', 'larksuiteoapi'], // 唯一 adapter：lark 长连接 + feishu/* 收发渲染 + 群历史 + im 探针
-  'intake.ts': ['feishu/doc'], // 读飞书文档（doc 层，README 明确豁免）——Phase 1 收进 docs/feishu.ts 后一并拿掉
+  'messaging/feishu.ts': ['feishu/', 'larksuiteoapi'], // 唯一 IM adapter：lark 长连接 + feishu/* 收发渲染 + 群历史 + im 探针
 };
 // feishu/* 目录本就是飞书 provider 层：内部互相 import + 可用 lark SDK。
 function allowedFor(rel: string): string[] {
@@ -110,8 +110,8 @@ test('架构边界：Phase 0 后 listen 连合法补拉都不许直连 feishu/*'
 });
 
 // 白名单是棘轮：加一条豁免 = 往缝里开一个洞，必须是有意的（改这个断言）而非顺手加一行。
-test('架构边界：飞书豁免白名单只剩 adapter + intake 两条（只许变短）', () => {
-  assert.deepEqual(Object.keys(ALLOW).sort(), ['intake.ts', 'messaging/feishu.ts']);
+test('架构边界：飞书豁免白名单只剩 IM adapter 一条（只许变短）', () => {
+  assert.deepEqual(Object.keys(ALLOW).sort(), ['messaging/feishu.ts']);
 });
 
 test('架构边界：核心层用副作用 import 或 require 偷接 lark SDK 时发布闸必须红', () => {
@@ -125,7 +125,8 @@ test('架构边界：核心层用副作用 import 或 require 偷接 lark SDK �
   ]);
 });
 
-test('架构边界：doc 豁免只允许 intake 读 feishu/doc，不能扩散到 dm/group raw API', () => {
+// Phase 1 关缝：intake 连「读飞书文档」这条豁免也没了——读文档走 docs 注册表（DocSource.read）。
+test('架构边界：Phase 1 后 intake 连读飞书文档都不许直连 feishu/*', () => {
   const offenders = boundaryOffenders([
     {
       rel: 'intake.ts',
@@ -135,7 +136,42 @@ test('架构边界：doc 豁免只允许 intake 读 feishu/doc，不能扩散到
       `,
     },
   ]);
-  assert.deepEqual(offenders, ['intake.ts → ./feishu/dm.ts']);
+  assert.deepEqual(offenders, ['intake.ts → ./feishu/doc.ts', 'intake.ts → ./feishu/dm.ts']);
+});
+
+// ── 第二条边界（Phase 1 新增）：文档源也只能经注册表用 ───────────────────
+// docs/<source>.ts 是**实现**，docs/index.ts 是**接线处**。核心一旦直接 import 某个源，
+// 「加一个源=加一行注册」就不成立了：那份直连会跟着源一起腐烂，而且绕过 fallback/去重的解析规则。
+// 例外只有两类：docs/ 目录内部（index 注册 + 源之间共用）、以及测试。
+function docSourceOffenders(files: { rel: string; content: string }[]): string[] {
+  const offenders: string[] = [];
+  for (const { rel, content } of files) {
+    if (rel.startsWith('docs/')) continue; // 注册表自己 + 源内部
+    for (const re of SPEC_RES) {
+      for (const m of content.matchAll(re)) {
+        const spec = m[1];
+        if (/(^|\/)docs\/[A-Za-z0-9_-]+\.ts$/.test(spec) && !spec.endsWith('/docs/index.ts')) {
+          offenders.push(`${rel} → ${spec}`);
+        }
+      }
+    }
+  }
+  return offenders;
+}
+
+test('架构边界：真实 src 里核心层只经 docs/index.ts 用文档源，不直连某个具体源', () => {
+  const offenders = docSourceOffenders(srcFiles());
+  assert.deepEqual(offenders, [], `这些直连具体文档源的 import 应改走 docs/index.ts：\n  ${offenders.join('\n  ')}`);
+});
+
+test('架构边界：直连 docs/feishu.ts 会被逮；走 docs/index.ts 放行', () => {
+  assert.deepEqual(
+    docSourceOffenders([
+      { rel: 'intake.ts', content: `import { feishuDocs } from './docs/feishu.ts';` },
+      { rel: 'gates/gateA.ts', content: `import { commentDoc } from '../docs/index.ts';` },
+    ]),
+    ['intake.ts → ./docs/feishu.ts'],
+  );
 });
 
 test('架构边界：非 import 字符串只作 doctor/文档文本时不误伤', () => {
