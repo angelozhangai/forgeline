@@ -20,7 +20,7 @@ An audit of the actual coupling found the seam holds — with four residual leak
 | 1 | ~~**The document layer was never abstracted at all.**~~ **Closed in Phase 1** — `DocSourcePort` + registry; the core only ever sees a `DocRef`. | [src/docs/port.ts](../src/docs/port.ts), [src/docs/index.ts](../src/docs/index.ts) |
 | 2 | ~~`extractFeishuLinks` — a Feishu URL regex — lives in the core.~~ **Closed in Phase 1** — the regex moved into the Feishu source; the core calls `claimDocs`. | [src/docs/feishu.ts](../src/docs/feishu.ts) |
 | 3 | ~~**Offline backfill bypasses the port entirely**; `MessagingPort` has no history method.~~ **Closed in Phase 0** — the loop is core-side, the API call is behind `listHistorySince`. | [src/messaging/backfill.ts](../src/messaging/backfill.ts) |
-| 4 | Feishu names baked into config, DB columns, probe enum and health labels. **DB columns closed in Phase 1** (migration v1); probe enum + health labels remain for Phase 4. | [src/llm/probes.ts](../src/llm/probes.ts), [src/health/check.ts](../src/health/check.ts) |
+| 4 | ~~Feishu names baked into config, DB columns, probe enum and health labels.~~ **Closed** — DB columns in Phase 1 (migration v1), probe enum + health labels in Phase 4 (migration v2). | — |
 
 Leak 3 is why README's "A Slack adapter is one file away, with the core untouched" was a slight
 overclaim when this was written. Leaks 1–2 were a whole second seam that had never been opened.
@@ -336,6 +336,30 @@ does nothing when clicked, it opens a degraded free-text modal that still carrie
 
 **DoD**: `grep -ri feishu src/` matches only `src/feishu/`, `src/messaging/feishu.ts`, `src/docs/feishu.ts`.
 
+**Landed** ([#13](https://github.com/angelozhangai/forgeline/pull/13)). The DoD as written is not quite
+achievable, and pretending otherwise would be worse than restating it. Three categories legitimately keep
+the name:
+
+1. **The wiring points** — `messaging/index.ts` maps `'feishu' → feishuPort`, `docs/index.ts` registers
+   `feishuDocs`. Naming providers is what a selection point and a registry are *for*.
+2. **`FEISHU_*` env keys** in `config.ts`'s `Env` — they are the Feishu provider's actual variable names.
+3. **Migration SQL** — `v1` renames `feishu_doc_token`, `v2` rewrites `dep = 'feishu'`. A migration that
+   could not name the old thing could not migrate it.
+
+Everything else went: `ProbeDep` `'feishu'` → `'im'` (with migration v2 rewriting stored rows), the health
+label now reads `${port.id} 长连接`, and the daemon's user-facing log lines name the live provider instead
+of assuming one.
+
+Two changes worth calling out because they are behavioural, not cosmetic:
+
+- **Auth-failure remediation moved into the adapter** (`InboundProbe.authFix`). It used to be a core lookup
+  table keyed by dep. "How do I fix this token" is provider knowledge; keeping it in the core meant every
+  new provider required a core edit, which is exactly what these seams exist to prevent.
+- **`intake` no longer falls back to `FEISHU_REVIEW_CHAT_ID`** for a manually-added PRD's chat; it uses
+  `port.watchedChats()[0]`. Same intent, provider-neutral — but note that a deployment setting *both*
+  `FEISHU_WATCH_CHATS` and a different `FEISHU_REVIEW_CHAT_ID` will now anchor manual adds to the first
+  watched chat rather than the review chat.
+
 ---
 
 ## 6. Open decisions
@@ -380,4 +404,4 @@ Tracked in [#2](https://github.com/angelozhangai/forgeline/issues/2).
 | 1 — `DocSourcePort` | [#4](https://github.com/angelozhangai/forgeline/issues/4) | ✅ done |
 | 2 — plaintext source | [#5](https://github.com/angelozhangai/forgeline/issues/5) | ✅ done |
 | 3 — Slack adapter | [#6](https://github.com/angelozhangai/forgeline/issues/6) | ✅ done |
-| 4 — naming + docs | [#7](https://github.com/angelozhangai/forgeline/issues/7) | not started |
+| 4 — naming + docs | [#7](https://github.com/angelozhangai/forgeline/issues/7) | ✅ done |

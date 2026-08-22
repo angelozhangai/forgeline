@@ -8,15 +8,22 @@ import { runAllProbes, type ProbeResult } from '../llm/probes.ts';
 import { getProbe, upsertProbe, allProbes } from '../store/contract.ts';
 import { sendHealthAlert } from './alert.ts';
 import type { Check } from './check.ts';
+import { port } from '../messaging/index.ts';
 
-const DEP_LABEL: Record<string, string> = { codex: 'codex', claude: 'claude', gh: 'gh', feishu: '飞书 API' };
+// 'im' 那一项显示成**当前生效的 provider 名**（飞书 API / slack API）——写死某一家的话，
+// 换了 provider 的部署会在状态页上看到一个跟自己无关的名字。
+function depLabel(dep: string): string {
+  if (dep === 'im') return `${port.id} API`;
+  return DEP_LABEL[dep] ?? dep;
+}
+const DEP_LABEL: Record<string, string> = { codex: 'codex', claude: 'claude', gh: 'gh' };
 // 登录/鉴权失效（kind='auth'）时各工具的「重新登录」指引——区别于 schema 漂移（改 contract.ts）。
 // 直击「token 过期 → 链路静默瘫」：给操作者可直接照做的修复动作，而非误导去改信封定义。
+// IM 那条**不在这里**：怎么修是 provider 知识，由 adapter 随探针结果自报（ProbeResult.authFix）。
 const AUTH_FIX: Record<string, string> = {
   codex: 'codex 重新登录（codex 非交互鉴权 / 重跑登录）',
   claude: 'claude 重新登录（/login 或换 CLAUDE_CODE_OAUTH_TOKEN / setup-token）',
   gh: 'gh auth login（需目标项目 GitHub org 写权限）',
-  feishu: '检查飞书 bot 凭据/权限（FEISHU_BOT_APP_ID/SECRET、群是否加 bot）',
 };
 
 // 跑全部探针并落库（available 的才落）。返回结果供调用方告警。昂贵——仅每日 interval / `forge contract-check` 调。
@@ -36,13 +43,13 @@ export async function maybeAlertContractDrift(results: ProbeResult[], now: numbe
     const wasOk = prev ? prev.ok : true; // 首次见到默认当「之前好的」，仅在变坏时告警
     upsertProbe(r);
     if (wasOk && !r.ok) {
-      const label = DEP_LABEL[r.dep] ?? r.dep;
+      const label = depLabel(r.dep);
       const body =
         r.kind === 'auth'
           ? [
               `**${label}** 调用非零退出，疑似**登录态失效 / token 过期**——相关闸/建 issue 会停泊（失败不静默）。`,
               `- 现象：${r.detail}`,
-              `- 处置：${AUTH_FIX[r.dep] ?? '检查该工具登录态'}，恢复后 \`forge retry <slug>\` 清停泊。`,
+              `- 处置：${r.authFix ?? AUTH_FIX[r.dep] ?? '检查该工具登录态'}，恢复后 \`forge retry <slug>\` 清停泊。`,
               ...(r.raw ? ['```', r.raw.slice(0, 600), '```'] : []),
             ]
           : [
@@ -54,7 +61,7 @@ export async function maybeAlertContractDrift(results: ProbeResult[], now: numbe
             ];
       await sendHealthAlert('degraded', r.kind === 'auth' ? `🔑 ${label} 登录/鉴权疑似失效` : `外部工具契约漂移：${label}`, body, now);
     } else if (!wasOk && r.ok) {
-      await sendHealthAlert('recovered', `外部工具契约已恢复：${DEP_LABEL[r.dep] ?? r.dep}`, [`${DEP_LABEL[r.dep] ?? r.dep} 信封字段重新解析正常。`], now);
+      await sendHealthAlert('recovered', `外部工具契约已恢复：${depLabel(r.dep)}`, [`${depLabel(r.dep)} 信封字段重新解析正常。`], now);
     }
   }
 }
@@ -72,9 +79,9 @@ export function contractCheck(now: number): Check {
   const newest = Math.max(...rows.map((r) => r.checkedAt));
   const ageMin = Math.max(0, Math.round((now - newest) / 60000));
   if (drifted.length) {
-    return { name: '外部工具契约', status: 'degraded', detail: `契约漂移：${drifted.map((d) => DEP_LABEL[d.dep] ?? d.dep).join('、')}（${ageMin} 分钟前探测）` };
+    return { name: '外部工具契约', status: 'degraded', detail: `契约漂移：${drifted.map((d) => depLabel(d.dep)).join('、')}（${ageMin} 分钟前探测）` };
   }
-  return { name: '外部工具契约', status: 'healthy', detail: `${rows.map((r) => DEP_LABEL[r.dep] ?? r.dep).join('/')} 契约正常（${ageMin} 分钟前）` };
+  return { name: '外部工具契约', status: 'healthy', detail: `${rows.map((r) => depLabel(r.dep)).join('/')} 契约正常（${ageMin} 分钟前）` };
 }
 
 // 给 CLI `forge contract-check` 用：跑探针 + 告警 + 打印一行行结果。
@@ -82,7 +89,7 @@ export async function runContractCheckCli(now: number): Promise<ProbeResult[]> {
   const results = await runContractProbes(now);
   for (const r of results) {
     const mark = !r.available ? '·' : r.ok ? '✓' : '✗';
-    log.info(`${mark} ${DEP_LABEL[r.dep] ?? r.dep}：${r.detail}`);
+    log.info(`${mark} ${depLabel(r.dep)}：${r.detail}`);
   }
   return results;
 }

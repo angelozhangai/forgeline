@@ -1,8 +1,8 @@
 import { writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
-import { loadConfig } from './config.ts';
 import { store as sessions } from './store/index.ts'; // 经 SessionStore 接缝（选择点），不直连 store/sessions.ts
 import { readDoc, formatRef, registeredIds, type DocRef } from './docs/index.ts';
+import { port } from './messaging/index.ts';
 import { sessionLogDir } from './util/render.ts';
 import { deriveSlug, slugify, shortId } from './util/slug.ts';
 import { runClaudeBare } from './llm/runClaude.ts';
@@ -52,7 +52,6 @@ function dupResult(existing: Session): AddResult {
 
 // V1 入口：手动登记一个 PRD（读文档 → 建 session）。V2 由群消息/补拉调用同一函数。
 export async function addPrd(o: AddOpts): Promise<AddResult> {
-  const cfg = loadConfig();
   if (!o.doc?.token) return { ok: false, created: false, msg: '缺需求文档（--prd <链接>）' };
   if (!registeredIds().includes(o.doc.source)) {
     // 未注册的源绝不静默吞：登记进去也读不出正文，只会变成一条永远停泊的需求。
@@ -103,7 +102,9 @@ export async function addPrd(o: AddOpts): Promise<AddResult> {
       prd_url: url,
       prd_text_path: prdPath,
       doc_ref: ref,
-      chat_id: o.chatId ?? cfg.env.FEISHU_REVIEW_CHAT_ID ?? null,
+      // 没给来源群时（手动 `forge add`）回落到**当前 provider 的第一个观察群**——写死某一家的 env
+      // 会让 Slack 部署把状态卡认到一个飞书群上去。
+      chat_id: o.chatId ?? port.watchedChats()[0] ?? null,
       poster_id: o.posterId ?? null,
       intake_msg_id: o.intakeMsgId ?? null,
     });

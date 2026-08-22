@@ -1,4 +1,4 @@
-# deploy — Forge 常驻守护 (launchd) + 看门狗 + 飞书长连接 + 本地状态页
+# deploy — Forge 常驻守护 (launchd) + 看门狗 + IM 长连接(飞书 / Slack) + 本地状态页
 
 > **Forge** = 本服务的品牌/代号：把 PRD 锻造成技术方案/issue。launchd 标签 `com.forge.daemon` / `com.forge.watchdog`，启动器 `deploy/forge-daemon` / `deploy/forge-watchdog`。
 >
@@ -57,7 +57,51 @@ open http://127.0.0.1:4319/   # 本地状态页
 
 参数都在 `config/runtime.yaml › health`,端口可被 `FORGE_HEALTH_PORT` 覆盖。手动活检:`./forge health`(加 `--json` 出结构化)。
 
+## 二·五、换成 Slack(可选)
+
+传输层是一条缝(`MessagingPort`),飞书和 Slack 是它的两个实现,**核心一行不用动**。
+在 `config/forge.env` 里设 `FORGE_MESSAGING_PROVIDER=slack`,再填那几个 `SLACK_*`
+(键与含义见 `config/forge.env.example` 的内联注释)。零新依赖:Web API 走原生 `fetch`,
+Socket Mode 走 Node 内置 `WebSocket`。
+
+> ⚠️ **写错 provider 名服务会直接起不来**,这是有意的。静默回退到飞书意味着:你以为接了 Slack,
+> 实际所有审批卡照发飞书,而 Slack 那边一片空白——**没有任何症状**。宁可起不来。
+
+Slack 后台(api.slack.com/apps → 建 App)要开的东西:
+
+1. **OAuth & Permissions → Bot Token Scopes**:`chat:write`、`channels:history`、`groups:history`、
+   `im:write`、`users:read`。装进工作区后拿到 `xoxb-…` → `SLACK_BOT_TOKEN`。
+2. **Socket Mode → 打开**;在 **Basic Information → App-Level Tokens** 建一枚带 `connections:write`
+   的 token(`xapp-…`)→ `SLACK_APP_TOKEN`。
+3. **Event Subscriptions → 订阅** `message.channels` / `message.groups` / `message.im`。
+4. **Interactivity & Shortcuts → 打开**。这条**必开**:Slack 的输入框在消息里不合法,评审表单只能走
+   modal,不开的话按钮点了没反应。
+5. 把 bot `/invite` 进要观察的频道,频道 id 填 `SLACK_WATCH_CHANNELS`;bot 自身 user id 填
+   `SLACK_BOT_USER_ID`(**不填等于哑火**:判不出群消息有没有 @ 到它 → 一律保守忽略)。
+
+跑 `FORGE_MESSAGING_PROVIDER=slack ./forge doctor` 会逐项体检上面这些。
+
+**与飞书唯一的体验差异**:评审/立项表单是「卡片上一个按钮 → 弹出 modal 填 → 一次提交」,
+而不是飞书那样直接在卡片里填。原因见上一条第 4 点,这是 Slack 平台的限制,不是实现取巧。
+
+### 需求文档从哪来
+
+读需求文档也是一条独立的缝(`DocSourcePort`,注册表而非选择点——一条消息里可能同时贴好几个源的链接)。
+默认注册两个:
+
+- **飞书文档**——认 `wiki/docx/docs` 链接,能回写机审批注;
+- **plaintext(兜底,默认关)**——把「@机器人 + 一段话」本身当成需求正文,不需要任何文档服务。
+  在 `config/runtime.yaml` 里 `doc_sources.plaintext.enabled: true` 打开。
+  ⚠️ 开了之后这类消息会**真的建需求、跑闸A = 自动花钱**;今天它们只会被忽略。归一后不足 20 字的
+  (「收到,谢谢」这类)不会被当成需求。
+
+接 Slack 而手上没有文档服务时,把 plaintext 打开就能跑通全链路。
+
+---
+
 ## 三、⚠️ 飞书开发者后台需开(只有你能做,长连接收事件的前提)
+
+> 用 Slack 的话跳过本节,看上面的「二·五」。
 
 在飞书开发者后台建一个企业自建应用(把 App ID/Secret 填进 `config/forge.env`),开这些后**发布新版**(企业自建需管理员审核生效):
 
