@@ -20,15 +20,15 @@ const fakePort = {
   },
 };
 
-let addPrdCalls: { prdUrl: string; chatId?: string }[] = []; // prdUrl 取自 doc.url，断言更好读
+let addPrdCalls: { prdUrl: string; chatId?: string; posterId?: string; intakeMsgId?: string }[] = []; // prdUrl 取自 doc.url，断言更好读
 let createdUrls = new Set<string>(); // 模拟 addPrd 的去重：同一 url 第二次 created=false
 
 mock.module('../src/messaging/index.ts', { namedExports: { port: fakePort } });
 mock.module('../src/intake.ts', {
   namedExports: {
-    addPrd: async (o: { doc: { url?: string; token: string }; chatId?: string }) => {
+    addPrd: async (o: { doc: { url?: string; token: string }; chatId?: string; posterId?: string; intakeMsgId?: string }) => {
       const url = o.doc.url ?? o.doc.token;
-      addPrdCalls.push({ prdUrl: url, chatId: o.chatId });
+      addPrdCalls.push({ prdUrl: url, chatId: o.chatId, posterId: o.posterId, intakeMsgId: o.intakeMsgId });
       const created = !createdUrls.has(url);
       createdUrls.add(url);
       return { ok: true, created, msg: '', session: { slug: `s-${addPrdCalls.length}` } };
@@ -56,10 +56,14 @@ function reset(): void {
 test('补拉：正文里的文档链接 → 登记，并把水位推到最后一条', async () => {
   reset();
   cursors.advanceCursor('oc_a', 1000);
-  history.oc_a = [msg({ chatId: 'oc_a', text: `看下这个 ${DOC}`, createTime: 2000 }), msg({ chatId: 'oc_a', text: '收到', createTime: 3000 })];
+  history.oc_a = [
+    msg({ chatId: 'oc_a', text: `看下这个 ${DOC}`, createTime: 2000, senderId: 'ou_pm', messageId: 'om_1' }),
+    msg({ chatId: 'oc_a', text: '收到', createTime: 3000 }),
+  ];
   const n = await backfillChat('oc_a');
   assert.equal(n, 1);
-  assert.deepEqual(addPrdCalls, [{ prdUrl: DOC, chatId: 'oc_a' }]);
+  // 发起人与原消息 id 一并带上：补拉登记的需求与 live 登记的长得一样（状态卡回到 PM 那条下面、能 @ 到人）。
+  assert.deepEqual(addPrdCalls, [{ prdUrl: DOC, chatId: 'oc_a', posterId: 'ou_pm', intakeMsgId: 'om_1' }]);
   assert.equal(cursors.getCursor('oc_a'), 3000); // 无链接的那条也推水位——否则每轮都重扫
 });
 
@@ -72,6 +76,17 @@ test('补拉：拉历史时按当前水位起（秒级精度的边界重复由�
   assert.deepEqual(historyCalls, [{ chatId: 'oc_b', sinceMs: 5000 }]);
   assert.equal(n, 1);
   assert.deepEqual(addPrdCalls.map((c) => c.prdUrl), [DOC2]); // 水位那条没被重登记
+});
+
+test('补拉：历史条目缺发起人/原消息 id 时照常登记（只是回不到那条下面）', async () => {
+  reset();
+  cursors.advanceCursor('oc_a2', 0);
+  // 历史接口本就可能不带这两项（老消息 / provider 差异）——缺了不能成为「不登记」的理由，
+  // 那等于离线期间的需求被静默丢掉；后果只是状态卡直接发到群里（notify 侧已有该降级）。
+  history.oc_a2 = [msg({ chatId: 'oc_a2', text: DOC, createTime: 100 })];
+  const n = await backfillChat('oc_a2');
+  assert.equal(n, 1);
+  assert.deepEqual(addPrdCalls, [{ prdUrl: DOC, chatId: 'oc_a2', posterId: undefined, intakeMsgId: undefined }]);
 });
 
 test('补拉：正文无链接时退到 adapter 给的兜底文本块（文档分享卡 / 富文本 post）', async () => {
