@@ -2,7 +2,7 @@ import { writeFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { loadConfig } from './config.ts';
 import { store as sessions } from './store/index.ts'; // 经 SessionStore 接缝（选择点），不直连 store/sessions.ts
-import { readPrd, extractDocToken } from './feishu/doc.ts';
+import { readDoc, formatRef, registeredIds, type DocRef } from './docs/index.ts';
 import { sessionLogDir } from './util/render.ts';
 import { deriveSlug, slugify, shortId } from './util/slug.ts';
 import { runClaudeBare } from './llm/runClaude.ts';
@@ -24,13 +24,16 @@ async function proposeSlug(title: string, prdText: string): Promise<string | nul
 }
 
 export interface AddOpts {
-  prdUrl: string;
+  // 需求文档引用（**已由文档源认领/解析过**）。调用方：listen/backfill 从 claimDocs 拿，CLI 从 parseAnyRef 拿。
+  // 传 ref 而非 URL，是因为「这串东西属于哪个源、源内 id 是什么」只有源自己知道——
+  // 让 intake 再猜一次，就等于把源的知识复制进核心。
+  doc: DocRef;
   slug?: string;
   title?: string;
   projectId?: string; // 目标项目（缺省按 群→项目映射 / 默认项目 解析）
   branch?: 'prod' | 'dev';
   chatId?: string;
-  posterOpenId?: string; // 发 PRD 的产品 open_id（群里 @TA）
+  posterId?: string; // 发 PRD 的产品在该 IM 里的 id（群里 @TA）
   intakeMsgId?: string; // PM 那条消息 id（bot 回复其下、发状态卡）
 }
 
@@ -47,24 +50,30 @@ function dupResult(existing: Session): AddResult {
   };
 }
 
-// V1 入口：手动登记一个 PRD（读飞书文档 → 建 session）。V2 由群轮询调用同一函数。
+// V1 入口：手动登记一个 PRD（读文档 → 建 session）。V2 由群消息/补拉调用同一函数。
 export async function addPrd(o: AddOpts): Promise<AddResult> {
   const cfg = loadConfig();
-  if (!o.prdUrl) return { ok: false, created: false, msg: '缺 --prd <飞书PRD链接>' };
+  if (!o.doc?.token) return { ok: false, created: false, msg: '缺需求文档（--prd <链接>）' };
+  if (!registeredIds().includes(o.doc.source)) {
+    // 未注册的源绝不静默吞：登记进去也读不出正文，只会变成一条永远停泊的需求。
+    return { ok: false, created: false, msg: `未注册的文档源「${o.doc.source}」（已注册：${registeredIds().join('/') || '无'}）` };
+  }
+  const ref = formatRef(o.doc);
+  const url = o.doc.url ?? null;
 
   // PRD 级去重：一份 PRD 的语义唯一，从接线到 issue/PR 全链路不可重复。
-  // 用 doc token（URL 各变体/查询参数都归一到同一 token）查；读文档前先挡，省一次网络读。
-  const token = extractDocToken(o.prdUrl);
-  const existing = (await sessions.findByDocToken(token)) ?? (await sessions.findByPrdUrl(o.prdUrl));
+  // 用 doc_ref（URL 各变体/查询参数都已由源归一到同一 token，再冠上源前缀）查；读文档前先挡，省一次网络读。
+  // findByPrdUrl 是旧路径兜底（doc_ref 之前的精确-URL 去重时代残留）。
+  const existing = (await sessions.findByDocRef(ref)) ?? (url ? await sessions.findByPrdUrl(url) : null);
   if (existing) return dupResult(existing);
 
-  const prd = await readPrd(o.prdUrl);
+  const prd = await readDoc(o.doc);
   if (!prd.ok) {
-    return { ok: false, msg: `读 PRD 失败：${prd.error}（确认是飞书文档链接且 feishu-doc.js 已登录）` };
+    return { ok: false, msg: `读需求文档失败（${o.doc.source}）：${prd.error}` };
   }
 
   const firstLine = prd.text.split('\n').map((l) => l.trim()).find((l) => l.length > 0) ?? '';
-  const title = (o.title?.trim()) || firstLine.slice(0, 80) || o.slug || o.prdUrl;
+  const title = (o.title?.trim()) || firstLine.slice(0, 80) || o.slug || url || o.doc.token;
   // slug 优先级：--slug 显式 > claude 起的英文 slug（标题中文时）> req-<id> 回退
   let slug = o.slug ? deriveSlug(title, o.slug) : '';
   if (!slug) {
@@ -91,18 +100,18 @@ export async function addPrd(o: AddOpts): Promise<AddResult> {
       title,
       project_id: projectId, // 显式 flag / 群→项目映射 / 默认项目（见上）
       branch,
-      prd_url: o.prdUrl,
+      prd_url: url,
       prd_text_path: prdPath,
-      feishu_doc_token: prd.token,
-      feishu_chat_id: o.chatId ?? cfg.env.FEISHU_REVIEW_CHAT_ID ?? null,
-      poster_open_id: o.posterOpenId ?? null,
+      doc_ref: ref,
+      chat_id: o.chatId ?? cfg.env.FEISHU_REVIEW_CHAT_ID ?? null,
+      poster_id: o.posterId ?? null,
       intake_msg_id: o.intakeMsgId ?? null,
     });
   } catch (e) {
-    // 并发竞态最后一道闸：另一条相同 doc token 的提交在本次读文档期间抢先插入 → 唯一索引拒绝本次。
+    // 并发竞态最后一道闸：另一条相同 doc_ref 的提交在本次读文档期间抢先插入 → 唯一索引拒绝本次。
     // 退回去重路径：复用抢先建好的那条，绝不重复建需求（落实「全链路不可重复」）。
-    if (sessions.isDuplicateTokenError(e)) {
-      const winner = (await sessions.findByDocToken(prd.token)) ?? (await sessions.findByDocToken(token)) ?? (await sessions.findByPrdUrl(o.prdUrl));
+    if (sessions.isDuplicateDocRefError(e)) {
+      const winner = (await sessions.findByDocRef(ref)) ?? (url ? await sessions.findByPrdUrl(url) : null);
       if (winner) {
         log.info(`PRD 并发竞态：复用抢先建好的 ${winner.slug}（${winner.id}）`);
         return dupResult(winner);

@@ -1,5 +1,5 @@
 // 集成：群消息入口的真实业务链路。只 mock 外部 IM/闸执行边界；
-// 链路本身走 listen → MessagingPort.parseMessage → extractFeishuLinks → addPrd → 群反馈/cursor/tick。
+// 链路本身走 listen → MessagingPort.parseMessage → claimDocs（文档源注册表）→ addPrd → 群反馈/cursor/tick。
 // 禁止镜像测试：不检查 listen 内部字段读取，只验证 PM 在群里发消息后生产上会发生什么。
 process.env.FORGE_DB = ':memory:';
 
@@ -11,7 +11,7 @@ import type { MessagingPort } from '../src/messaging/port.ts';
 // 让 cursors→store→root.ts 在 env 设好前求值 DB_PATH → 落真库（污染 state/service.db 的 chat_cursor）。
 // 与本套件其它涉库测试同范式：在 FORGE_DB 设好后**动态** import（见文件末 await import）。
 
-type IntakeCall = { prdUrl: string; chatId?: string; posterOpenId?: string; intakeMsgId?: string };
+type IntakeCall = { doc: { source: string; token: string; url?: string }; chatId?: string; posterId?: string; intakeMsgId?: string };
 
 let parsedMessage: InboundMessage | null = null;
 const addPrdCalls: IntakeCall[] = [];
@@ -101,7 +101,9 @@ test('PM 发文档分享/富文本消息：纯 text 无链接也能登记 PRD、
 
   await __handleMessageForTest({ raw: { ignored: true } });
 
-  assert.deepEqual(addPrdCalls, [{ prdUrl: 'https://example.feishu.cn/docx/RichDocToken', chatId: 'oc_rich', posterOpenId: 'ou_pm', intakeMsgId: 'om_rich' }]);
+  assert.deepEqual(addPrdCalls, [
+    { doc: { source: 'feishu', token: 'RichDocToken', url: 'https://example.feishu.cn/docx/RichDocToken' }, chatId: 'oc_rich', posterId: 'ou_pm', intakeMsgId: 'om_rich' },
+  ]);
   assert.equal(syncCalls, 1, '新 PRD 应立即在群里回复/刷新状态卡，PM 看到入口已接住');
   assert.equal(tickCalls, 1, '收到有效 PRD 后应立即推进闸A，而不是等下一轮 poll');
   assert.equal(cursors.getCursor('oc_rich'), 1_700_000_000_123, '处理过的消息要推进水位，避免重连后重复补拉');
@@ -192,6 +194,6 @@ test('p2p 私聊（isGroup=false）：天然定向，无需 @机器人 也照常
   await __handleMessageForTest({ raw: {} });
 
   assert.equal(addPrdCalls.length, 1, '私聊定向消息照常入流程（不被群 @ 闸拦下）');
-  assert.equal(addPrdCalls[0].prdUrl, 'https://example.feishu.cn/wiki/P2PToken');
+  assert.deepEqual(addPrdCalls[0].doc, { source: 'feishu', token: 'P2PToken', url: 'https://example.feishu.cn/wiki/P2PToken' });
   assert.equal(tickCalls, 1);
 });

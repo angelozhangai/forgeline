@@ -10,9 +10,9 @@ export interface Session {
   branch: string; // 'main' | 'dev'
   prd_url: string | null;
   prd_text_path: string | null;
-  feishu_chat_id: string | null;
-  feishu_doc_token: string | null;
-  poster_open_id: string | null; // 发 PRD 的产品的 open_id（群里 @TA 回复用）
+  chat_id: string | null; // 来源群/频道 id（IM provider 无关）
+  doc_ref: string | null; // 需求文档引用 '<source>:<token>'（见 src/docs/port.ts）
+  poster_id: string | null; // 发 PRD 的产品在该 IM 里的 id（群里 @TA 回复用）
   intake_msg_id: string | null; // PM 那条消息 id（bot 回复到它下面）
   status_msg_id: string | null; // bot 在群里那张状态卡 id（全程原地编辑）
   // 复杂度（相对估点，闸A 提议 + 人确认；全程流转、写进 issue、可加总工作量）

@@ -15,7 +15,7 @@ import { notify, syncGroupCard } from '../notify.ts';
 import { port } from '../messaging/index.ts';
 import { resolveActor } from '../messaging/operators.ts';
 import type { CardModel } from '../messaging/index.ts';
-import { extractFeishuLinks } from '../util/links.ts';
+import { claimDocs } from '../docs/index.ts';
 import { ACTIVE_GATE_STATES } from '../statemachine/states.ts';
 import { healthConfig } from '../health/config.ts';
 import { initHeartbeat, pingLiveness, markCycle, markWs } from '../health/heartbeat.ts';
@@ -26,9 +26,6 @@ import { recordSample } from '../health/history.ts';
 import { sendHealthAlert } from '../health/alert.ts';
 import { runContractProbes } from '../health/contract.ts';
 import { allProbes, startupProbeDue } from '../store/contract.ts';
-
-// 抽链接实现挪到 util/links.ts（backfill 也用，避免 backfill↔listen 循环依赖）；re-export 保持既有引用。
-export { extractFeishuLinks };
 
 async function ack(text: string): Promise<void> {
   await port.sendDmText('⏳ 处理中', [text], 'grey').catch(() => undefined);
@@ -184,7 +181,7 @@ async function handleMessage(evt: Record<string, unknown>): Promise<void> {
   if (!m) return;
   const chatId = m.chatId;
   const createTime = m.createTime; // adapter 已兜 now()（缺 createTime 不塞 0，避免水位插到 epoch）
-  const posterOpenId = m.senderId;
+  const posterId = m.senderId;
   const intakeMsgId = m.messageId;
   const text = m.text;
   // 群消息入口闸：群里**只有 @机器人**才入流程——否则群内随手分享/转发的飞书文档会被误当 PRD 吃进闸A（白花钱）。
@@ -200,22 +197,16 @@ async function handleMessage(evt: Record<string, unknown>): Promise<void> {
     return;
   }
   // 链接常不在纯文本里（文档分享卡片 / 富文本 post）——adapter 把这些结构挖成 searchTexts 候选，
-  // 这里对 text + 候选逐个抽飞书文档链接（识别飞书 doc 链接是 doc 层、留在核心；不碰飞书 raw shape）。
-  let links = extractFeishuLinks(text);
-  if (links.length === 0) {
-    for (const st of m.searchTexts ?? []) {
-      links = extractFeishuLinks(st);
-      if (links.length) break;
-    }
-  }
+  // 交给**文档源注册表**认领（谁认得出就归谁；一个都不认才轮到兜底源）。核心不知道任何一种链接长什么样。
+  const docs = claimDocs({ text, searchTexts: m.searchTexts });
   if (process.env.FORGE_WS_DEBUG === '1') {
-    log.info(`消息入口收到：chat=${chatId} links=${links.length} text="${text.slice(0, 80)}" evt=${JSON.stringify(evt).slice(0, 700)}`);
+    log.info(`消息入口收到：chat=${chatId} docs=${docs.length} text="${text.slice(0, 80)}" evt=${JSON.stringify(evt).slice(0, 700)}`);
   }
-  if (links.length === 0) {
-    log.warn('消息入口：未发现飞书文档链接，忽略此消息');
+  if (docs.length === 0) {
+    log.warn('消息入口：没有任何文档源认领这条消息，忽略');
   } else {
-    for (const url of links) {
-      const r = await addPrd({ prdUrl: url, chatId: chatId || undefined, posterOpenId, intakeMsgId });
+    for (const doc of docs) {
+      const r = await addPrd({ doc, chatId: chatId || undefined, posterId, intakeMsgId });
       if (r.ok && r.session) {
         if (r.created) {
           log.ok(`消息入口：登记 ${r.session.slug}`);

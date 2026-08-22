@@ -20,16 +20,17 @@ const fakePort = {
   },
 };
 
-let addPrdCalls: { prdUrl: string; chatId?: string }[] = [];
+let addPrdCalls: { prdUrl: string; chatId?: string }[] = []; // prdUrl 取自 doc.url，断言更好读
 let createdUrls = new Set<string>(); // 模拟 addPrd 的去重：同一 url 第二次 created=false
 
 mock.module('../src/messaging/index.ts', { namedExports: { port: fakePort } });
 mock.module('../src/intake.ts', {
   namedExports: {
-    addPrd: async (o: { prdUrl: string; chatId?: string }) => {
-      addPrdCalls.push({ prdUrl: o.prdUrl, chatId: o.chatId });
-      const created = !createdUrls.has(o.prdUrl);
-      createdUrls.add(o.prdUrl);
+    addPrd: async (o: { doc: { url?: string; token: string }; chatId?: string }) => {
+      const url = o.doc.url ?? o.doc.token;
+      addPrdCalls.push({ prdUrl: url, chatId: o.chatId });
+      const created = !createdUrls.has(url);
+      createdUrls.add(url);
       return { ok: true, created, msg: '', session: { slug: `s-${addPrdCalls.length}` } };
     },
   },

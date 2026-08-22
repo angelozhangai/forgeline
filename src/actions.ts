@@ -4,7 +4,8 @@ import { projectForSession, configForSession } from './projects.ts';
 import { loadConfig, inAllowList } from './config.ts';
 import { store as sessions } from './store/index.ts'; // 经 SessionStore 接缝（选择点），不直连 store/sessions.ts
 import { doWrites } from './writes.ts';
-import { feishuCommentAdd, prMergeState } from './workspace.ts';
+import { prMergeState } from './workspace.ts';
+import { commentDoc } from './docs/index.ts';
 import { notify, syncGroupCard } from './notify.ts';
 import { normSize, SIZES, sizeBadge } from './util/sizing.ts';
 import { probeLoad } from './util/load.ts';
@@ -181,8 +182,8 @@ export function confirmCommentText(round: number, opts: { who: string; verdict?:
 
 // 把确认评论发到 PRD 飞书文档（顶层评论，落在问题评论之后；best-effort，绝不阻断流程）。
 export function postConfirmComment(s: Session, opts: { who: string; verdict?: string; notes?: string }): void {
-  if (!s.feishu_doc_token) return;
-  void feishuCommentAdd(s.feishu_doc_token, confirmCommentText(s.gate_a_round ?? 1, opts)).catch(() => undefined);
+  if (!s.doc_ref) return;
+  void commentDoc(s.doc_ref, confirmCommentText(s.gate_a_round ?? 1, opts));
 }
 
 // PM 群卡提交答复：不直接定案，而是回喂同一 claude 会话做下一轮复评（闸A 多轮循环）。
