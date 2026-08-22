@@ -1,7 +1,7 @@
 import { readFileSync, existsSync } from 'node:fs';
 import YAML from 'yaml';
 import { z } from 'zod';
-import { configFile, ENV_FILE } from './root.ts';
+import { configFile, loadEnvFile as readEnvFile } from './root.ts';
 import { DEFAULT_PROJECT_ID } from './project.ts';
 import { AUTONOMY_MAX_LEVEL } from './statemachine/autonomyPolicy.ts';
 
@@ -138,6 +138,15 @@ export interface Env {
   FEISHU_DM_UNION_ID?: string; // 或 union_id（同企业跨应用一致，feishu-doc.js 用户身份可一次性取得，绕开 contact 审批）
   FEISHU_DM_CHAT_ID?: string; // 或 p2p chat_id
   FEISHU_DM_EMAIL?: string; // 或飞书工作邮箱（receive_id_type=email）
+  // 传输层 provider 选择（见 src/messaging/index.ts）。'feishu'（缺省）| 'slack'；认不出的值硬抛，绝不静默回退。
+  FORGE_MESSAGING_PROVIDER?: string;
+  // Slack（provider=slack 时必配）
+  SLACK_BOT_TOKEN?: string; // xoxb-…：Web API（发卡/改卡/读历史）
+  SLACK_APP_TOKEN?: string; // xapp-…：Socket Mode 建连（apps.connections.open 只认它）
+  SLACK_BOT_USER_ID?: string; // bot 自身 user id：群消息入口闸判「是否 @ 了本机器人」；未配则保守忽略群消息
+  SLACK_DM_USER_ID?: string; // 私聊推送目标（你本人的 user id，可直接当 channel 用）
+  SLACK_WATCH_CHANNELS?: string; // 逗号分隔的 channel id：开机/重连补拉这些频道的离线消息
+  SLACK_WEBHOOK_URL?: string; // 群 webhook 兜底（bot 私聊未送达时的降级）
   NOTIFY_DESKTOP?: string; // '0' 关闭 macOS 本地桌面通知兜底（默认开）
   CLAUDE_CODE_OAUTH_TOKEN?: string;
   [k: string]: string | undefined;
@@ -409,25 +418,9 @@ function loadYaml<T>(name: string, schema: z.ZodType<T>): T {
   return r.data;
 }
 
+// forge.env 的解析器住在 root.ts（传输层选择点也要用它，那里不能拖 zod 进来）。这里只做类型收窄。
 function loadEnvFile(): Env {
-  const env: Env = {};
-  if (!existsSync(ENV_FILE)) return env;
-  for (const raw of readFileSync(ENV_FILE, 'utf8').split('\n')) {
-    const line = raw.trim();
-    if (!line || line.startsWith('#')) continue;
-    const eq = line.indexOf('=');
-    if (eq < 0) continue;
-    const key = line.slice(0, eq).trim();
-    let val = line.slice(eq + 1).trim();
-    if (
-      (val.startsWith('"') && val.endsWith('"')) ||
-      (val.startsWith("'") && val.endsWith("'"))
-    ) {
-      val = val.slice(1, -1);
-    }
-    if (val !== '') env[key] = val;
-  }
-  return env;
+  return readEnvFile() as Env;
 }
 
 let cached: Config | null = null;

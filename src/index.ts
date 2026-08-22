@@ -11,6 +11,7 @@ import { store as sessions } from './store/index.ts'; // 经 SessionStore 接缝
 import { db } from './store/db.ts';
 import { addPrd, addImplementTask } from './intake.ts';
 import { parseAnyRef, registeredIds } from './docs/index.ts';
+import { port } from './messaging/index.ts';
 import { tick } from './orchestrator/worker.ts';
 import { listen } from './daemon/listen.ts';
 import { confirm, submitPmAnswers, requestGateB, submitGateBAnswers, forceGateBGo, go, deny, retry, setSize, assign, postConfirmComment, requestGateC, submitGateCAnswers, requestReviewPr, submitGateDAnswers, ackMerged } from './actions.ts';
@@ -168,11 +169,24 @@ function doctor(extError: string | null): void {
   ck('feishu-doc.js', existsSync(resolve(SCRIPTS_DIR, 'feishu-doc.js')));
   ck('config/forge.env', existsSync(ENV_FILE), existsSync(ENV_FILE) ? '' : '缺（可选；从 .example 复制）');
   if (cfg) {
-    const botOk = !!(cfg.env.FEISHU_BOT_APP_ID && cfg.env.FEISHU_BOT_APP_SECRET);
-    const tgt = cfg.env.FEISHU_DM_OPEN_ID || cfg.env.FEISHU_DM_UNION_ID || cfg.env.FEISHU_DM_CHAT_ID || cfg.env.FEISHU_DM_EMAIL;
-    ck('飞书 bot 私聊通知', botOk && !!tgt, botOk ? (tgt ? '已配' : '缺推送目标 FEISHU_DM_*') : '未配（降级桌面+日志）');
-    const sdkOk = existsSync(resolve(SVC_DIR, 'node_modules/@larksuiteoapi/node-sdk'));
-    ck('飞书长连接 SDK（forge listen 按钮/群入口）', sdkOk, sdkOk ? '已装（后台需开「事件订阅→长连接」见 deploy/README）' : 'npm install');
+    // 只体检**当前生效的** provider：一台机器不会同时接两个 IM，把没在用的那套也列出来只会制造噪音。
+    out(`  IM provider: ${port.id}（FORGE_MESSAGING_PROVIDER，缺省 feishu）`);
+    if (port.id === 'slack') {
+      const e = cfg.env;
+      ck('Slack bot token（发卡/改卡/读历史）', !!e.SLACK_BOT_TOKEN, e.SLACK_BOT_TOKEN ? '已配' : '缺 SLACK_BOT_TOKEN（xoxb-…）');
+      ck('Slack app token（Socket Mode 建连）', !!e.SLACK_APP_TOKEN, e.SLACK_APP_TOKEN ? '已配' : '缺 SLACK_APP_TOKEN（xapp-…，后台需开 Socket Mode）');
+      ck('Slack 私聊推送目标', !!e.SLACK_DM_USER_ID, e.SLACK_DM_USER_ID ? '已配' : '缺 SLACK_DM_USER_ID（降级桌面+日志）');
+      ck('Slack 观察频道（群入口 + 离线补拉）', !!e.SLACK_WATCH_CHANNELS, e.SLACK_WATCH_CHANNELS ? '已配' : '缺 SLACK_WATCH_CHANNELS');
+      // 未配 bot user id → 群消息无法确认「有没有 @ 我」→ 核心保守忽略**全部**群消息。这不是可选项，是哑火。
+      ck('Slack bot user id（群消息 @ 判定）', !!e.SLACK_BOT_USER_ID, e.SLACK_BOT_USER_ID ? '已配' : '缺 SLACK_BOT_USER_ID → 群消息一律被保守忽略');
+      ck('原生 WebSocket（Socket Mode 免依赖建连）', typeof WebSocket === 'function', typeof WebSocket === 'function' ? `Node ${process.version}` : 'Node ≥22 才内置');
+    } else {
+      const botOk = !!(cfg.env.FEISHU_BOT_APP_ID && cfg.env.FEISHU_BOT_APP_SECRET);
+      const tgt = cfg.env.FEISHU_DM_OPEN_ID || cfg.env.FEISHU_DM_UNION_ID || cfg.env.FEISHU_DM_CHAT_ID || cfg.env.FEISHU_DM_EMAIL;
+      ck('飞书 bot 私聊通知', botOk && !!tgt, botOk ? (tgt ? '已配' : '缺推送目标 FEISHU_DM_*') : '未配（降级桌面+日志）');
+      const sdkOk = existsSync(resolve(SVC_DIR, 'node_modules/@larksuiteoapi/node-sdk'));
+      ck('飞书长连接 SDK（forge listen 按钮/群入口）', sdkOk, sdkOk ? '已装（后台需开「事件订阅→长连接」见 deploy/README）' : 'npm install');
+    }
   }
   try {
     db();
