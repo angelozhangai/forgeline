@@ -18,13 +18,29 @@ export interface ModalContext {
   kind: 'decision' | 'go'; // 决定开哪种模态
 }
 
-const plain = (text: string): Record<string, unknown> => ({ type: 'plain_text', text: text.slice(0, 150), emoji: true });
+// ── plain_text 的上限是**按字段分的**，而且超了不是截断是整发失败 ──────
+// view.title / submit / close = 24；option.text / option.value = 75；placeholder = 150；
+// input.label / hint = 2000。一刀切一个数两头都错：
+//   · 标题/提交文案超 24 → views.open 直接 ok:false → 人看到的是「按钮点了没反应」，
+//     本仓最不能出现的那种形态（没有任何症状指向真正的原因）；
+//   · 待决项 label 砍到 150 → PM 在模态里只看得见半句问题。
+// 这两种都只有在真工作区点一次按钮才会暴露 → 在这里按字段各自封顶，并在本地钉死。
+const LIMIT = { title: 24, option: 75, placeholder: 150, label: 2000 } as const;
+
+// 按**码点**截，不按 UTF-16 单元：直接 slice 会把 emoji 的代理对劈成两半，
+// Slack 收到非法 UTF-16 会把整个 view 拒掉——又是一次「点了没反应」。
+const clip = (text: string, max: number): string => Array.from(text ?? '').slice(0, max).join('');
+const ellipsize = (text: string, max: number): string => (Array.from(text ?? '').length <= max ? (text ?? '') : `${clip(text, max - 1)}…`);
+
+const plain = (text: string, max: number = LIMIT.placeholder): Record<string, unknown> => ({ type: 'plain_text', text: ellipsize(text, max), emoji: true });
+// title/submit/close：既不能超 24，也**不能为空**（空 plain_text 同样是 ok:false）→ 空就退到兜底文案。
+const chip = (text: string, fallback: string): Record<string, unknown> => plain((text ?? '').trim() || fallback, LIMIT.title);
 const mrkdwnEl = (text: string): Record<string, unknown> => ({ type: 'mrkdwn', text });
 
-// 下拉选项：Slack 的 option.text 上限 75 字符、value 上限 75。截断而不是报错——
-// 选项文案是人写的，长了就截，绝不能因此让整张卡发不出去。
+// 下拉选项：text / value 都封顶 75。截断而不是报错——选项文案是人写的，长了就截，
+// 绝不能因此让整张卡发不出去。value 不加省略号：它是要回喂给核心的原值，不是给人看的。
 function option(label: string, value: string): Record<string, unknown> {
-  return { text: plain(label.slice(0, 75)), value: value.slice(0, 75) };
+  return { text: plain(label, LIMIT.option), value: clip(value, LIMIT.option) };
 }
 
 // 一条待决项 → 一个 input 块（block_id = action_id = ask_<id>，与 composeDecisionAnswer 同序对齐）。
@@ -34,17 +50,17 @@ function askBlock(id: string, item: DecisionItem): Record<string, unknown> {
     type: 'input',
     block_id: `ask_${id}`,
     optional: true,
-    label: plain(`${id}. ${item.prompt}`),
+    label: plain(`${id}. ${item.prompt}`, LIMIT.label),
     element: {
       type: 'static_select',
       action_id: `ask_${id}`,
       placeholder: plain('选择…'),
       options: [
-        ...item.options.slice(0, 10).map((o) => option(`${o.recommended ? '★ ' : ''}${o.label}`, o.label.slice(0, 120))),
+        ...item.options.slice(0, 10).map((o) => option(`${o.recommended ? '★ ' : ''}${o.label}`, o.label)),
         option('其他（在下方补充说明里填）', '__other__'),
       ],
     },
-    ...(item.hint ? { hint: plain(`建议：${item.hint}`) } : {}),
+    ...(item.hint ? { hint: plain(`建议：${item.hint}`, LIMIT.label) } : {}),
   };
 }
 
@@ -65,7 +81,7 @@ export function buildDecisionModal(ctx: ModalContext, o: DecisionModalOpts): Rec
       type: 'input',
       block_id: 'verdict',
       optional: true,
-      label: plain('整体结论'),
+      label: plain('整体结论', LIMIT.label),
       element: {
         type: 'static_select',
         action_id: 'verdict',
@@ -78,7 +94,7 @@ export function buildDecisionModal(ctx: ModalContext, o: DecisionModalOpts): Rec
     type: 'input',
     block_id: 'notes',
     optional: true,
-    label: plain(o.notesLabel),
+    label: plain(o.notesLabel, LIMIT.label),
     element: { type: 'plain_text_input', action_id: 'notes', multiline: true, placeholder: plain(o.notesPlaceholder) },
   });
   return view(ctx, o.title ?? '需求评审', o.submitText, blocks);
@@ -98,7 +114,7 @@ export function buildGoModal(ctx: ModalContext, pool: string[], picked: string |
       }
     : { type: 'plain_text_input', action_id: 'assignee', placeholder: plain('填 DRI 短码，如 M') };
   return view(ctx, '立项 · 建需求', '✅ 立项 · 建需求', [
-    { type: 'input', block_id: 'assignee', optional: true, label: plain('指派 DRI'), element },
+    { type: 'input', block_id: 'assignee', optional: true, label: plain('指派 DRI', LIMIT.label), element },
   ]);
 }
 
@@ -108,9 +124,9 @@ function view(ctx: ModalContext, title: string, submitText: string, blocks: Reco
     callback_id: 'forge_form',
     // 上下文的唯一载体：view_submission 里没有原卡片，全靠它把 {action,slug,round} 带回来。
     private_metadata: JSON.stringify({ action: ctx.action, slug: ctx.slug, round: ctx.round ?? 0 }),
-    title: plain(title),
-    submit: plain(submitText),
-    close: plain('取消'),
+    title: chip(title, '需求评审'),
+    submit: chip(submitText, '提交'),
+    close: chip('取消', '取消'),
     blocks: blocks.length ? blocks : [{ type: 'section', text: mrkdwnEl('（没有待填项）') }],
   };
 }

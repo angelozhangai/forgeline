@@ -293,12 +293,19 @@ test('parseMessage：bot 自己发的 / 带 subtype 的一律不入流程（否�
   assert.equal(slackPort.parseMessage({ event: { type: 'reaction_added' } }), null);
 });
 
-test('parseMessage：群消息按 <@BOTID> 判 @；未配 bot user id → null（核心保守忽略，绝不当没 @）', () => {
+test('parseMessage：群消息按 <@BOTID> / <@BOTID|name> 判 @；未配 bot user id → null（核心保守忽略，绝不当没 @）', () => {
   reset({ SLACK_BOT_USER_ID: 'UBOT' });
   const hit = slackPort.parseMessage({ event: { type: 'message', channel: 'C1', ts: '1.2', text: '<@UBOT> 看下', channel_type: 'channel' } });
   assert.equal(hit?.mentionedBot, true);
+  // 带显示名的老写法 <@U123|name>：历史条目/老客户端里仍会出现。只认 <@U123> 的话，
+  // 群入口会「明明 @ 了却没反应」，而这条闸的失败是静默的（核心保守忽略），没有症状指向原因。
+  const legacy = slackPort.parseMessage({ event: { type: 'message', channel: 'C1', ts: '1.2', text: '<@UBOT|forge> 看下', channel_type: 'channel' } });
+  assert.equal(legacy?.mentionedBot, true);
   const miss = slackPort.parseMessage({ event: { type: 'message', channel: 'C1', ts: '1.2', text: '随手一说', channel_type: 'channel' } });
   assert.equal(miss?.mentionedBot, false);
+  // 别把「@ 了另一个 id 前缀相同的人」算成 @ 了自己。
+  const other = slackPort.parseMessage({ event: { type: 'message', channel: 'C1', ts: '1.2', text: '<@UBOTX> 看下', channel_type: 'channel' } });
+  assert.equal(other?.mentionedBot, false);
   reset({});
   const noId = slackPort.parseMessage({ event: { type: 'message', channel: 'C1', ts: '1.2', text: '<@UBOT> 看下', channel_type: 'channel' } });
   assert.equal(noId?.mentionedBot, null, '「无法确认」不等于「没人 @」');
