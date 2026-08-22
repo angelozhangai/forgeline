@@ -232,9 +232,13 @@ Ordering principle: each phase ends green, and Feishu behaviour is unchanged unl
   (absent field → `null`, which is *not* the same as "nobody was mentioned"), and the core loop
   deliberately does not read it. Whether Feishu history items actually carry the field is one live-tenant
   run away, and `test/messaging-feishu-history.test.ts` already pins both branches.
+  *(Closed in [#19](https://github.com/angelozhangai/forgeline/pull/19) — the faithful `null` mapping is
+  what made the three-state gate possible. See D1 in §6.)*
 - **Backfilled sessions still lose `posterId` / `intakeMsgId`.** The loop now *sees* the full
   `InboundMessage`, so passing them through is a two-line change — but it would alter Feishu behaviour
   (offline-registered sessions would start replying in-thread), and Phase 0 was a pure refactor. Follow-up.
+  *(Closed in [#17](https://github.com/angelozhangai/forgeline/pull/17), which also found that a failed
+  `replyGroupCard` dropped the status card entirely instead of degrading to a channel post.)*
 
 ### Phase 1 — `DocSourcePort`
 
@@ -364,13 +368,35 @@ Two changes worth calling out because they are behavioural, not cosmetic:
 
 ## 6. Open decisions
 
-**D1 — does offline backfill get the @-mention gate?** Live group messages must @ the bot before
+**D1 — does offline backfill get the @-mention gate?** ~~Live group messages must @ the bot before
 entering the pipeline (an anti-cost measure: casually shared docs must not trigger Gate A). Backfill
 does **not** apply that gate today, so it is a genuine hole. Unifying is the correct fix, but only if
 Feishu's `im/v1/messages` history items actually carry the server-filled `mentions` array — otherwise
 `mentionedBot` would be `null`, the core would conservatively ignore everything, and backfill would
 silently stop working. **Default: preserve today's behaviour in Phase 0** (no silent change), verify the
-history envelope during implementation, and unify in a separate follow-up if the field is available.
+history envelope during implementation, and unify in a separate follow-up if the field is available.~~
+
+**Resolved** ([#15](https://github.com/angelozhangai/forgeline/issues/15) / [#19](https://github.com/angelozhangai/forgeline/pull/19)) — **yes, and without waiting for the tenant dump.**
+
+The question was framed as a blocking one: go look at a live Feishu history item, *then* decide. That
+framing was wrong, because it assumed both paths must treat `mentionedBot === null` the same way. They
+should not. The two failure modes are not symmetric:
+
+| | live message | backfilled history item |
+| --- | --- | --- |
+| cost of wrongly admitting | one wasted Gate A | one wasted Gate A |
+| cost of wrongly ignoring | the message is still in the chat; @ again | **the requirement is gone, silently** |
+
+So the gate became a **three-state predicate** ([src/messaging/gate.ts](../src/messaging/gate.ts)) shared by
+both paths, and only the third state diverges: live ignores what it cannot confirm, backfill admits it.
+That is a strict improvement for every provider that *does* report mentions (Slack reads `<@BOTID>` from
+history text; Feishu too, if the field is there) and an exact no-op for any provider that does not — so
+it needed no tenant answer to land.
+
+The observation the issue asked for still happens, just automatically: an unconfirmable message now
+raises one summary `warn` per backfill round naming the provider. Running the daemon answers the original
+question; nobody has to hand-dump an API payload. If that line never appears on a Feishu deployment, the
+offline gate is live there too and D1 is fully closed for Feishu as well.
 
 **D2 — where does `FORGE_MESSAGING_PROVIDER` get read?** `process.env` first, then a direct minimal read
 of `forge.env`. Deliberately *not* via `loadConfig()`: calling it at module scope in a module this
