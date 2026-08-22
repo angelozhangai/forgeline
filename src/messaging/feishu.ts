@@ -22,6 +22,9 @@ import type { MessagingPort, InboundHandlers, InboundChannel, InboundProbe } fro
 // 像素宠物动图开关：默认开，但仅当 keys.json 里有对应 image_key 才真挂图（否则回退纯文字/emoji）。FORGE_PET_GIF=0 强制关。
 const PET_GIF_ON = FUN_ON && process.env.FORGE_PET_GIF !== '0';
 
+// 鉴权失效时给操作者的处置指引（随探针结果上浮到告警里）。怎么修是 provider 知识，核心不替它说话。
+const FEISHU_AUTH_FIX = '检查飞书 bot 凭据/权限（FEISHU_BOT_APP_ID/SECRET、群是否已加 bot）';
+
 // ── 飞书 2.0 元素原语（从 notify.ts 原样迁来，保字节级不变）──────────────
 const md = (content: string): Record<string, unknown> => ({ tag: 'markdown', content });
 const hr = { tag: 'hr' };
@@ -363,7 +366,7 @@ const feishuPort: MessagingPort = {
       return { available: false, ok: false, detail: '飞书 bot/观察群未配齐（跳过）' };
     }
     const token = await botTenantToken();
-    if (!token) return { available: true, ok: false, kind: 'auth', detail: '取 tenant_access_token 失败（鉴权/网络，非必然漂移）' };
+    if (!token) return { available: true, ok: false, kind: 'auth', detail: '取 tenant_access_token 失败（鉴权/网络，非必然漂移）', authFix: FEISHU_AUTH_FIX };
     try {
       const url = new URL(`${FEISHU_BASE}/im/v1/messages`);
       url.searchParams.set('container_id_type', 'chat');

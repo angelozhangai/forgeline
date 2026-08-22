@@ -164,6 +164,10 @@ export const MIGRATIONS: Migration[] = [
       DROP INDEX IF EXISTS idx_session_doc_token;
     `, // 新唯一索引由 ensurePartialUniqueIndexes 在迁移后建——放这里会让存量重复值把整条迁移拖崩
   },
+  // v2（Phase 4，去飞书化命名）：契约探针的 dep 从 'feishu' 改成 'im'——这一项探的是**当前生效的
+  // 那个 IM provider**，不是某一家。不改的话，换到 Slack 的部署会在状态页上盯着一行叫「feishu」的
+  // 探针结果，而它其实探的是 Slack。dep 是主键，'im' 在 v2 之前不可能存在，故不会撞。
+  { v: 2, sql: `UPDATE contract_probe SET dep = 'im' WHERE dep = 'feishu';` },
 ];
 
 // MIGRATIONS 里最大的 v（空表 → 0）。新库建完基线后直接盖这个版本号，跳过历史迁移。

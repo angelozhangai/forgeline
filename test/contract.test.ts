@@ -5,7 +5,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { commandExists } from '../src/util/proc.ts';
-import { probeCodex, probeClaude, probeGh, probeFeishu } from '../src/llm/probes.ts';
+import { probeCodex, probeClaude, probeGh, probeIm } from '../src/llm/probes.ts';
 
 const LIVE = process.env.FORGE_CONTRACT_LIVE === '1';
 const now = 1_700_000_000_000; // 固定注入时钟（避免 Date.now，且 schema 不依赖它）
@@ -26,7 +26,7 @@ test('契约·gh（真二进制·只读免费）', { skip: !LIVE || !commandExis
 });
 
 test('契约·飞书 API（金丝雀·只读免费）', { skip: !LIVE }, async () => {
-  const r = await probeFeishu(now);
+  const r = await probeIm(now);
   if (!r.available) return; // 未配齐 → 不算失败
   assert.ok(r.ok, `飞书契约漂移：${r.detail}`);
 });

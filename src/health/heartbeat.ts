@@ -16,7 +16,7 @@ export interface Heartbeat {
   lastCycleAt: number | null; // 最近一次 runCycle 完成（业务进度；长 gate 期间会偏旧，仅展示用）
   lastCycleOk: boolean | null;
   cycleCount: number;
-  wsConfigured: boolean; // 是否配了 FEISHU_BOT_APP_*（未配=仅周期 tick，长连接 n/a）
+  wsConfigured: boolean; // 入站传输是否已配齐（port.inboundConfigured()；未配=仅周期 tick，长连接 n/a）
   wsConnected: boolean;
   wsLastEventAt: number | null;
   activeGates: number; // 当前 GATE_*_RUNNING / ADVERSARIAL_LOOP 的 session 数

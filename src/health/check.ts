@@ -14,6 +14,7 @@ import type { Heartbeat } from './heartbeat.ts';
 import { healthConfig } from './config.ts';
 import type { HealthCfg } from './config.ts';
 import { contractCheck } from './contract.ts';
+import { port } from '../messaging/index.ts';
 
 export type Status = 'healthy' | 'degraded' | 'down';
 export type CheckStatus = Status | 'na';
@@ -94,14 +95,17 @@ export function classifyDaemon(hb: Heartbeat | null, now: number, cfg: HealthCfg
 }
 
 // 长连接分级：未配 bot 凭据 = n/a（不算故障，对齐 listen.ts 降级语义）；配了但断 = degraded。
-export function classifyWs(hb: Heartbeat | null): Check {
+// provider 名**从外面传进来**（调用方给 port.id），不在这里 import messaging——本模块的分级函数
+// 是纯的（测试直接喂结构体，不碰 DB/网络），拉一个模块级单例进来会把这条性质弄没。
+export function classifyWs(hb: Heartbeat | null, provider = 'IM'): Check {
+  const name = `${provider} 长连接`;
   if (!hb?.wsConfigured) {
-    return { name: '飞书长连接', status: 'na', detail: '未配 FEISHU_BOT_APP_*（仅周期 tick）' };
+    return { name, status: 'na', detail: '未配 bot 凭据（仅周期 tick）' };
   }
   if (!hb.wsConnected) {
-    return { name: '飞书长连接', status: 'degraded', detail: '已配但未连接（卡片按钮/群入口暂不可用，周期 tick 仍跑）' };
+    return { name, status: 'degraded', detail: '已配但未连接（卡片按钮/群入口暂不可用，周期 tick 仍跑）' };
   }
-  return { name: '飞书长连接', status: 'healthy', detail: '已建立' };
+  return { name, status: 'healthy', detail: '已建立' };
 }
 
 // ── 实时采信（IO）──────────────────────────────────────────────
@@ -189,7 +193,7 @@ export async function evaluateHealth(now: number = Date.now()): Promise<HealthRe
   const cfg = healthConfig();
   const hb = readHeartbeat();
   const daemon = classifyDaemon(hb, now, cfg);
-  const ws = classifyWs(hb);
+  const ws = classifyWs(hb, port.id);
 
   const { check: dbC, ok: dbOk } = dbCheck();
   let byState: Record<string, number> = {};

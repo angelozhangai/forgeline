@@ -11,7 +11,9 @@ import { runClaude } from './runClaude.ts';
 import { CODEX_ENVELOPE, assertCodexEnvelope } from './contract.ts';
 import { port } from '../messaging/index.ts';
 
-export type ProbeDep = 'codex' | 'claude' | 'gh' | 'feishu';
+// 'im' 而不是 'feishu'：这一项探的是**当前生效的那个 IM provider**（见 messaging/index.ts 选择点），
+// 不是某一家。存量库里的 'feishu' 行由 store 迁移 v2 改名过来。
+export type ProbeDep = 'codex' | 'claude' | 'gh' | 'im';
 
 export interface ProbeResult {
   dep: ProbeDep;
@@ -23,6 +25,8 @@ export interface ProbeResult {
   // !ok 时的归因，决定告警给哪种「处置」：auth=登录/鉴权疑似失效（重新登录、清停泊）；
   // drift=输出信封漂移（改 src/llm/contract.ts）。缺省/ok 时按 drift 文案（保守，沿用旧行为）。
   kind?: 'auth' | 'drift';
+  // kind='auth' 时的处置指引（provider 自报；缺省时 health/contract 退到通用文案）。
+  authFix?: string;
 }
 
 // 最便宜的一轮：逼出完整信封又不让模型乱跑工具。
@@ -78,16 +82,17 @@ export async function probeGh(now: number): Promise<ProbeResult> {
   }
 }
 
-// 飞书入站传输探针：im/v1/messages 信封校验本是 messaging-provider 专属知识——逻辑收进 adapter
-// （port.probe），这里只薄壳映射成统一 ProbeResult，断开 llm 层对 feishu/dm（base/token）的直连。
-export async function probeFeishu(now: number): Promise<ProbeResult> {
+// 入站传输探针：信封校验本是 messaging-provider 专属知识——逻辑收进 adapter（port.probe），
+// 这里只薄壳映射成统一 ProbeResult，断开 llm 层对任何一家 IM raw 层的直连。
+export async function probeIm(now: number): Promise<ProbeResult> {
   const p = await port.probe();
   // kind 必须透传（auth/drift）：丢了它则 health/contract 告警退回 drift 缺省文案（误导去改 contract.ts），
-  // 漏掉「飞书 token 过期 / 群未加 bot」这类登录·权限失效——正是 #1 要直击的场景。
-  return { dep: 'feishu', available: p.available, ok: p.ok, kind: p.kind, detail: p.detail, raw: p.raw, at: now };
+  // 漏掉「token 过期 / bot 没加进群」这类登录·权限失效——正是 #1 要直击的场景。
+  // authFix 同理由 adapter 透传：怎么修是 provider 知识，核心不替它说话。
+  return { dep: 'im', available: p.available, ok: p.ok, kind: p.kind, authFix: p.authFix, detail: p.detail, raw: p.raw, at: now };
 }
 
-// 跑全部探针（codex/claude 付费 trivial；gh/飞书免费只读）。available=false 的也返回（上层据此跳过告警）。
+// 跑全部探针（codex/claude 付费 trivial；gh/IM 免费只读）。available=false 的也返回（上层据此跳过告警）。
 export async function runAllProbes(now: number): Promise<ProbeResult[]> {
-  return [await probeCodex(now), await probeClaude(now), await probeGh(now), await probeFeishu(now)];
+  return [await probeCodex(now), await probeClaude(now), await probeGh(now), await probeIm(now)];
 }
