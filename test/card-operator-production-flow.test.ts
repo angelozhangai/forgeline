@@ -117,7 +117,6 @@ mock.module('../src/writes.ts', {
 });
 mock.module('../src/workspace.ts', {
   namedExports: {
-    feishuCommentAdd: async () => ({ ok: true }),
     prMergeState: async () => ({ ok: true, merged: true, state: 'MERGED' }),
     commitDeliveryDocs: async () => ({ ok: true, committed: false, stderr: '' }),
   },

@@ -69,11 +69,7 @@ mock.module('../src/workspace.ts', {
     listEpicChildren: async () => ({ ok: true, issues: [], stderr: '' }),
     issueStates: async () => [],
     addLabel: async () => ({ ok: true, stderr: '' }),
-    feishuRead: async () => ({ ok: true, text: '' }),
-    feishuCommentAdd: async () => ({ ok: true }),
     prMergeState: async () => ({ ok: true, merged: true, state: 'MERGED' }),
-    feishuUserToken: async () => null,
-    feishuReadDocxRaw: async () => ({ ok: true, text: '' }),
   },
 });
 

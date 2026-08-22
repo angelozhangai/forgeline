@@ -12,8 +12,8 @@ const { store } = await import('../src/store/index.ts');
 
 // 接缝上每个公开操作。漏一个 → 消费方迁移到 store.* 时才暴雷。
 const SEAM_METHODS = [
-  'create', 'findByIssueRef', 'isDuplicateTokenError', 'isDuplicateIssueRefError',
-  'get', 'getBySlug', 'findByPrdUrl', 'findByDocToken', 'resolve',
+  'create', 'findByIssueRef', 'isDuplicateDocRefError', 'isDuplicateIssueRefError',
+  'get', 'getBySlug', 'findByPrdUrl', 'findByDocRef', 'resolve',
   'listByStates', 'listAll', 'distinctProjects', 'countByState', 'countByStates',
   'patch', 'transition', 'appendEvent', 'events', 'lastEventTs', 'leaseClaim',
 ] as const;

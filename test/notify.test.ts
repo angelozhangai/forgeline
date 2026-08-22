@@ -102,7 +102,7 @@ test('群卡 闸A（AWAITING_PM_CONFIRM）：逐条下拉(ask_H1) + ★推荐 + 
   const path = gateAFile([
     { q: '充值的钱会过期吗？', severity: 'high', options: [{ label: '不过期', recommended: true, impact: '对用户友好' }, { label: '一年后过期', recommended: false, impact: '需到期提醒' }] },
   ]);
-  const c = json(buildStatusCard(sess({ state: 'AWAITING_PM_CONFIRM', gate_a_output_path: path, gate_a_round: 1, poster_open_id: 'ou_pm', feishu_chat_id: 'oc' } as never)));
+  const c = json(buildStatusCard(sess({ state: 'AWAITING_PM_CONFIRM', gate_a_output_path: path, gate_a_round: 1, poster_id: 'ou_pm', chat_id: 'oc' } as never)));
   assert.match(c, /"name":"ask_H1"/); // 逐条交互下拉（不是只有全局 verdict）
   assert.match(c, /★/); // 推荐值标记
   assert.match(c, /充值的钱会过期吗/);
@@ -120,7 +120,7 @@ test('群卡 闸A：8 个待拍板问题都能逐条选择，第 9 个不挤进�
       options: [{ label: `选项${i + 1}`, recommended: i === 7, impact: `影响${i + 1}` }],
     })),
   );
-  const c = json(buildStatusCard(sess({ state: 'AWAITING_PM_CONFIRM', gate_a_output_path: path, gate_a_round: 3, poster_open_id: 'ou_pm', feishu_chat_id: 'oc' } as never)));
+  const c = json(buildStatusCard(sess({ state: 'AWAITING_PM_CONFIRM', gate_a_output_path: path, gate_a_round: 3, poster_id: 'ou_pm', chat_id: 'oc' } as never)));
   assert.match(c, /"name":"ask_H1"/);
   assert.match(c, /"name":"ask_H8"/);
   assert.doesNotMatch(c, /"name":"ask_H9"/);
@@ -183,7 +183,7 @@ test('needs_go：有残留时标注条数', () => {
 
 // 群状态卡：回复 PM 那条、原地编辑的那张卡
 test('群状态卡 待产品确认：@PM + 确认表单 + 人话状态，不泄漏黑话', () => {
-  const c = json(buildStatusCard(sess({ state: 'AWAITING_PM_CONFIRM', poster_open_id: 'ou_pm', gate_a_output_path: null })));
+  const c = json(buildStatusCard(sess({ state: 'AWAITING_PM_CONFIRM', poster_id: 'ou_pm', gate_a_output_path: null })));
   assert.match(c, /<at id=ou_pm>/); // 群里 @ 发 PRD 的产品
   assert.match(c, /"action":"confirm_submit"/); // 确认表单在群卡上
   assert.match(c, /待产品确认/);

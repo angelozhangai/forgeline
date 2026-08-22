@@ -61,17 +61,17 @@ test('remoteApi：非法转移 → 抛（业务错误经信封回传原 message�
   await assert.rejects(() => remote.transition('rm2', 'DONE' as never), /illegal transition/);
 });
 
-test('remoteApi：撞 doc_token 唯一索引 → reject，isDuplicateTokenError 跨网仍可分类（原 message 保真）', async () => {
-  await remote.create({ id: 'rm3a', slug: 'rm3a', title: 'T', branch: 'dev', feishu_doc_token: 'tok-dup' });
+test('remoteApi：撞 doc_token 唯一索引 → reject，isDuplicateDocRefError 跨网仍可分类（原 message 保真）', async () => {
+  await remote.create({ id: 'rm3a', slug: 'rm3a', title: 'T', branch: 'dev', doc_ref: 'tok-dup' });
   let err: unknown;
   try {
-    await remote.create({ id: 'rm3b', slug: 'rm3b', title: 'T', branch: 'dev', feishu_doc_token: 'tok-dup' });
+    await remote.create({ id: 'rm3b', slug: 'rm3b', title: 'T', branch: 'dev', doc_ref: 'tok-dup' });
   } catch (e) {
     err = e;
   }
   assert.ok(err, '第二次撞唯一索引应抛');
   // 纯谓词在 client 本地对 rejected error 跑 message 正则——证明 server→client message 保真。
-  assert.equal(remote.isDuplicateTokenError(err), true);
+  assert.equal(remote.isDuplicateDocRefError(err), true);
   assert.equal(remote.isDuplicateIssueRefError(err), false);
 });
 
@@ -87,7 +87,7 @@ test('remoteApi：每个读/查找/聚合方法都经 HTTP 往返且方法名对
   // 造一条带去重键/PRD/项目的 session，覆盖各查找路径。
   await remote.create({
     id: 'rm6', slug: 'rm6-slug', title: 'T', branch: 'dev',
-    prd_url: 'https://x.feishu.cn/wiki/rm6', feishu_doc_token: 'tok-rm6',
+    prd_url: 'https://x.feishu.cn/wiki/rm6', doc_ref: 'tok-rm6',
     source_kind: 'issue', issue_ref: 'owner/repo#6', project_id: 'projX',
   });
   await remote.appendEvent('rm6', 'note', { n: 1 });
@@ -96,7 +96,7 @@ test('remoteApi：每个读/查找/聚合方法都经 HTTP 往返且方法名对
   assert.equal((await remote.findByIssueRef('owner/repo#6'))?.id, 'rm6');
   assert.equal((await remote.getBySlug('rm6-slug'))?.id, 'rm6');
   assert.equal((await remote.findByPrdUrl('https://x.feishu.cn/wiki/rm6'))?.id, 'rm6');
-  assert.equal((await remote.findByDocToken('tok-rm6'))?.id, 'rm6');
+  assert.equal((await remote.findByDocRef('tok-rm6'))?.id, 'rm6');
   assert.equal((await remote.resolve('rm6-slug'))?.id, 'rm6');
   assert.ok((await remote.listAll('projX')).some((s) => s.id === 'rm6'));
   assert.ok((await remote.distinctProjects()).includes('projX'));

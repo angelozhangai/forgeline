@@ -14,7 +14,7 @@ import { loadConfig } from '../config.ts';
 import { log } from '../util/log.ts';
 import { store } from '../store/index.ts';
 const { patch, appendEvent } = store; // 经 SessionStore 接缝取本地实现方法（自由函数无 this，解构安全）
-import { feishuCommentAdd } from '../workspace.ts';
+import { commentDoc } from '../docs/index.ts';
 import { projectActions } from '../project/index.ts';
 import { SIZE_RUBRIC, sizeBadge } from '../util/sizing.ts';
 import { SCORE_RUBRIC, normScore, normDims } from '../util/scoring.ts';
@@ -203,8 +203,8 @@ export async function runGateA(s: Session): Promise<GateAOutcome> {
     force: true,
   });
   appendMachineSection(proj.deliveryDir, s.slug, env, routing);
-  if (s.feishu_doc_token) {
-    await feishuCommentAdd(s.feishu_doc_token, machineComment(env, routing, 1)).catch(() => undefined);
+  if (s.doc_ref) {
+    await commentDoc(s.doc_ref, machineComment(env, routing, 1));
   }
   const n = env.open_questions.length;
   return { round: 1, openQuestions: n, resolved: n === 0, stalled: false };
@@ -278,8 +278,8 @@ export async function runGateARevision(s: Session): Promise<GateAOutcome> {
   });
 
   appendRevisionSection(proj.deliveryDir, s.slug, round, env, routing);
-  if (s.feishu_doc_token) {
-    await feishuCommentAdd(s.feishu_doc_token, machineComment(env, routing, round)).catch(() => undefined);
+  if (s.doc_ref) {
+    await commentDoc(s.doc_ref, machineComment(env, routing, round));
   }
   return { round, openQuestions: n, resolved, stalled };
 }
