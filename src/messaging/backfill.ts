@@ -33,7 +33,9 @@ export async function backfillChat(chatId: string): Promise<number> {
     // 今天的补拉本就没有这道闸，Phase 0 是纯内部重构，绝不顺手改行为——历史条目是否带服务端 mentions
     // 需要在真实租户上验过才能统一（验不过就等于补拉静默失效）。统一与否走单独的 follow-up。
     for (const doc of docsIn(m)) {
-      const r = await addPrd({ doc, chatId });
+      // 发起人 / 原消息 id 一并带上——补拉登记的需求这才与 live 登记的**长得一样**：
+      // 状态卡回复到 PM 那条消息下面、卡里能 @ 到人。缺任一项照常登记（补拉本就可能拿不全）。
+      const r = await addPrd({ doc, chatId, posterId: m.senderId, intakeMsgId: m.messageId });
       if (r.ok && r.session && r.created) {
         n++;
         log.ok(`补拉登记：${r.session.slug}（离线期间群消息）`);
