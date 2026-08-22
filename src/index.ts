@@ -10,6 +10,7 @@ import { out, log } from './util/log.ts';
 import { store as sessions } from './store/index.ts'; // 经 SessionStore 接缝（选择点），不直连 store/sessions.ts
 import { db } from './store/db.ts';
 import { addPrd, addImplementTask } from './intake.ts';
+import { parseAnyRef, registeredIds } from './docs/index.ts';
 import { tick } from './orchestrator/worker.ts';
 import { listen } from './daemon/listen.ts';
 import { confirm, submitPmAnswers, requestGateB, submitGateBAnswers, forceGateBGo, go, deny, retry, setSize, assign, postConfirmComment, requestGateC, submitGateCAnswers, requestReviewPr, submitGateDAnswers, ackMerged } from './actions.ts';
@@ -417,8 +418,16 @@ async function main(): Promise<void> {
       doctor(extError);
       break;
     case 'add': {
+      const raw = str(flags.prd) ?? pos[0] ?? '';
+      // 链接归哪个源，由注册表说了算；谁都不认就**明说**（绝不猜一个源，猜错=登记一条永远读不出正文的需求）。
+      const doc = raw ? parseAnyRef(raw) : null;
+      if (!doc) {
+        out(raw ? `无法识别的需求文档：${raw}（已注册的文档源：${registeredIds().join('/') || '无'}）` : '缺 --prd <需求文档链接>');
+        process.exitCode = 1;
+        break;
+      }
       const r = await addPrd({
-        prdUrl: str(flags.prd) ?? pos[0] ?? '',
+        doc,
         slug: str(flags.slug),
         title: str(flags.title),
         projectId: str(flags.project), // 显式指定目标项目（缺省按 群→项目映射/默认 解析）

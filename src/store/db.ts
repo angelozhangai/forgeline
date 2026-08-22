@@ -15,13 +15,17 @@ export function db(): DatabaseSync {
   // 让 sqlite 在锁上自旋等到 5s 再报错，吞掉这类瞬态（绝大多数锁窗口是毫秒级）。
   d.exec('PRAGMA busy_timeout = 5000;');
   const schemaPath = resolve(dirname(fileURLToPath(import.meta.url)), 'schema.sql');
+  // schema.sql 是**当前**基线，不是历史起点：新库建出来就已经是最新形状，不该再被历史迁移改一遍
+  //（v1 的 RENAME COLUMN 在新库上会直接抛——列早就叫新名字了）。所以先探「这库是不是全新的」，
+  // 建完基线再把 user_version 一次性推到最新，让迁移只服务于**存量**老库。
+  const fresh = (d.prepare("SELECT count(*) AS n FROM sqlite_master WHERE type='table' AND name='session'").get() as { n: number }).n === 0;
   d.exec(readFileSync(schemaPath, 'utf8'));
   // 轻量迁移:给已存在的旧库补新增列(CREATE TABLE IF NOT EXISTS 不会改已存在表)
   for (const col of [
     "project_id TEXT NOT NULL DEFAULT 'demo'", // 多项目：旧库存量行回填默认项目
     'adversarial_residual TEXT',
     'ref_num INTEGER',
-    'poster_open_id TEXT',
+    'poster_open_id TEXT', // pre-versioning 老库补列；v1 迁移随后把它改名成 poster_id
     'intake_msg_id TEXT',
     'status_msg_id TEXT',
     'size TEXT',
@@ -103,24 +107,33 @@ export function db(): DatabaseSync {
       /* 列已存在 → 忽略 */
     }
   }
-  // PRD 级去重的并发竞态最后一道闸：同一 doc token 并发插入只能成一条（部分索引——手动 add 无 token 的不约束）。
-  // 放迁移段而非 schema.sql：旧库若已有重复 token（精确-URL 去重时代残留）建索引会失败，
-  // 此处吞掉不阻断启动（去重仍由 findByDocToken 逻辑层兜，清理重复后下次启动自动建上）。
-  try {
-    d.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_session_doc_token ON session(feishu_doc_token) WHERE feishu_doc_token IS NOT NULL;');
-  } catch {
-    /* 旧库存量重复 token → 暂不建唯一索引，待人工清理 */
+  if (fresh) {
+    // 全新库 = 已经是最新基线 → 直接盖到最新版本，跳过所有历史迁移（它们只适用于存量老库）。
+    d.exec(`PRAGMA user_version = ${latestMigrationVersion(MIGRATIONS)};`);
   }
-  // standalone 裸 issue 去重的并发竞态最后一道闸：同一 issue_ref 并发插入只能成一条（部分索引——无 issue_ref 的不约束）。
-  // 与 doc_token 同理（此前缺这道，issue_ref 去重仅靠 findByIssueRef 逻辑层，并发下可建重复 → 重复 worktree/PR）。
+  applyMigrations(d, MIGRATIONS); // 基线对齐后，跑版本化（user_version）的非增量迁移
+  ensurePartialUniqueIndexes(d); // 唯一索引在迁移**之后**建：列名/取值都已是最终形态
+  _db = d;
+  return d;
+}
+
+// 两条「并发竞态最后一道闸」的部分唯一索引。**必须放在 applyMigrations 之后**：v1 才把列改成
+// doc_ref，之前建索引一定失败；而放进 v1 的 SQL 里更糟——旧库若有存量重复值，建索引失败会让整条
+// 迁移回滚，服务直接起不来（test/store-legacy-duplicates.test.ts 守的正是这条）。
+// 故：各自 try/catch 吞掉，去重仍由 findByDocRef / findByIssueRef 逻辑层兜；人工清理重复后下次启动自动建上。
+function ensurePartialUniqueIndexes(d: DatabaseSync): void {
+  // PRD 级去重：同一 doc_ref 并发插入只能成一条（部分索引——手动 add 无 ref 的不约束）。
+  try {
+    d.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_session_doc_ref ON session(doc_ref) WHERE doc_ref IS NOT NULL;');
+  } catch {
+    /* 旧库存量重复 doc_ref → 暂不建唯一索引，待人工清理 */
+  }
+  // standalone 裸 issue 去重：同一 issue_ref 并发插入只能成一条。
   try {
     d.exec('CREATE UNIQUE INDEX IF NOT EXISTS idx_session_issue_ref ON session(issue_ref) WHERE issue_ref IS NOT NULL;');
   } catch {
     /* 旧库存量重复 issue_ref → 暂不建唯一索引，待人工清理 */
   }
-  applyMigrations(d, MIGRATIONS); // 基线对齐后，跑版本化（user_version）的非增量迁移
-  _db = d;
-  return d;
 }
 
 // ── 版本化迁移（user_version，forward-only）──
@@ -134,9 +147,29 @@ export interface Migration {
 }
 
 export const MIGRATIONS: Migration[] = [
-  // 目前所有变更都是增量加列（走上面的幂等补列块），尚无非增量迁移。
-  // 例：{ v: 1, sql: 'ALTER TABLE session RENAME COLUMN foo TO bar;' }
+  // v1（Phase 1，可插拔文档源）：session 上三个带「飞书」字样的列改成 provider 无关的名字，
+  // 并把 doc token 升级成**带源前缀的 ref**。一条迁移一并做完，因为它们改的是同一张表、同一批调用点，
+  // 拆成两次意味着两次迁移 + 两次全仓扫引用，而收尾用的纯清洁阶段通常永远不会来。
+  //
+  // 为什么 token 要带前缀：裸 token 做唯一索引，迟早有两个源给出同一个字符串，
+  // 于是两份毫不相干的需求被判成重复（PRD 级去重是红线）。存量数据全部来自飞书 → 无条件加 'feishu:'；
+  // 本迁移由 user_version 保证**只跑一次**，不会重复加前缀。
+  {
+    v: 1,
+    sql: `
+      ALTER TABLE session RENAME COLUMN feishu_doc_token TO doc_ref;
+      ALTER TABLE session RENAME COLUMN feishu_chat_id TO chat_id;
+      ALTER TABLE session RENAME COLUMN poster_open_id TO poster_id;
+      UPDATE session SET doc_ref = 'feishu:' || doc_ref WHERE doc_ref IS NOT NULL;
+      DROP INDEX IF EXISTS idx_session_doc_token;
+    `, // 新唯一索引由 ensurePartialUniqueIndexes 在迁移后建——放这里会让存量重复值把整条迁移拖崩
+  },
 ];
+
+// MIGRATIONS 里最大的 v（空表 → 0）。新库建完基线后直接盖这个版本号，跳过历史迁移。
+export function latestMigrationVersion(migrations: Migration[]): number {
+  return migrations.reduce((m, x) => (x.v > m ? x.v : m), 0);
+}
 
 // 应用所有 v > 当前 user_version 的迁移（升序、各自事务、逐条 bump user_version）。返回应用后的版本。
 // 纯函数式（不碰模块级 _db），可对任意 DatabaseSync 单测。

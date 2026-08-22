@@ -10,9 +10,9 @@ CREATE TABLE IF NOT EXISTS session (
   branch               TEXT NOT NULL,
   prd_url              TEXT,
   prd_text_path        TEXT,
-  feishu_chat_id       TEXT,
-  feishu_doc_token     TEXT,
-  poster_open_id       TEXT,
+  chat_id              TEXT,
+  doc_ref              TEXT,   -- 需求文档引用：'<source>:<token>'（PRD 级去重的真源，见 src/docs/port.ts）
+  poster_id            TEXT,
   intake_msg_id        TEXT,
   status_msg_id        TEXT,
   size                 TEXT,

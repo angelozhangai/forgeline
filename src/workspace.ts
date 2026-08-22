@@ -1,4 +1,6 @@
-// 对主仓现有脚本 + feishu-doc.js 的类型化封装。服务"调用、不重写"。
+// 对主仓现有脚本的类型化封装。服务"调用、不重写"。
+// 注：飞书文档那几支（read/comment-add/token/docx raw）已在 Phase 1 迁到 src/docs/feishu.ts——
+// 它们是**文档源**的实现细节，不是通用的项目脚本封装。
 import { resolve } from 'node:path';
 import { run } from './util/proc.ts';
 import { SCRIPTS_DIR } from './root.ts';
@@ -12,7 +14,7 @@ function escapeRe(s: string): string {
 }
 
 // dir：目标项目的 scripts 目录（多项目：调用方传 project(s.project_id).scriptsDir）。
-// 缺省回退默认项目 SCRIPTS_DIR——供共享基建脚本（feishu-doc.js）及未线程化的调用用。
+// 缺省回退默认项目 SCRIPTS_DIR——供共享基建脚本及未线程化的调用用。
 function scriptPath(name: string, dir: string = SCRIPTS_DIR): string {
   return resolve(dir, name);
 }
@@ -213,60 +215,6 @@ export async function prMergeState(prUrl: string): Promise<{ ok: boolean; merged
 export async function addLabel(repo: string, num: number, label: string, owner: string = DEFAULT_OWNER): Promise<{ ok: boolean; stderr: string }> {
   const r = await run('gh', ['issue', 'edit', String(num), '-R', `${owner}/${repo}`, '--add-label', label], { timeoutMs: 60000 });
   return { ok: r.code === 0 && !r.timedOut, stderr: r.stderr };
-}
-
-// ── 飞书文档（feishu-doc.js）──────────────────────────
-function feishuEnv(): NodeJS.ProcessEnv {
-  const env = { ...process.env };
-  // 飞书走国内，代理会断（见 CLAUDE.md / 记忆）
-  delete env.https_proxy;
-  delete env.http_proxy;
-  delete env.HTTPS_PROXY;
-  delete env.HTTP_PROXY;
-  return env;
-}
-
-export async function feishuRead(token: string): Promise<{ ok: boolean; text: string; error?: string }> {
-  const r = await run('node', [scriptPath('feishu-doc.js'), 'read', token], {
-    env: feishuEnv(),
-    timeoutMs: 60000,
-  });
-  if (r.code !== 0) return { ok: false, text: '', error: r.stderr.slice(0, 500) || `exit ${r.code}` };
-  return { ok: true, text: r.stdout };
-}
-
-export async function feishuCommentAdd(token: string, text: string): Promise<{ ok: boolean; error?: string }> {
-  const r = await run('node', [scriptPath('feishu-doc.js'), 'comment-add', token, text], {
-    env: feishuEnv(),
-    timeoutMs: 60000,
-  });
-  if (r.code !== 0) return { ok: false, error: r.stderr.slice(0, 500) || `exit ${r.code}` };
-  return { ok: true };
-}
-
-// 取一枚你本人的 user_access_token（feishu-doc.js 自动续期）。
-export async function feishuUserToken(): Promise<string | null> {
-  const r = await run('node', [scriptPath('feishu-doc.js'), 'token'], { env: feishuEnv(), timeoutMs: 30000 });
-  if (r.code !== 0) return null;
-  const t = r.stdout.trim();
-  return t || null;
-}
-
-// 直接读 docx 文档纯文本（绕开 feishu-doc.js 的「<30 字当 wiki 节点」启发式——/docx/ 直链的 doc_id 常 <30 会被误判）。
-export async function feishuReadDocxRaw(docId: string): Promise<{ ok: boolean; text: string; error?: string }> {
-  const token = await feishuUserToken();
-  if (!token) return { ok: false, text: '', error: '取 user token 失败（feishu-doc.js token）' };
-  try {
-    const res = await fetch(
-      `https://open.feishu.cn/open-apis/docx/v1/documents/${encodeURIComponent(docId)}/raw_content?lang=0`,
-      { headers: { Authorization: `Bearer ${token}` } },
-    );
-    const j = (await res.json()) as { code?: number; msg?: string; data?: { content?: string } };
-    if (j.code !== 0) return { ok: false, text: '', error: `docx raw_content code=${j.code} ${j.msg ?? ''}` };
-    return { ok: true, text: j.data?.content ?? '' };
-  } catch (e) {
-    return { ok: false, text: '', error: String(e).slice(0, 300) };
-  }
 }
 
 // ── 交付文档自动提交（config 门控、默认关、**绝不 push**）────────────────────

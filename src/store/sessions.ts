@@ -10,7 +10,7 @@ export type { NewSession, EventRow } from './port.ts';
 // 导出供一致性测试：ALL_COLUMNS 必须 ⊆ 实际 session 表列（schema.sql + db.ts 迁移），否则 patch 静默丢字段。
 export const ALL_COLUMNS = [
   'id', 'ref_num', 'slug', 'title', 'state', 'project_id', 'branch', 'prd_url', 'prd_text_path',
-  'feishu_chat_id', 'feishu_doc_token', 'poster_open_id', 'intake_msg_id', 'status_msg_id',
+  'chat_id', 'doc_ref', 'poster_id', 'intake_msg_id', 'status_msg_id',
   'size', 'size_reason', 'size_source',
   'prd_score', 'prd_score_dims', 'prd_score_reason',
   'gate_a_output_path', 'gate_a_session_id', 'gate_a_round', 'gate_a_pending_input', 'gate_a_residual',
@@ -55,13 +55,13 @@ export async function create(s: NewSession): Promise<Session> {
   const refNum = (prep('SELECT COALESCE(MAX(ref_num), 0) + 1 AS n FROM session').get() as { n: number }).n;
   prep(
     `INSERT INTO session (id, ref_num, slug, title, state, project_id, branch, prd_url, prd_text_path,
-        feishu_chat_id, feishu_doc_token, poster_open_id, intake_msg_id, source_kind, issue_ref, created_at, updated_at)
+        chat_id, doc_ref, poster_id, intake_msg_id, source_kind, issue_ref, created_at, updated_at)
        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)`,
   ).run(
     s.id, refNum, s.slug, s.title, s.state ?? 'INTAKE', s.project_id ?? 'demo', s.branch,
     s.prd_url ?? null, s.prd_text_path ?? null,
-    s.feishu_chat_id ?? null, s.feishu_doc_token ?? null,
-    s.poster_open_id ?? null, s.intake_msg_id ?? null,
+    s.chat_id ?? null, s.doc_ref ?? null,
+    s.poster_id ?? null, s.intake_msg_id ?? null,
     s.source_kind ?? null, s.issue_ref ?? null, now, now,
   );
   await appendEvent(s.id, 'intake', { ref: `REQ-${refNum}`, slug: s.slug, prd_url: s.prd_url ?? null, source_kind: s.source_kind ?? 'prd', issue_ref: s.issue_ref ?? null });
@@ -76,10 +76,10 @@ export async function findByIssueRef(ref: string): Promise<Session | null> {
   );
 }
 
-// create() 撞 doc token 唯一索引（并发竞态：另一条相同 PRD 抢先插入）→ 据此回退去重路径。【纯谓词·同步】
-export function isDuplicateTokenError(e: unknown): boolean {
+// create() 撞 doc_ref 唯一索引（并发竞态：另一条相同 PRD 抢先插入）→ 据此回退去重路径。【纯谓词·同步】
+export function isDuplicateDocRefError(e: unknown): boolean {
   const msg = e instanceof Error ? e.message : String(e);
-  return /UNIQUE constraint failed/i.test(msg) && /feishu_doc_token/i.test(msg);
+  return /UNIQUE constraint failed/i.test(msg) && /doc_ref/i.test(msg);
 }
 
 // create() 撞 issue_ref 唯一索引（并发竞态：另一条相同 standalone issue 抢先插入）→ 据此回退去重路径。【纯谓词·同步】
@@ -106,13 +106,13 @@ export async function findByPrdUrl(url: string): Promise<Session | null> {
   );
 }
 
-// 按飞书文档 token 找（PRD 级去重的真源：URL 各种变体/查询参数都归一到同一 doc token）。
+// 按文档 ref 找（PRD 级去重的真源：URL 各种变体/查询参数都已归一到同一 '<source>:<token>'）。
 // 取最早一条作为该 PRD 的规范 session（重复提交复用它）。
-export async function findByDocToken(token: string): Promise<Session | null> {
-  if (!token) return null;
+export async function findByDocRef(ref: string): Promise<Session | null> {
+  if (!ref) return null;
   return (
-    (prep('SELECT * FROM session WHERE feishu_doc_token = ? ORDER BY created_at ASC LIMIT 1')
-      .get(token) as unknown as Session) ?? null
+    (prep('SELECT * FROM session WHERE doc_ref = ? ORDER BY created_at ASC LIMIT 1')
+      .get(ref) as unknown as Session) ?? null
   );
 }
 
@@ -235,12 +235,12 @@ export async function leaseClaim(states: State[], runnerId: string, ttlMs: numbe
 export const localSqliteStore: SessionStore = {
   create,
   findByIssueRef,
-  isDuplicateTokenError,
+  isDuplicateDocRefError,
   isDuplicateIssueRefError,
   get,
   getBySlug,
   findByPrdUrl,
-  findByDocToken,
+  findByDocRef,
   resolve,
   listByStates,
   listAll,

@@ -31,7 +31,6 @@ mock.module('../src/workspace.ts', {
   namedExports: {
     commitDeliveryDocs: async () => ({ ok: true, committed: false, stderr: '' }),
     publishTechDesign: async () => ({ ok: true, stdout: '', stderr: '' }),
-    feishuCommentAdd: async () => ({ ok: true }),
     prMergeState: async () => ({ ok: true, merged: true, state: 'MERGED' }),
     newReqSingle: async () => ({ ok: false, stdout: '', stderr: 'unexpected single path', issues: [] }),
     newReqEpic: async () => {

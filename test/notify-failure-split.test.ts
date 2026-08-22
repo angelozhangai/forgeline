@@ -25,7 +25,7 @@ function sess(p: Partial<Session>): Session {
   return {
     id: 'id1', slug: 'finance-report', title: 't', state: 'GATE_B_FAILED', branch: 'dev',
     gate_a_output_path: null, routing: null, adversarial_residual: null, gate_a_cost_usd: 1, gate_b_cost_usd: 2,
-    confirmed_by: null, confirmed_notes: null, error: DRIFT_ERR, prd_url: null, feishu_chat_id: null,
+    confirmed_by: null, confirmed_notes: null, error: DRIFT_ERR, prd_url: null, chat_id: null,
     ...p,
   } as unknown as Session;
 }

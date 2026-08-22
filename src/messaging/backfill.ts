@@ -6,25 +6,20 @@
 // ——水位只前进、边界那条再过滤一次、防重入、抽链接的兜底顺序。它跟用哪个 IM 无关。换 Slack 时
 // 只需 slack adapter 实现 listHistorySince（conversations.history），本文件一行不动。
 import { log } from '../util/log.ts';
-import { extractFeishuLinks } from '../util/links.ts';
+import { claimDocs, type DocRef } from '../docs/index.ts';
 import { addPrd } from '../intake.ts';
 import * as cursors from '../store/cursors.ts';
 import { port } from './index.ts';
 import type { InboundMessage } from './model.ts';
 
-// 一条历史消息里的需求文档链接：先扫正文，空则逐个扫 adapter 给的兜底文本块
-// （文档分享卡 / 富文本 post 的链接不在正文里）。与 live 消息入口 handleMessage 同序，避免两条路径漂移。
-function linksIn(m: InboundMessage): string[] {
-  const fromText = extractFeishuLinks(m.text);
-  if (fromText.length) return fromText;
-  for (const st of m.searchTexts ?? []) {
-    const found = extractFeishuLinks(st);
-    if (found.length) return found;
-  }
-  return [];
+// 一条历史消息里的需求文档：交给文档源注册表认领（正文 + adapter 给的兜底文本块——
+// 文档分享卡 / 富文本 post 的链接不在正文里）。与 live 消息入口 handleMessage 同一个 claimDocs，
+// 两条路径不会漂移。
+function docsIn(m: InboundMessage): DocRef[] {
+  return claimDocs({ text: m.text, searchTexts: m.searchTexts });
 }
 
-// 补拉单群：游标以后的消息抽文档链接 → addPrd（按文档去重）。返回新登记条数。
+// 补拉单群：游标以后的消息认领需求文档 → addPrd（按 doc_ref 去重）。返回新登记条数。
 export async function backfillChat(chatId: string): Promise<number> {
   const cursorMs = cursors.getCursor(chatId) ?? Date.now();
   const msgs = await port.listHistorySince(chatId, cursorMs);
@@ -37,8 +32,8 @@ export async function backfillChat(chatId: string): Promise<number> {
     // 注意（对应设计文档 D1）：这里**不**做 live 群消息那道「必须 @机器人」的入口闸。
     // 今天的补拉本就没有这道闸，Phase 0 是纯内部重构，绝不顺手改行为——历史条目是否带服务端 mentions
     // 需要在真实租户上验过才能统一（验不过就等于补拉静默失效）。统一与否走单独的 follow-up。
-    for (const url of linksIn(m)) {
-      const r = await addPrd({ prdUrl: url, chatId });
+    for (const doc of docsIn(m)) {
+      const r = await addPrd({ doc, chatId });
       if (r.ok && r.session && r.created) {
         n++;
         log.ok(`补拉登记：${r.session.slug}（离线期间群消息）`);

@@ -474,7 +474,7 @@ export function buildStatusCard(s: Session, x: NotifyExtra = {}): CardModel {
   const subtitle = `${stateLabel(s.state)}${rd ? ` · 第${rd}轮评审` : ''}${s.size ? ` · 复杂度 ${s.size}` : ''}`;
   // 宠物动图资源名（按进化阶；DONE 用完全体那只）。petRow 把它做成「头像左 + 文字右」一行。
   const asset = petAssetName(s.state);
-  const mentionId = s.poster_open_id || undefined; // @PM（adapter 渲染成 <at>）；无则用「产品同学」兜底
+  const mentionId = s.poster_id || undefined; // @PM（adapter 渲染成 <at>）；无则用「产品同学」兜底
   // 底部小字脚注：① 复杂度徽章(始终显示，核心属性) ② 彩蛋(进化树/投喂/隐藏台词，FUN 时)。沉底不抢正文。
   const footer = (): CardBlock[] => {
     const lines: CardBlock[] = [];
@@ -577,13 +577,13 @@ export function buildStatusCard(s: Session, x: NotifyExtra = {}): CardModel {
 // 同步群状态卡到当前状态：无则回复 PM 那条创建，有则原地编辑。仅群来源(有 chat_id)生效。
 export async function syncGroupCard(s: Session, x: NotifyExtra = {}): Promise<void> {
   const cur = (await sessions.get(s.id)) ?? s; // 取最新 status_msg_id，避免陈旧重复发
-  if (!cur.feishu_chat_id) return; // 非群来源(手动 add) → 不发群卡
+  if (!cur.chat_id) return; // 非群来源(手动 add) → 不发群卡
   try {
     const card = buildStatusCard(cur, x);
     if (cur.status_msg_id) {
       await port.editGroupCard(cur.status_msg_id, card);
     } else {
-      const mid = cur.intake_msg_id ? await port.replyGroupCard(cur.intake_msg_id, card) : await port.sendGroupCard(cur.feishu_chat_id, card);
+      const mid = cur.intake_msg_id ? await port.replyGroupCard(cur.intake_msg_id, card) : await port.sendGroupCard(cur.chat_id, card);
       if (mid) await sessions.patch(cur.id, { status_msg_id: mid });
     }
   } catch (e) {

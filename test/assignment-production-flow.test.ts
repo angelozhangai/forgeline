@@ -69,7 +69,6 @@ mock.module('../src/workspace.ts', {
   namedExports: {
     commitDeliveryDocs: async () => ({ ok: true, committed: false, stderr: '' }),
     publishTechDesign: async () => ({ ok: true, stdout: '', stderr: '' }),
-    feishuCommentAdd: async () => ({ ok: true }),
     prMergeState: async () => ({ ok: true, merged: true, state: 'MERGED' }),
     newReqSingle: async (_repo: string, _title: string, o: { assignee?: string | null } = {}) => {
       singleCreates++;

@@ -17,8 +17,8 @@ An audit of the actual coupling found the seam holds — with four residual leak
 
 | # | Leak | Where |
 | --- | --- | --- |
-| 1 | **The document layer was never abstracted at all.** PRD read-in and machine-review comment write-back are wired straight to Feishu Docs. | [src/intake.ts](../src/intake.ts), [src/feishu/doc.ts](../src/feishu/doc.ts), [src/workspace.ts](../src/workspace.ts), [src/gates/gateA.ts](../src/gates/gateA.ts), [src/actions.ts](../src/actions.ts) |
-| 2 | `extractFeishuLinks` — a Feishu URL regex — lives in the core. | [src/util/links.ts](../src/util/links.ts) |
+| 1 | ~~**The document layer was never abstracted at all.**~~ **Closed in Phase 1** — `DocSourcePort` + registry; the core only ever sees a `DocRef`. | [src/docs/port.ts](../src/docs/port.ts), [src/docs/index.ts](../src/docs/index.ts) |
+| 2 | ~~`extractFeishuLinks` — a Feishu URL regex — lives in the core.~~ **Closed in Phase 1** — the regex moved into the Feishu source; the core calls `claimDocs`. | [src/docs/feishu.ts](../src/docs/feishu.ts) |
 | 3 | ~~**Offline backfill bypasses the port entirely**; `MessagingPort` has no history method.~~ **Closed in Phase 0** — the loop is core-side, the API call is behind `listHistorySince`. | [src/messaging/backfill.ts](../src/messaging/backfill.ts) |
 | 4 | Feishu names baked into config, DB columns, probe enum and health labels. | [src/config.ts](../src/config.ts), [src/store/schema.sql](../src/store/schema.sql), [src/llm/probes.ts](../src/llm/probes.ts), [src/health/check.ts](../src/health/check.ts) |
 
@@ -247,6 +247,17 @@ Ordering principle: each phase ends green, and Feishu behaviour is unchanged unl
 **DoD**: whitelist down to `messaging/feishu.ts` + `docs/feishu.ts`; Feishu behaviour identical; an
 upgraded old DB has every `doc_ref` prefixed and still dedups.
 
+**Landed** ([#10](https://github.com/angelozhangai/forgeline/pull/10)). Three things worth carrying forward:
+
+- **The whitelist went to one entry, not two.** `docs/feishu.ts` needs no exemption at all — it talks to
+  the project's `feishu-doc.js` and to `docx/v1`, never to `src/feishu/*` or the lark SDK. A *second*
+  boundary rule replaced it: nothing outside `src/docs/` may import a concrete source, only `docs/index.ts`.
+- **`schema.sql` is the current baseline, not the historical origin.** A fresh DB is detected before the
+  schema is applied and stamped straight to the latest `user_version`, so historical migrations only ever
+  run against pre-existing databases. Without this, v1's `RENAME COLUMN` would have thrown on every new install.
+- **The unique index is rebuilt *after* migrations, not inside v1.** A legacy DB with duplicate tokens would
+  otherwise fail the index creation, roll back the whole migration, and refuse to start.
+
 ### Phase 2 — `plaintext` document source
 
 | | Task | Files |
@@ -329,7 +340,7 @@ Tracked in [#2](https://github.com/angelozhangai/forgeline/issues/2).
 | Phase | Issue | Status |
 | --- | --- | --- |
 | 0 — transport seam | [#3](https://github.com/angelozhangai/forgeline/issues/3) | ✅ done |
-| 1 — `DocSourcePort` | [#4](https://github.com/angelozhangai/forgeline/issues/4) | not started |
+| 1 — `DocSourcePort` | [#4](https://github.com/angelozhangai/forgeline/issues/4) | ✅ done |
 | 2 — plaintext source | [#5](https://github.com/angelozhangai/forgeline/issues/5) | not started |
 | 3 — Slack adapter | [#6](https://github.com/angelozhangai/forgeline/issues/6) | not started |
 | 4 — naming + docs | [#7](https://github.com/angelozhangai/forgeline/issues/7) | not started |

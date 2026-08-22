@@ -131,7 +131,7 @@ test('issue_ref 唯一索引：同 issue_ref 第二条被 DB 拒（防重复 wor
 
 test('isDuplicateIssueRefError：仅识别 issue_ref 撞唯一索引，不误判 doc_token/其它错', () => {
   assert.equal(sessions.isDuplicateIssueRefError(new Error('UNIQUE constraint failed: session.issue_ref')), true);
-  assert.equal(sessions.isDuplicateIssueRefError(new Error('UNIQUE constraint failed: session.feishu_doc_token')), false);
+  assert.equal(sessions.isDuplicateIssueRefError(new Error('UNIQUE constraint failed: session.doc_ref')), false);
   assert.equal(sessions.isDuplicateIssueRefError(new Error('database is locked')), false);
 });
 
