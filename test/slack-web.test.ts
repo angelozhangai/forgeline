@@ -31,14 +31,42 @@ test('凭据读取：bot token 与 app token 是两枚不同的东西（Socket M
   assert.equal(appToken(), 'xapp-test');
 });
 
-test('正常调用：POST JSON + Bearer 鉴权，body 原样透传', async () => {
+test('正常调用：POST form 编码 + Bearer 鉴权，body 原样透传', async () => {
   reset();
   stubFetch([{ status: 200, json: async () => ({ ok: true, ts: '1.2' }) }]);
   const r = await slackApi('chat.postMessage', { channel: 'C1', text: 'hi' });
   assert.equal(r.ok, true);
   assert.equal(requests[0].url, 'https://slack.com/api/chat.postMessage');
-  assert.equal((requests[0].init.headers as Record<string, string>).Authorization, 'Bearer xoxb-test');
-  assert.deepEqual(JSON.parse(requests[0].init.body as string), { channel: 'C1', text: 'hi' });
+  const headers = requests[0].init.headers as Record<string, string>;
+  assert.equal(headers.Authorization, 'Bearer xoxb-test');
+  assert.match(headers['Content-Type'], /^application\/x-www-form-urlencoded/);
+  assert.deepEqual(Object.fromEntries(new URLSearchParams(requests[0].init.body as string)), { channel: 'C1', text: 'hi' });
+  reset();
+});
+
+// 为什么必须是 form 而不是 JSON：JSON body 只有一份被标注的写方法名单吃得下，
+// conversations.history 这类读方法不在名单里——JSON 发过去 channel 会被当成没传，
+// 回一个 channel_not_found，看着像权限问题。而这条路径（离线补拉 + 入站探针）
+// **只有真工作区才跑得到**，本地测试永远照不出来 → 只能在编码这一层钉死。
+test('读方法（conversations.history）同样走 form 编码：channel/limit 必须真的出现在 body 里', async () => {
+  reset();
+  stubFetch([{ status: 200, json: async () => ({ ok: true, messages: [], has_more: false }) }]);
+  await slackApi('conversations.history', { channel: 'C1', oldest: '1712345678.000000', limit: 50 });
+  const form = new URLSearchParams(requests[0].init.body as string);
+  assert.equal(form.get('channel'), 'C1');
+  assert.equal(form.get('oldest'), '1712345678.000000');
+  assert.equal(form.get('limit'), '50', '数字要序列化成字符串，不能整个丢掉');
+  reset();
+});
+
+test('结构体入参（blocks / attachments / view）在 form 编码里就是 JSON 串', async () => {
+  reset();
+  stubFetch([{ status: 200, json: async () => ({ ok: true }) }]);
+  await slackApi('views.open', { trigger_id: 'T1', view: { type: 'modal', blocks: [{ type: 'divider' }] }, drop: undefined });
+  const form = new URLSearchParams(requests[0].init.body as string);
+  assert.equal(form.get('trigger_id'), 'T1');
+  assert.deepEqual(JSON.parse(form.get('view') ?? ''), { type: 'modal', blocks: [{ type: 'divider' }] });
+  assert.equal(form.has('drop'), false, 'undefined 不发出去，别变成字符串 "undefined"');
   reset();
 });
 
