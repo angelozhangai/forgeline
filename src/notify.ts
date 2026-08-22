@@ -583,7 +583,12 @@ export async function syncGroupCard(s: Session, x: NotifyExtra = {}): Promise<vo
     if (cur.status_msg_id) {
       await port.editGroupCard(cur.status_msg_id, card);
     } else {
-      const mid = cur.intake_msg_id ? await port.replyGroupCard(cur.intake_msg_id, card) : await port.sendGroupCard(cur.chat_id, card);
+      // intake 那条不一定还回得上去（消息被删、太久、或补拉登记时记下的 id 本就跨了一次重启）。
+      // 回复失败**必须退回直接发到群**：把卡丢掉等于这条需求在群里全程没有任何反馈，而且
+      // status_msg_id 一直是空，之后每次同步都重走同一条失败路径，永远出不来。
+      const replied = cur.intake_msg_id ? await port.replyGroupCard(cur.intake_msg_id, card) : null;
+      if (cur.intake_msg_id && !replied) log.warn(`群状态卡：回复原消息失败（${cur.intake_msg_id}）→ 改为直接发到群`);
+      const mid = replied ?? (await port.sendGroupCard(cur.chat_id, card));
       if (mid) await sessions.patch(cur.id, { status_msg_id: mid });
     }
   } catch (e) {
