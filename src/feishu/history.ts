@@ -14,6 +14,9 @@ export interface FeishuHistMsg {
   create_time?: string;
   sender?: { id?: string; id_type?: string };
   chat_id?: string;
+  // 会话类型（'group' / 'p2p'）。live 事件的 message.chat_type 一定有；**历史条目不一定**——
+  // 带就用，不带就回落到 chatIsGroup() 现问一次（见下）。
+  chat_type?: string;
   body?: { content?: string };
   // 服务端填充的 @ 列表。live 事件里一定有；历史条目是否带取决于飞书信封——
   // 缺失与「真的没人被 @」不可区分，故 adapter 映射时用 undefined/[] 区分（见 messaging/feishu.ts）。
@@ -62,4 +65,51 @@ export async function listMessages(chatId: string, startSec: number): Promise<Fe
     pageToken = j.data.page_token;
   }
   return out;
+}
+
+
+// ── 这个会话是群还是私聊 ────────────────────────────────────────────
+// 补拉必须知道这件事：把私聊历史当成群消息，会撞上「群里没 @ 我」的入口闸被丢掉——
+// 离线期间私聊过来的需求就此静默消失，而那正是补拉存在的唯一理由。
+//
+// ⚠️ 用 **chat_mode**，不是 chat_type。同一个名字在飞书两个接口里意思不一样：
+//   · 事件 message.chat_type：'group' / 'p2p'   ← 会话形态
+//   · im/v1/chats 的 chat_type：'private' / 'public' ← 群的**可见性**
+// 拿后者当前者用，所有公开群都会被判成私聊，入口闸整个失效。
+//
+// 会话形态一辈子不变 → 按 chatId 记忆，一个进程一次往返。拿不到就返回 null，由调用方决定怎么办
+// （绝不猜一个，猜错的两个方向代价完全不对称）。
+const CHAT_IS_GROUP = new Map<string, boolean>();
+
+interface ChatResp {
+  code?: number;
+  msg?: string;
+  data?: { chat_mode?: string };
+}
+
+export async function chatIsGroup(chatId: string): Promise<boolean | null> {
+  const hit = CHAT_IS_GROUP.get(chatId);
+  if (hit !== undefined) return hit;
+  const token = await botTenantToken();
+  if (!token) return null;
+  let j: ChatResp;
+  try {
+    const res = await fetch(`${FEISHU_BASE}/im/v1/chats/${encodeURIComponent(chatId)}`, { headers: { Authorization: `Bearer ${token}` } });
+    j = (await res.json()) as ChatResp;
+  } catch (e) {
+    log.warn(`取会话类型网络异常（${chatId}）：${String(e).slice(0, 120)}`);
+    return null;
+  }
+  if (j.code !== 0 || typeof j.data?.chat_mode !== 'string') {
+    log.warn(`取会话类型失败（${chatId}）：${j.code} ${(j.msg ?? '').slice(0, 120)}（需要 im:chat:readonly）`);
+    return null;
+  }
+  const isGroup = j.data.chat_mode !== 'p2p';
+  CHAT_IS_GROUP.set(chatId, isGroup);
+  return isGroup;
+}
+
+/** 仅供测试：清掉会话类型记忆。 */
+export function __clearChatKindCacheForTest(): void {
+  CHAT_IS_GROUP.clear();
 }
