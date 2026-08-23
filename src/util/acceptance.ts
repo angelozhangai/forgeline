@@ -1,15 +1,20 @@
 import type { Acceptance, GateBEnvelope } from '../gates/envelopes.ts';
 
-// 仓字母 → 展示名（与 writes.ts REPO_NAME 同口径，util 层不反向依赖故本地一份）。
+// Repo letter -> display name (the same terms as REPO_NAME in writes.ts; the util layer must not depend
+// backwards on it, so it keeps its own copy).
 const REPO_LABEL: Record<string, string> = {
   C: 'demo',
   U: 'example-web',
   A: 'example-admin',
 };
 
-// 渲染「验收（Done 定义 · 外环）」markdown，作为 issue 正文 / 技术方案文档的工程师可见块。
-// repo 给定时只取该仓相关项 + 未标 repo 的通用项；不给则全取（Epic / 技术方案文档用）。
-// 外环 = 绑契约/边界、当前全红的可执行验收；内环（单元+集成）由工程师开发期按 TDD 补，差分覆盖门卡新增行。
+// Render the "Acceptance (definition of done · outer ring)" markdown, the engineer-facing block of an issue
+// body or a technical-design document.
+// Given a repo, take only that repo's items plus the ones with no repo set; given none, take everything (for
+// the Epic and the technical-design document).
+// The outer ring binds contracts and boundaries and is executable and entirely red today; the inner ring
+// (unit + integration) is what the engineer adds TDD-style during development, gated by the diff-coverage
+// floor on the new lines.
 export function acceptanceMarkdown(acc: Acceptance | undefined, repo?: string): string {
   if (!acc) return '';
   const pick = <T extends { repo?: string }>(xs: T[]): T[] =>
@@ -19,13 +24,13 @@ export function acceptanceMarkdown(acc: Acceptance | undefined, repo?: string): 
   if (contracts.length === 0 && scenarios.length === 0) return '';
 
   const tag = (r: string): string => (r ? `[${REPO_LABEL[r] ?? r}] ` : '');
-  const lines: string[] = ['## 验收（Done 定义 · 外环，开发前应全红）'];
+  const lines: string[] = ['## Acceptance (definition of done · outer ring, all red before development starts)'];
   if (contracts.length) {
-    lines.push('', '**契约（固定边界 — 测试绑这里，不绑内部方法）**');
+    lines.push('', '**Contracts (the fixed boundary — tests bind here, never to an internal method)**');
     for (const c of contracts) lines.push(`- ${tag(c.repo)}${c.surface.trim()}`);
   }
   if (scenarios.length) {
-    lines.push('', '**验收场景（声明式 BDD；先写、当前红，工程师按 TDD 补内环单测/集测推绿）**');
+    lines.push('', '**Acceptance scenarios (declarative BDD; written first and red today — the engineer adds the inner-ring unit and integration tests TDD-style to turn them green)**');
     for (const s of scenarios) {
       lines.push('', `*${s.id || 'AC'}*`, '```gherkin', s.gherkin.trim(), '```');
     }
@@ -33,16 +38,34 @@ export function acceptanceMarkdown(acc: Acceptance | undefined, repo?: string): 
   return lines.join('\n');
 }
 
-// 命令式 UI 动作（验收应描述业务结果，不描述操作步骤）。命中即判不声明式。
-const IMPERATIVE = /点击|点按钮|单击|填写|填入|输入框|勾选|下拉框|\bclick\b|\bfill in\b|\btype into\b/i;
+// Imperative UI actions (acceptance should state a business outcome, not a click path). A match means it is
+// not declarative.
+// The scenarios being linted are generated from the requirement document, and a requirement document may
+// arrive in any language — source is English, input is not. So the non-English alternatives have to stay, or
+// the lint would quietly stop catching click paths for every non-English PRD. They are written as escapes
+// rather than as literal characters, which is how this repo keeps non-English *data* out of its source text
+// (see test/english-only.test.ts).
+const IMPERATIVE_INTL = [
+  '\u70b9\u51fb', // click
+  '\u70b9\u6309\u94ae', // click the button
+  '\u5355\u51fb', // single-click
+  '\u586b\u5199', // fill in
+  '\u586b\u5165', // enter into
+  '\u8f93\u5165\u6846', // input field
+  '\u52fe\u9009', // tick / check
+  '\u4e0b\u62c9\u6846', // dropdown
+].join('|');
+const IMPERATIVE = new RegExp(`${IMPERATIVE_INTL}|\\bclick\\b|\\bfill in\\b|\\btype into\\b`, 'i');
 
 export interface AcceptanceLint {
   ok: boolean;
   problems: string[];
 }
 
-// 外环验收的确定性 lint（GO 前闸口）：空 / 结构不全 / 命令式 / 漏仓 → 挡。
-// 只做高信号项；「绑内部方法名」这类易误报的判断不放这里，交对抗复审。
+// The deterministic lint on the outer-ring acceptance (the gate before GO): empty, structurally incomplete,
+// imperative, or missing a repo -> blocked.
+// It only covers the high-signal cases; a judgement like "this binds an internal method name", which is easy
+// to get wrong, is left to the adversarial review.
 export function lintAcceptance(env: GateBEnvelope): AcceptanceLint {
   const problems: string[] = [];
   const acc = env.acceptance ?? { contracts: [], scenarios: [] };
@@ -50,20 +73,21 @@ export function lintAcceptance(env: GateBEnvelope): AcceptanceLint {
   const scenarios = (acc.scenarios ?? []).filter((s) => s.gherkin.trim());
 
   if (scenarios.length === 0)
-    problems.push('外环验收缺场景：acceptance.scenarios 至少 1 条声明式 Given/When/Then');
+    problems.push('the outer-ring acceptance has no scenario: acceptance.scenarios needs at least one declarative Given/When/Then');
   if (contracts.length === 0)
-    problems.push('外环验收缺契约：acceptance.contracts 至少 1 条固定边界（端点/schema 或导出签名）');
+    problems.push('the outer-ring acceptance has no contract: acceptance.contracts needs at least one fixed boundary (an endpoint/schema, or an exported signature)');
 
   for (const s of scenarios) {
-    const id = s.id || '(无 id 场景)';
+    const id = s.id || '(scenario with no id)';
     const g = s.gherkin;
     if (!(/given/i.test(g) && /when/i.test(g) && /then/i.test(g)))
-      problems.push(`场景 ${id} 结构不全：需同时含 Given / When / Then`);
+      problems.push(`scenario ${id} is structurally incomplete: it must contain Given, When and Then`);
     if (IMPERATIVE.test(g))
-      problems.push(`场景 ${id} 出现命令式动作（点按钮/填输入框…）：验收须声明式描述业务结果`);
+      problems.push(`scenario ${id} uses an imperative action (click a button, fill in a field, ...): acceptance must state the business outcome declaratively`);
   }
 
-  // 每个有 issue 的仓必须被外环覆盖（该仓的 contract/scenario，或未标 repo 的通用项覆盖全部）。
+  // Every repo that has an issue must be covered by the outer ring (either by a contract/scenario of its own,
+  // or by an item with no repo set, which covers all of them).
   const hasGeneral = contracts.some((c) => !c.repo) || scenarios.some((s) => !s.repo);
   if (!hasGeneral) {
     const covered = new Set(
@@ -71,7 +95,7 @@ export function lintAcceptance(env: GateBEnvelope): AcceptanceLint {
     );
     for (const r of new Set(env.issue_specs.map((i) => i.repo).filter(Boolean))) {
       if (!covered.has(r))
-        problems.push(`仓 ${r} 有 issue 但无外环验收覆盖（给它配 contract/scenario，或用通用项）`);
+        problems.push(`repo ${r} has an issue but no outer-ring acceptance covering it (give it a contract/scenario, or use an unscoped one)`);
     }
   }
 

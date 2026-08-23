@@ -14,7 +14,8 @@ export function shortId(): string {
   );
 }
 
-// 标题多为中文 → slugify 可能为空，回退到 req-<shortid>。--slug 显式覆盖优先。
+// Requirement titles often arrive in a non-Latin script (source is English, input is not), so slugify can
+// come back empty — fall back to req-<shortid>. An explicit --slug override wins.
 export function deriveSlug(title: string, override?: string): string {
   if (override?.trim()) return slugify(override) || override.trim();
   return slugify(title) || `req-${shortId()}`;
