@@ -1,7 +1,8 @@
 // Slack provider 层——**Web API 薄封装**。零新依赖：原生 fetch + Bearer token，跟飞书 raw 层同规格。
 //
-// 只做四件事：拼 URL/鉴权、把「HTTP 层失败」和「Slack 层 ok:false」压成同一种结果、限流退避、
-// 把凭据的读取收在一处。业务语义（发什么卡、怎么解析回调）一概不在这里——那是 messaging/slack.ts 的事。
+// 只做五件事：拼 URL/鉴权、按 Slack 通吃的 form 编码序列化入参、把「HTTP 层失败」和「Slack 层
+// ok:false」压成同一种结果、限流退避、把凭据的读取收在一处。
+// 业务语义（发什么卡、怎么解析回调）一概不在这里——那是 messaging/slack.ts 的事。
 //
 // 只允许 messaging/slack.ts 使用（架构边界闸守着）。
 import { loadConfig } from '../config.ts';
@@ -27,7 +28,26 @@ export function appToken(): string | undefined {
 
 const MAX_RETRY = 3;
 
-// 调一次 Slack Web API（POST + JSON）。429 按 Retry-After 退避重试，最多 MAX_RETRY 次。
+// ── 入参编码：一律 application/x-www-form-urlencoded ────────────────
+// Slack 的 Web API **不是**所有方法都吃 JSON body：JSON 只对一份被明确标注的方法名单有效
+// （chat.postMessage / chat.update / views.open 这类写方法），而 conversations.history
+// 这类读方法只认 form 编码——JSON 发过去，参数会被当成压根没传，于是回一个
+// channel_not_found / invalid_arguments，看上去像「凭据/权限不对」，其实是编码不对。
+// 那两处恰恰是**只有真工作区才跑得到**的路径（离线补拉 + 入站探针），本地测试永远照不出来。
+//
+// 官方 SDK 的做法同样是「一律 form 编码，复杂值 JSON 串成字符串」（唯一例外是文件上传的
+// multipart）。我们照做：一种编码通吃所有方法，少一条只在上线那天才炸的分叉。
+function formBody(body: Record<string, unknown>): string {
+  const p = new URLSearchParams();
+  for (const [k, v] of Object.entries(body)) {
+    if (v === undefined || v === null) continue;
+    // blocks / attachments / view 这些结构体在 form 编码里就是「JSON 串成的字符串」——Slack 明确这么收。
+    p.append(k, typeof v === 'string' ? v : typeof v === 'number' || typeof v === 'boolean' ? String(v) : JSON.stringify(v));
+  }
+  return p.toString();
+}
+
+// 调一次 Slack Web API（POST + form 编码，见上）。429 按 Retry-After 退避重试，最多 MAX_RETRY 次。
 // 失败绝不抛：返回 { ok:false, error }，由调用方决定降级——传输层失败不该掀翻编排循环。
 export async function slackApi(
   method: string,
@@ -42,8 +62,8 @@ export async function slackApi(
     try {
       res = await fetch(`${SLACK_BASE}/${method}`, {
         method: 'POST',
-        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json; charset=utf-8' },
-        body: JSON.stringify(body),
+        headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8' },
+        body: formBody(body),
       });
     } catch (e) {
       return { ok: false, error: `network: ${String(e).slice(0, 200)}` };
