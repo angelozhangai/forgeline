@@ -1,10 +1,13 @@
-// 集成（Codex SF4）：worker.applyAutonomy 接的是**真** actions（不 mock），证明自治自动路径真的继承生产 action 的
-// 权限闸 / 指派闸 / 状态机红线——而非只验「调了某个函数名」。只 mock 外部边界：写动作 doWrites（计数，断言「未写」）、
-// 项目解析（控自治 level/actor）、notify/load。真：actions.ts、真 config（permissions: go_approvers/gate_b_allowed=[M,...]）、状态机、sessions。
+// Integration (codex SF4): worker.applyAutonomy is wired to the **real** actions, not mocks, proving the
+// autonomous path really inherits the production action's permission gate, assignment gate and state-machine
+// red lines -- rather than merely checking that some function name was called. Only the external boundaries
+// are mocked: doWrites (counted, to assert nothing was written), project resolution (to control the autonomy
+// level and actor), notify and load. Real: actions.ts, the real config (go_approvers and
+// gate_b_allowed=[M, ...]), the state machine and sessions.
 process.env.FORGE_DB = ':memory:';
 import { test, mock, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-const { loadConfig } = await import('../src/config.ts'); // 动态导入（绝不静态！静态会 hoist 到 FORGE_DB=:memory: 之前 → root.ts 落真库 → 并发串库）。桩回退真配置。
+const { loadConfig } = await import('../src/config.ts'); // imported dynamically -- never statically! A static import hoists above FORGE_DB=':memory:', so root.ts lands on the real database and concurrent tests collide. The stub falls back to the real config.
 
 let autonomyLevel = 0;
 let autonomyActor = 'M';
@@ -19,7 +22,8 @@ mock.module('../src/projects.ts', {
     configForSession: () => loadConfig(),
   },
 });
-// 写动作边界：计数 doWrites，断言被自治拦下的 GO「根本没写」。
+// The write boundary: doWrites is counted, so a go the autonomy layer blocked can be asserted to have
+// written nothing at all.
 let doWritesCalls = 0;
 mock.module('../src/writes.ts', {
   namedExports: {
@@ -51,39 +55,39 @@ async function mkStalled(): Promise<string> {
 
 beforeEach(() => { db().exec('DELETE FROM session; DELETE FROM event_log;'); doWritesCalls = 0; autonomyLevel = 0; autonomyActor = 'M'; });
 
-test('真 action·L4：AWAITING_GATE_D → 真 requestReviewPr 推进 GATE_D_REQUESTED；红线态 AWAITING_HUMAN_MERGE/GATE_C_STALLED 纹丝不动', async () => {
+test('the real action at L4: AWAITING_GATE_D moves to GATE_D_REQUESTED through the real requestReviewPr, while the red-line states AWAITING_HUMAN_MERGE and GATE_C_STALLED do not budge', async () => {
   autonomyLevel = 4;
   const dId = await mkAt('AWAITING_GATE_D');
   const mId = await mkAt('AWAITING_HUMAN_MERGE');
   const sId = await mkStalled();
   await worker.applyAutonomy();
-  assert.equal((await sessions.get(dId))!.state, 'GATE_D_REQUESTED', '真 requestReviewPr 推进（权限+状态机都过）');
-  assert.equal((await sessions.get(mId))!.state, 'AWAITING_HUMAN_MERGE', '红线#1：永不自动 merge —— 态不动');
-  assert.equal((await sessions.get(sId))!.state, 'GATE_C_STALLED', '红线#2：确定性闸 —— 态不动');
+  assert.equal((await sessions.get(dId))!.state, 'GATE_D_REQUESTED', 'the real requestReviewPr moved it, passing both the permission gate and the state machine');
+  assert.equal((await sessions.get(mId))!.state, 'AWAITING_HUMAN_MERGE', 'red line #1: never merge automatically -- the state does not move');
+  assert.equal((await sessions.get(sId))!.state, 'GATE_C_STALLED', 'red line #2: a deterministic gate -- the state does not move');
 });
 
-test('真 action·权限继承：actor 不在权限名单 → 真 requestGateB 被拒，CONFIRMED 态不动 + permission_denied', async () => {
+test('the real action inherits the permissions: an actor not on the list is refused by the real requestGateB, CONFIRMED does not move, and permission_denied is recorded', async () => {
   autonomyLevel = 1;
-  autonomyActor = 'NOPE'; // 不在 gate_b_allowed
+  autonomyActor = 'NOPE'; // not in gate_b_allowed
   const id = await mkAt('CONFIRMED');
   await worker.applyAutonomy();
-  assert.equal((await sessions.get(id))!.state, 'CONFIRMED', '权限不过 → 真 action 不转移');
+  assert.equal((await sessions.get(id))!.state, 'CONFIRMED', 'the permission did not pass, so the real action performed no transition');
   const evs = await sessions.events(id);
-  assert.ok(evs.some((e) => e.kind === 'permission_denied'), '真 action 落 permission_denied');
+  assert.ok(evs.some((e) => e.kind === 'permission_denied'), 'the real action recorded permission_denied');
   const res = evs.find((e) => e.kind === 'autonomy_auto_result');
   assert.equal(JSON.parse(res!.detail ?? '{}').ok, false);
 });
 
-test('真 action·指派闸继承：auto-GO 未指派 DRI → 真 go 受阻，AWAITING_GO 态不动 + go_blocked_no_assignee + **doWrites 零调用（绝无外向写）**', async () => {
+test('the real action inherits the assignment gate: an automatic go with no DRI assigned is blocked by the real go, AWAITING_GO does not move, go_blocked_no_assignee is recorded, and **doWrites is never called, so nothing is written outward**', async () => {
   autonomyLevel = 2;
-  const id = await mkAt('AWAITING_GO'); // 手动转移到此，未跑 autoAssignOnGo → assignee 为空
+  const id = await mkAt('AWAITING_GO'); // driven here by hand without running autoAssignOnGo, so assignee is empty
   await worker.applyAutonomy();
-  assert.equal((await sessions.get(id))!.state, 'AWAITING_GO', '指派闸未过 → 真 go 不立项、态不动');
-  assert.ok((await sessions.events(id)).some((e) => e.kind === 'go_blocked_no_assignee'), '真 go 落指派阻塞事件');
-  assert.equal(doWritesCalls, 0, '红线#3：写动作前确定性闸未过 → 根本没调 doWrites（无外向写）');
+  assert.equal((await sessions.get(id))!.state, 'AWAITING_GO', 'the assignment gate did not pass, so the real go filed nothing and the state did not move');
+  assert.ok((await sessions.events(id)).some((e) => e.kind === 'go_blocked_no_assignee'), 'the real go recorded the assignment-blocked event');
+  assert.equal(doWritesCalls, 0, 'red line #3: a deterministic gate before the write did not pass, so doWrites was never called and nothing went outward');
 });
 
-test('真 action·权限通过：actor=M（在 go_approvers）·L4·AWAITING_GATE_D → 真 requestReviewPr 推进', async () => {
+test('the real action with the permission granted: actor=M (in go_approvers) at L4 from AWAITING_GATE_D moves forward through the real requestReviewPr', async () => {
   autonomyLevel = 4;
   const id = await mkAt('AWAITING_GATE_D');
   await worker.applyAutonomy();

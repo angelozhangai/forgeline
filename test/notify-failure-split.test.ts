@@ -1,18 +1,22 @@
-// 错误展示分流：出问题时群侧只见「处理中」、不露具体错误；具体错误私聊 M；bot 私聊失败也不外泄群 webhook。
+// How errors are split by audience: when something breaks, the channel sees only "in progress" and never the
+// specific error; the specific error goes to the maintainer by direct message; and a failed direct message
+// still must not leak it to the channel webhook.
 process.env.FORGE_DB = ':memory:';
-process.env.NOTIFY_DESKTOP = '0'; // 测试里别弹桌面通知
-process.env.FORGE_FUN = '0'; // 关彩蛋，输出确定（不挂宠物动图）
+process.env.NOTIFY_DESKTOP = '0'; // no desktop notifications during tests
+process.env.FORGE_FUN = '0'; // turn the easter egg off so the output is deterministic (no pet animation)
 
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import type { Session } from '../src/types.ts';
 
-const DRIFT_ERR = 'CODEX_CONTRACT_DRIFT: codex 输出缺信封事件：thread.started、turn.completed';
+const DRIFT_ERR = 'CODEX_CONTRACT_DRIFT: the codex output is missing the envelope events thread.started and turn.completed';
 
-// 所有 mock 必须在首次 import notify.ts 之前声明（ESM 绑定在模块求值时定死）。
+// Every mock has to be declared before notify.ts is first imported -- ESM bindings are fixed when the module
+// is evaluated.
 let postCardCalls = 0;
 let sentBot = false;
-// feishu.ts adapter 现静态 import botTenantToken/FEISHU_BASE/botOpenId(Cached)（port.probe + 群 @ 闸用）——mock 须补齐这些导出，否则 ESM 实例化即失败。
+// The feishu.ts adapter now statically imports botTenantToken / FEISHU_BASE / botOpenId(Cached), used by
+// port.probe and the channel mention gate, so the mock has to carry those exports or ESM instantiation fails.
 mock.module('../src/feishu/dm.ts', { namedExports: { sendBotCardObject: async () => sentBot, sendBotCard: async () => false, botTenantToken: async () => '', botOpenId: async () => null, botOpenIdCached: () => null, FEISHU_BASE: 'https://example.invalid' } });
 mock.module('../src/feishu/group.ts', { namedExports: { replyCard: async () => null, patchCard: async () => true, sendCardToChat: async () => null } });
 mock.module('../src/feishu/notify.ts', { namedExports: { postCard: async () => { postCardCalls++; return true; } } });
@@ -30,41 +34,44 @@ function sess(p: Partial<Session>): Session {
   } as unknown as Session;
 }
 
-// ── 纯渲染：群卡藏错、私聊露错 ──────────────────────────────────────
-test('群状态卡 *_FAILED：只显示「处理中」，绝不含具体错误，头部不报红', () => {
+// -- Pure rendering: the channel card hides the error, the direct message shows it --
+test('the channel status card in any *_FAILED state shows only that it is in progress, never the specific error, and does not turn the header red', () => {
   for (const st of ['GATE_A_FAILED', 'GATE_B_FAILED', 'WRITE_FAILED'] as const) {
     const c = json(buildStatusCard(sess({ state: st })));
-    assert.doesNotMatch(c, /CONTRACT_DRIFT|thread\.started|信封|出错|失败|处理中断/, `${st} 群卡泄漏了错误`);
-    assert.doesNotMatch(c, /"template":"red"/, `${st} 群卡不该报红`);
-    assert.match(c, /In progress|reviewing|designing|creating/, `${st} 群卡应显示进行中文案`);
-    assert.doesNotMatch(c, /Gate [ABCD]|GATE_/, `${st} 群卡泄漏黑话`);
+    // `interrupted` is in stateLabel's own wording for these states, so this also catches a regression that
+    // let the raw state label onto the channel card.
+    assert.doesNotMatch(c, /CONTRACT_DRIFT|thread\.started|envelope|interrupted|error|failed/i, `the channel card for ${st} leaked the error`);
+    assert.doesNotMatch(c, /"template":"red"/, `the channel card for ${st} should not turn red`);
+    assert.match(c, /In progress|reviewing|designing|creating/, `the channel card for ${st} should read as still in progress`);
+    assert.doesNotMatch(c, /Gate [ABCD]|GATE_/, `the channel card for ${st} leaks jargon`);
   }
 });
 
-test('私聊(M)卡 failed：保留具体错误 + 重试按钮', () => {
+test('the maintainer\'s direct-message card for failed keeps the specific error and the retry button', () => {
   const c = json(buildCard('failed', sess({}), { error: DRIFT_ERR }));
-  assert.match(c, /CONTRACT_DRIFT/); // M 拿到真因
+  assert.match(c, /CONTRACT_DRIFT/); // the maintainer gets the real cause
   assert.match(c, /"action":"retry"/);
 });
 
-// ── notify()：bot 私聊失败时，failed/recovered 不外泄群 webhook ──────
-test('notify failed：bot 私聊失败 → 不调用 postCard（不外泄群 webhook）', async () => {
+// -- notify(): when the bot's direct message fails, failed and recovered still do not leak to the channel
+// webhook --
+test('notify failed: the bot\'s direct message fails -> postCard is never called, so nothing leaks to the channel webhook', async () => {
   postCardCalls = 0;
-  sentBot = false; // bot 私聊失败
+  sentBot = false; // the bot's direct message fails
   await notify('failed', sess({}), { error: DRIFT_ERR });
-  assert.equal(postCardCalls, 0, 'failed 时 bot 失败也绝不外泄群 webhook');
+  assert.equal(postCardCalls, 0, 'even when the bot fails, a failure must never leak to the channel webhook');
 });
 
-test('notify recovered：bot 私聊失败 → 同样不外泄群 webhook', async () => {
+test('notify recovered: the bot\'s direct message fails -> it does not leak to the channel webhook either', async () => {
   postCardCalls = 0;
   sentBot = false;
   await notify('recovered', sess({ state: 'GATE_B_FAILED' }), { from: 'GATE_B_FAILED', to: 'ADVERSARIAL_LOOP' });
   assert.equal(postCardCalls, 0);
 });
 
-test('notify needs_go（对照组）：bot 私聊失败 → 仍走 postCard 群兜底（非错误类不变）', async () => {
+test('notify needs_go (the control): the bot\'s direct message fails -> it still falls back to postCard in the channel, since this is not an error card', async () => {
   postCardCalls = 0;
   sentBot = false;
   await notify('needs_go', sess({ state: 'AWAITING_GO' }));
-  assert.equal(postCardCalls, 1, 'M 决策类卡保留 webhook 兜底');
+  assert.equal(postCardCalls, 1, "a card the maintainer decides on keeps its webhook fallback");
 });

@@ -1,16 +1,20 @@
-// FORGE_HOME / FORGE_CONFIG_DIR / FORGE_STATE_DIR / FORGE_LOGS_DIR：把服务自身的
-// 可变状态搬出检出目录的部署接缝。
+// FORGE_HOME / FORGE_CONFIG_DIR / FORGE_STATE_DIR / FORGE_LOGS_DIR: the deployment seam that moves the
+// service's own mutable state out of the checkout.
 //
-// 合约（不是实现的镜像）：
-//   1. 全都不设 → 一切落在检出目录内，与引入本接缝之前逐字节一致（向后兼容）；
-//   2. FORGE_HOME 一次搬走 config/state/logs 三者；
-//   3. 单项 FORGE_* 优先级高于 FORGE_HOME，且只影响自己那一项；
-//   4. 空串 / 纯空格 == 没设（否则会静默锚到进程 cwd，症状极难追）；
-//   5. 配置文件逐个回落：叠加目录有就用叠加的，没有就用仓内默认 —— 私有部署
-//      只覆盖它在乎的那几个，其余跟着仓库升级；
-//   6. 指向不存在的目录不抛异常，按「该文件没被覆盖」处理；
-//   7. EXT_DIR（扩展包目录）走同一套规则：FORGE_EXT_DIR > $FORGE_HOME/ext > 检出目录内 ext/ ——
-//      下游产品的扩展包跟着部署根一起搬，不必再记一个新约定。
+// The contract (not a mirror of the implementation):
+//   1. None of them set -> everything lands inside the checkout, byte for byte as it was before this seam
+//      existed (backward compatibility);
+//   2. FORGE_HOME moves config, state and logs in one go;
+//   3. An individual FORGE_* beats FORGE_HOME, and affects only its own directory;
+//   4. An empty string or pure whitespace counts as unset (otherwise it silently anchors to the process cwd,
+//      which is a very hard symptom to trace);
+//   5. Config files fall back one file at a time: use the overlay's copy if it has one, the in-repo default
+//      otherwise -- a private deployment overrides only the few it cares about and the rest keep upgrading
+//      with the repo;
+//   6. Pointing at a directory that does not exist throws nothing; it just means that file is not overridden;
+//   7. EXT_DIR (the extension-pack directory) follows the same rules: FORGE_EXT_DIR > $FORGE_HOME/ext > the
+//      checkout's own ext/ -- a downstream product's pack moves with the deployment root, so there is no new
+//      convention to remember.
 import { test, describe, before, after } from 'node:test';
 import assert from 'node:assert/strict';
 import { mkdtempSync, mkdirSync, writeFileSync, rmSync, existsSync } from 'node:fs';
@@ -23,7 +27,8 @@ const ROOT_TS = pathToFileURL(resolve(import.meta.dirname, '../src/root.ts')).hr
 const VARS = ['FORGE_HOME', 'FORGE_CONFIG_DIR', 'FORGE_STATE_DIR', 'FORGE_LOGS_DIR', 'FORGE_EXT_DIR'] as const;
 
 let bust = 0;
-/** 用带 query 的 URL 绕开 ESM 模块缓存，让 root.ts 在给定 env 下重新求值。 */
+/** Use a query string on the URL to sidestep the ESM module cache, so root.ts is re-evaluated under the
+ * given env. */
 async function loadRoot(env: Partial<Record<(typeof VARS)[number], string>>) {
   const saved = Object.fromEntries(VARS.map((k) => [k, process.env[k]]));
   for (const k of VARS) delete process.env[k];
@@ -48,14 +53,15 @@ before(() => {
   overlay = resolve(tmp, 'overlay-config');
   mkdirSync(home, { recursive: true });
   mkdirSync(overlay, { recursive: true });
-  // 叠加目录里只放 routing.yaml —— 用来验证「只覆盖在乎的那个，其余回落」。
+  // The overlay holds routing.yaml only -- that is what proves "override the one you care about, fall back
+  // for the rest".
   writeFileSync(resolve(overlay, 'routing.yaml'), 'reviewers: {}\n');
 });
 
 after(() => rmSync(tmp, { recursive: true, force: true }));
 
-describe('部署目录接缝', () => {
-  test('全都不设：一切落在检出目录内（向后兼容）', async () => {
+describe('the deployment-directory seam', () => {
+  test('none of them set: everything lands inside the checkout (backward compatibility)', async () => {
     const r = await loadRoot({});
     assert.equal(r.CONFIG_DIR, resolve(r.SVC_DIR, 'config'));
     assert.equal(r.CONFIG_DIR, r.CONFIG_REPO_DIR);
@@ -64,18 +70,18 @@ describe('部署目录接缝', () => {
     assert.equal(r.ENV_FILE, resolve(r.SVC_DIR, 'config', 'forge.env'));
   });
 
-  test('FORGE_HOME 一次搬走 config/state/logs 三者，但 CONFIG_REPO_DIR 不动', async () => {
+  test('FORGE_HOME moves config, state and logs in one go, while CONFIG_REPO_DIR stays put', async () => {
     const r = await loadRoot({ FORGE_HOME: home });
     assert.equal(r.CONFIG_DIR, resolve(home, 'config'));
     assert.equal(r.STATE_DIR, resolve(home, 'state'));
     assert.equal(r.LOGS_DIR, resolve(home, 'logs'));
-    // 仓内默认目录必须仍然指向检出，否则回落就没有落点了。
+    // The in-repo default directory has to keep pointing at the checkout, or the fallback has nowhere to land.
     assert.equal(r.CONFIG_REPO_DIR, resolve(r.SVC_DIR, 'config'));
-    // prompts 走的是 FORGE_PROMPTS_DIR（loadPrompt 内解析），不归 FORGE_HOME 管。
+    // Prompts go through FORGE_PROMPTS_DIR, resolved inside loadPrompt -- FORGE_HOME does not govern them.
     assert.equal(r.PROMPTS_DIR, resolve(r.SVC_DIR, 'prompts'));
   });
 
-  test('单项覆盖优先于 FORGE_HOME，且只影响自己那一项', async () => {
+  test('an individual override beats FORGE_HOME and affects only its own directory', async () => {
     const solo = resolve(tmp, 'solo-state');
     const r = await loadRoot({ FORGE_HOME: home, FORGE_STATE_DIR: solo });
     assert.equal(r.STATE_DIR, solo);
@@ -83,7 +89,7 @@ describe('部署目录接缝', () => {
     assert.equal(r.LOGS_DIR, resolve(home, 'logs'));
   });
 
-  test('派生路径跟着搬：DB / 心跳 / 看门狗 / launchd 日志', async () => {
+  test('the derived paths move too: the database, the heartbeat, the watchdog and the launchd log', async () => {
     const r = await loadRoot({ FORGE_HOME: home });
     assert.equal(r.DB_PATH, resolve(home, 'state', 'service.db'));
     assert.equal(r.HEARTBEAT_PATH, resolve(home, 'state', 'heartbeat.json'));
@@ -91,36 +97,37 @@ describe('部署目录接缝', () => {
     assert.equal(r.LAUNCHD_LOG, resolve(home, 'logs', 'launchd.log'));
   });
 
-  test('相对路径按 cwd 展开成绝对路径（下游全都按绝对路径拼接）', async () => {
+  test('a relative path is expanded against cwd into an absolute one (everything downstream composes absolute paths)', async () => {
     const r = await loadRoot({ FORGE_HOME: '.' });
     assert.equal(r.CONFIG_DIR, resolve(process.cwd(), 'config'));
   });
 
   for (const [label, value] of [
-    ['空串', ''],
-    ['纯空格', '   '],
+    ['an empty string', ''],
+    ['pure whitespace', '   '],
   ] as const) {
-    test(`${label}视同未设置 —— 绝不能静默锚到 cwd`, async () => {
+    test(`${label} counts as unset -- it must never silently anchor to cwd`, async () => {
       const r = await loadRoot({ FORGE_HOME: value, FORGE_CONFIG_DIR: value });
       assert.equal(r.CONFIG_DIR, resolve(r.SVC_DIR, 'config'));
       assert.equal(r.STATE_DIR, resolve(r.SVC_DIR, 'state'));
     });
   }
 
-  // 扩展包目录：合约 7。核心不认识任何下游产品，只认这个位置。
-  test('都不设：EXT_DIR 落在检出目录内，且本仓不自带 ext/ —— 缺省就是「没有扩展」', async () => {
+  // The extension-pack directory: contract 7. The core knows no downstream product, only this location.
+  test('nothing set: EXT_DIR lands inside the checkout, and this repo ships no ext/ -- the default is no extension at all', async () => {
     const r = await loadRoot({});
     assert.equal(r.EXT_DIR, resolve(r.SVC_DIR, 'ext'));
-    // 公开核心一旦自带 ext/，纯 OSS 用户就会莫名其妙装上一个包。这条守的是「开源仓自洽」。
-    assert.equal(existsSync(r.EXT_DIR), false, '公开核心不应自带 ext/ 目录');
+    // The moment the public core ships an ext/, a pure open-source user loads a pack out of nowhere. This is
+    // what keeps the open-source repo self-consistent.
+    assert.equal(existsSync(r.EXT_DIR), false, 'the public core should not ship an ext/ directory');
   });
 
-  test('FORGE_HOME 把扩展包目录一起搬走 —— 下游不必再记一个新约定', async () => {
+  test('FORGE_HOME moves the extension-pack directory along with everything else -- no new convention for downstream to remember', async () => {
     const r = await loadRoot({ FORGE_HOME: home });
     assert.equal(r.EXT_DIR, resolve(home, 'ext'));
   });
 
-  test('FORGE_EXT_DIR 优先于 FORGE_HOME，且不影响 config/state/logs', async () => {
+  test('FORGE_EXT_DIR beats FORGE_HOME without affecting config, state or logs', async () => {
     const solo = resolve(tmp, 'solo-ext');
     const r = await loadRoot({ FORGE_HOME: home, FORGE_EXT_DIR: solo });
     assert.equal(r.EXT_DIR, solo);
@@ -130,44 +137,44 @@ describe('部署目录接缝', () => {
   });
 
   for (const [label, value] of [
-    ['空串', ''],
-    ['纯空格', ' \t '],
+    ['an empty string', ''],
+    ['pure whitespace', ' \t '],
   ] as const) {
-    test(`FORGE_EXT_DIR 为${label}视同未设置 —— 不能把扩展包目录锚到 cwd`, async () => {
+    test(`FORGE_EXT_DIR set to ${label} counts as unset -- the pack directory must not anchor to cwd`, async () => {
       const r = await loadRoot({ FORGE_EXT_DIR: value });
       assert.equal(r.EXT_DIR, resolve(r.SVC_DIR, 'ext'));
     });
   }
 });
 
-describe('configFile 的逐文件回落', () => {
-  test('未设叠加：一律走仓内默认', async () => {
+describe('configFile falling back one file at a time', () => {
+  test('no overlay set: everything comes from the in-repo default', async () => {
     const r = await loadRoot({});
     assert.equal(r.configFile('routing.yaml'), resolve(r.CONFIG_REPO_DIR, 'routing.yaml'));
   });
 
-  test('叠加目录里有的用叠加的，没有的回落仓内 —— 只覆盖在乎的那几个', async () => {
+  test('what the overlay has comes from the overlay, what it lacks falls back to the repo -- override only the few you care about', async () => {
     const r = await loadRoot({ FORGE_CONFIG_DIR: overlay });
     assert.equal(r.configFile('routing.yaml'), resolve(overlay, 'routing.yaml'));
-    // runtime.yaml 不在叠加目录里 → 用仓内默认，且必须是真实存在的文件，
-    // 否则 loadYaml 会以「读取失败」炸掉，而不是安静地用默认值。
+    // runtime.yaml is not in the overlay, so it comes from the repo -- and it has to be a file that really
+    // exists, or loadYaml blows up with a read failure instead of quietly using the default.
     assert.equal(r.configFile('runtime.yaml'), resolve(r.CONFIG_REPO_DIR, 'runtime.yaml'));
   });
 
-  test('叠加目录不存在：不抛异常，全部回落', async () => {
+  test('the overlay directory does not exist: nothing throws, everything falls back', async () => {
     const r = await loadRoot({ FORGE_CONFIG_DIR: resolve(tmp, 'does-not-exist') });
     assert.doesNotThrow(() => r.configFile('routing.yaml'));
     assert.equal(r.configFile('routing.yaml'), resolve(r.CONFIG_REPO_DIR, 'routing.yaml'));
   });
 
-  test('仓内也没有的文件名：返回仓内路径,交给调用方报「读不到」', async () => {
-    // 可选文件（projects.yaml）靠调用方 existsSync 判断，所以这里必须返回一个
-    // 稳定的路径而不是抛异常 —— 否则「没有多项目注册表」会变成崩溃。
+  test('a filename the repo does not have either: return the in-repo path and leave the caller to report that it could not be read', async () => {
+    // Optional files such as projects.yaml are decided by the caller's existsSync, so this has to return a
+    // stable path rather than throw -- otherwise "there is no multi-project registry" turns into a crash.
     const r = await loadRoot({ FORGE_CONFIG_DIR: overlay });
     assert.equal(r.configFile('projects.yaml'), resolve(r.CONFIG_REPO_DIR, 'projects.yaml'));
   });
 
-  test('叠加目录里的 forge.env 会被 ENV_FILE 采纳', async () => {
+  test('a forge.env in the overlay is picked up by ENV_FILE', async () => {
     const withEnv = resolve(tmp, 'overlay-with-env');
     mkdirSync(withEnv, { recursive: true });
     writeFileSync(resolve(withEnv, 'forge.env'), 'FORGE_FUN=1\n');
@@ -176,9 +183,9 @@ describe('configFile 的逐文件回落', () => {
   });
 });
 
-// FORGE_EVAL_FIXTURES_DIR：把 golden 样本整体换成仓外的私有集。
-// 与 config 不同,这里是**替换**不是叠加 —— 混算通过率没有意义。
-describe('golden fixtures 目录接缝', () => {
+// FORGE_EVAL_FIXTURES_DIR: swap the golden samples wholesale for a private set outside the repo.
+// Unlike config this **replaces** rather than overlays -- a pass rate computed across a mixture means nothing.
+describe('the golden-fixtures directory seam', () => {
   const EXP_TS = pathToFileURL(resolve(import.meta.dirname, '../src/eval/expectations.ts')).href;
   let n = 0;
   async function loadExp(value?: string) {
@@ -193,14 +200,15 @@ describe('golden fixtures 目录接缝', () => {
     }
   }
 
-  test('未设置：用仓内 fixtures/eval,且那批样本必须真的加载得出来', async () => {
+  test('unset: use the in-repo fixtures/eval, and those samples must really load', async () => {
     const m = await loadExp(undefined);
     assert.equal(m.EVAL_ROOT, resolve(import.meta.dirname, '../fixtures/eval'));
-    // 仅断言路径等于自己会变成镜像测试;真正的合约是「默认路径能加载出样本」。
-    assert.ok(m.loadFixtures().length > 0, '仓内 golden 样本应当非空');
+    // Asserting only that the path equals itself would be a mirror test; the real contract is that the
+    // default path loads samples.
+    assert.ok(m.loadFixtures().length > 0, 'the in-repo golden samples should not be empty');
   });
 
-  test('设置后整体替换,仓内样本一个都不带进来', async () => {
+  test('once set it replaces them wholesale, bringing not one in-repo sample along', async () => {
     const priv = resolve(tmp, 'private-fixtures');
     mkdirSync(resolve(priv, 'only-mine'), { recursive: true });
     writeFileSync(resolve(priv, 'only-mine', 'prd.md'), '# private\n');
@@ -215,10 +223,10 @@ describe('golden fixtures 目录接缝', () => {
   });
 
   for (const [label, value] of [
-    ['空串', ''],
-    ['纯空格', '  '],
+    ['an empty string', ''],
+    ['pure whitespace', '  '],
   ] as const) {
-    test(`${label}视同未设置 —— 不能把 golden 集指到 cwd`, async () => {
+    test(`${label} counts as unset -- the golden set must not point at cwd`, async () => {
       const m = await loadExp(value);
       assert.equal(m.EVAL_ROOT, resolve(import.meta.dirname, '../fixtures/eval'));
     });

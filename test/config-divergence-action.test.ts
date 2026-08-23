@@ -1,12 +1,16 @@
-// 集成（配置分化收口）：真 action 的权限闸**按 session 所属项目**取名单与 login 映射，而非全局。
-// mock config.ts（带 projects 注册表）但 resolveLogin/inAllowList 用**生产同款逻辑**（读 cfg.routing.reviewers，
-// 即被合并后的项目级 reviewers），**不** mock projects.ts —— configForProject 的字段级/map 合并是被测真逻辑。
-// 真：actions.ts、projects.ts、状态机、sessions。证明同一个人（短码或 login）在不同项目得到不同权限后果。
+// Integration, closing out config divergence: a real action's permission gate takes its allow list and login
+// mapping **from the project the session belongs to**, not from the global config.
+// config.ts is mocked (carrying a projects registry) while resolveLogin and inAllowList use **exactly the
+// production logic**, reading cfg.routing.reviewers -- that is, the project-level reviewers after merging.
+// projects.ts is **not** mocked: configForProject's field-level and map merging is the real logic under test.
+// Real: actions.ts, projects.ts, the state machine and sessions. This proves the same person, by short code
+// or by login, gets different permission outcomes in different projects.
 process.env.FORGE_DB = ':memory:';
 import { test, mock, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-// 全局 gate_b_allowed=[M]；项目 acme 覆盖名单为 [BD]（字段级替换），并加自己的 reviewers（map 合并 → 继承全局 + EO）。demo 无覆盖 → 全局。
+// Globally gate_b_allowed=[M]; the acme project replaces the list with [BD] (a field-level replacement) and
+// adds its own reviewers (a map merge, so the global entries plus EO). demo overrides nothing, so it is global.
 const PERMISSIONS = { gate_b_allowed: ['M'], go_approvers: ['M'], gate_c_allowed: ['M'], pr_create_approvers: ['M'], merge_ack_allowed: ['M'] };
 const ROUTING = { min_confidence: 0.7, sensitive_areas: [], reviewers: { M: 'ming', BD: 'jintao' }, lead: 'M' };
 const REGISTRY = {
@@ -16,7 +20,8 @@ const REGISTRY = {
     acme: { root: '/tmp/acme-proj', permissions: { gate_b_allowed: ['BD'] }, routing: { reviewers: { EO: 'xw-login' } } },
   },
 };
-// 生产同款短码/login 解析（读传入 cfg 的 routing.reviewers —— actions 传的是 configForSession(s) 的合并结果）。
+// The same short-code and login resolution production uses, reading routing.reviewers off the cfg passed in --
+// and what actions passes is the merged result of configForSession(s).
 function resolveLogin(cfg: { routing: { reviewers: Record<string, string> } }, code: string): string | null {
   const up = code.toUpperCase();
   for (const [k, v] of Object.entries(cfg.routing.reviewers)) if (k.toUpperCase() === up) return v;
@@ -53,43 +58,45 @@ async function mkConfirmed(id: string, project: string): Promise<void> {
 
 beforeEach(() => { db().exec('DELETE FROM session; DELETE FROM event_log;'); });
 
-test('真 requestGateB：项目 acme 覆盖 gate_b_allowed=[BD] → 全局审批人 M 被拒、态不变 + permission_denied', async () => {
+test('the real requestGateB: acme overrides gate_b_allowed to [BD], so the global approver M is refused, the state does not change, and permission_denied is recorded', async () => {
   await mkConfirmed('s-acme', 'acme');
-  const r = await actions.requestGateB('s-acme', 'M'); // M 在**全局** gate_b_allowed，但不在 acme 的
+  const r = await actions.requestGateB('s-acme', 'M'); // M is in the **global** gate_b_allowed, but not in acme's
   assert.equal(r.ok, false);
   assert.match(r.msg, /may not run Gate B/);
-  assert.equal((await sessions.get('s-acme'))!.state, 'CONFIRMED'); // 未推进
+  assert.equal((await sessions.get('s-acme'))!.state, 'CONFIRMED'); // it did not move
   assert.ok((await sessions.events('s-acme')).some((e) => e.kind === 'permission_denied'));
 });
 
-test('真 requestGateB：acme 的 BD 在该项目名单内 → 推进 GATE_B_REQUESTED', async () => {
+test('the real requestGateB: BD is on acme\'s own list, so it moves to GATE_B_REQUESTED', async () => {
   await mkConfirmed('s-acme', 'acme');
   const r = await actions.requestGateB('s-acme', 'BD');
   assert.equal(r.ok, true);
   assert.equal((await sessions.get('s-acme'))!.state, 'GATE_B_REQUESTED');
 });
 
-test('真 requestGateB：默认项目 demo 无覆盖 → 沿用全局名单（M 可、BD 不可）', async () => {
+test('the real requestGateB: the default project demo overrides nothing and keeps the global list, so M may and BD may not', async () => {
   await mkConfirmed('s-demo', 'demo');
-  assert.equal((await actions.requestGateB('s-demo', 'BD')).ok, false); // BD 不在全局 gate_b_allowed
+  assert.equal((await actions.requestGateB('s-demo', 'BD')).ok, false); // BD is not in the global gate_b_allowed
   assert.equal((await sessions.get('s-demo'))!.state, 'CONFIRMED');
-  const r = await actions.requestGateB('s-demo', 'M'); // M 在全局
+  const r = await actions.requestGateB('s-demo', 'M'); // M is in the global list
   assert.equal(r.ok, true);
   assert.equal((await sessions.get('s-demo'))!.state, 'GATE_B_REQUESTED');
 });
 
-test('真 requestGateB·login 映射（SF2 reviewers map 合并）：acme 名单含继承短码 BD，用其 **login=jintao** 也能过', async () => {
-  // acme 只覆盖 reviewers={EO:...} → map 合并保留全局 BD→jintao。gate_b_allowed=[BD] 是项目覆盖；
-  // 用 login 'jintao'（非短码）→ inAllowList 经合并后的 reviewers 解析 BD→jintao 命中。证明继承短码的 login 映射不丢。
+test('the real requestGateB and the login mapping (SF2, reviewers merged as a map): acme\'s list carries the inherited short code BD, and its **login jintao** passes too', async () => {
+  // acme overrides only reviewers={EO: ...}, so the map merge keeps the global BD -> jintao, while
+  // gate_b_allowed=[BD] is the project's own override. Passing the login 'jintao' rather than the short code
+  // makes inAllowList resolve BD -> jintao through the merged reviewers and match -- proving the login mapping
+  // of an inherited short code is not lost.
   await mkConfirmed('s-acme', 'acme');
   const r = await actions.requestGateB('s-acme', 'jintao');
   assert.equal(r.ok, true);
   assert.equal((await sessions.get('s-acme'))!.state, 'GATE_B_REQUESTED');
 });
 
-test('真 requestGateB·login 映射：acme 自己的 reviewers（EO→xw-login）不在 gate_b_allowed=[BD] → 仍被拒（名单是替换、身份映射才合并）', async () => {
+test('the real requestGateB and the login mapping: acme\'s own reviewers entry (EO -> xw-login) is not in gate_b_allowed=[BD], so it is still refused -- the allow list is replaced, only the identity map is merged', async () => {
   await mkConfirmed('s-acme', 'acme');
-  const r = await actions.requestGateB('s-acme', 'xw-login'); // EO 解析得到，但 EO 不在 acme gate_b_allowed=[BD]
+  const r = await actions.requestGateB('s-acme', 'xw-login'); // it resolves to EO, but EO is not in acme's gate_b_allowed=[BD]
   assert.equal(r.ok, false);
   assert.equal((await sessions.get('s-acme'))!.state, 'CONFIRMED');
 });

@@ -1,5 +1,6 @@
-// 集成：闸A codex 对抗循环（runGateALoop）的真实 gateAConfig 接线——prompt 加载 + 输出 schema +
-// 列持久化 + 停泊残留。引擎控制流本身在 reviewFixLoop.test.ts 已覆盖，这里只验闸A 专属配置。
+// Integration: gate A's codex adversarial loop (runGateALoop) against the real gateAConfig wiring -- loading
+// the prompt, the output schema, persisting the columns and the leftovers on a stall. The engine's own control
+// flow is already covered by reviewFixLoop.test.ts, so this file checks only what is specific to gate A.
 process.env.FORGE_DB = ':memory:';
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
@@ -7,7 +8,8 @@ import { writeFileSync, readFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-// 假驱动：codex reviewer / claude fixer 各用队列逐轮返回（队空兜 LGTM）。
+// Fake drivers: the codex reviewer and the claude fixer each return from a queue, round by round, falling back
+// to LGTM once the queue is empty.
 const codexQueue: { ok: boolean; result?: string; available?: boolean }[] = [];
 mock.module('../src/llm/runCodex.ts', {
   namedExports: {
@@ -45,34 +47,35 @@ async function mkSession(id: string) {
   return (await sessions.get(id))!;
 }
 
-test('runGateALoop：codex LGTM → resolved（不调 fixer），对抗轮次落库', async () => {
+test('runGateALoop: codex says LGTM -> resolved without calling the fixer, and the adversarial round is persisted', async () => {
   codexQueue.length = 0; claudeQueue.length = 0;
   codexQueue.push({ ok: true, result: JSON.stringify({ verdict: 'LGTM', findings: [] }) });
   const out = await runGateALoop(await mkSession('gal1'));
   assert.equal(out.resolved, true);
   assert.equal(out.verdict, 'LGTM');
   assert.equal((await sessions.get('gal1'))!.gate_a_adv_round, 1);
-  assert.equal(claudeQueue.length, 0); // fixer 未被调用（队列未被消费）
+  assert.equal(claudeQueue.length, 0); // the fixer was never called, so its queue was never consumed
 });
 
-test('runGateALoop：CHANGES → claude 改评审 → 复审 LGTM；修订落 gate-a.json + fixer 会话落库', async () => {
+test('runGateALoop: CHANGES -> claude revises the review -> the re-review says LGTM; the revision lands in gate-a.json and the fixer session is persisted', async () => {
   codexQueue.length = 0; claudeQueue.length = 0;
   codexQueue.push({ ok: true, result: CHANGES });
-  claudeQueue.push({ ok: true, result: FIX({ ...BASE_ENV, open_questions: [{ q: '退款去哪？', suggestion: '余额', severity: 'high', options: [] }] }) });
+  claudeQueue.push({ ok: true, result: FIX({ ...BASE_ENV, open_questions: [{ q: 'Where does the refund go?', suggestion: 'the balance', severity: 'high', options: [] }] }) });
   codexQueue.push({ ok: true, result: JSON.stringify({ verdict: 'LGTM', findings: [] }) });
   const s = await mkSession('gal2');
   const out = await runGateALoop(s);
   assert.equal(out.resolved, true);
   const env = JSON.parse(readFileSync((await sessions.get('gal2'))!.gate_a_output_path!, 'utf8'));
-  assert.equal(env.open_questions.length, 1); // claude 的修订已落盘
-  assert.ok((await sessions.get('gal2'))!.gate_a_fixer_session); // fixer 会话已 pin 落库（续修 resume 用）
+  assert.equal(env.open_questions.length, 1); // claude's revision reached disk
+  assert.ok((await sessions.get('gal2'))!.gate_a_fixer_session); // the fixer session is pinned and persisted, for resuming a revision
 });
 
-test('runGateALoop：到上限仍 CHANGES → stalled + 落 gate_a_residual(source=codex)', async () => {
+test('runGateALoop: still CHANGES at the cap -> stalled, storing gate_a_residual with source=codex', async () => {
   codexQueue.length = 0; claudeQueue.length = 0;
   for (let i = 0; i < 6; i++) { codexQueue.push({ ok: true, result: CHANGES }); claudeQueue.push({ ok: true, result: FIX(BASE_ENV) }); }
   const s = await mkSession('gal3');
-  // 每-tick 上限会先 paused，模拟多个 tick 续跑直到 stalled（最多 5 次防呆）。
+  // The per-tick cap pauses first, so this simulates several ticks carrying on until it stalls, with a
+  // sanity limit of five.
   let out = await runGateALoop(s);
   for (let i = 0; i < 5 && out.paused; i++) out = await runGateALoop((await sessions.get('gal3'))!);
   assert.equal(out.stalled, true);
@@ -81,10 +84,11 @@ test('runGateALoop：到上限仍 CHANGES → stalled + 落 gate_a_residual(sour
   assert.ok(resid.findings.length >= 1);
 });
 
-test('runGateALoop：on_missing=skip 且 codex 不可用 → 视为通过（保住评审稿，不卡死）', async () => {
+test('runGateALoop: with on_missing=skip and codex unavailable it counts as passed, which keeps the review draft rather than wedging', async () => {
   codexQueue.length = 0; claudeQueue.length = 0;
   codexQueue.push({ ok: false, available: false });
-  // 仓内 runtime.yaml on_missing=claude（降级），此处仅验 codex 不可用时不抛、不静默丢稿——降级 claude 复审。
+  // The repo's runtime.yaml sets on_missing=claude (degrade), so all this checks is that an unavailable codex
+  // neither throws nor silently drops the draft -- it degrades to a claude re-review.
   claudeQueue.push({ ok: true, result: JSON.stringify({ verdict: 'LGTM', findings: [] }) });
   const out = await runGateALoop(await mkSession('gal4'));
   assert.equal(out.resolved, true);
