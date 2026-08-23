@@ -100,7 +100,7 @@ test('publish 在建 issue 之前（真跑）', async () => {
 
 test('publish 失败 → 抛 WRITE_FAILED，绝不建 issue', async () => {
   publishFail = true;
-  await assert.rejects(() => doWrites(sess({ gate_b_draft_path: draft(SINGLE) })), /发布主仓失败/);
+  await assert.rejects(() => doWrites(sess({ gate_b_draft_path: draft(SINGLE) })), /publishing the technical plan to the main repo failed/);
   assert.equal(singleCalls, 0); // 发布没成，不建 issue
 });
 
@@ -184,7 +184,7 @@ test('finding2：多仓子 issue 部分创建失败（脚本退 0）→ 覆盖�
   const created: CreatedIssueT[] = [];
   await assert.rejects(
     () => doWrites(sess({ gate_b_draft_path: draft(MULTI) }), { onCreated: (iss) => { created.length = 0; created.push(...iss); } }),
-    /子 issue 缺失/,
+    /sub-issues are missing/,
   );
   assert.equal(listChildrenCalls, 0); // fresh 路径不查 GitHub（靠 stdout 标记），直接挡
   assert.equal(approveCalls, 0); // 缺子 issue 不放行 status:3
@@ -193,7 +193,7 @@ test('finding2：多仓子 issue 部分创建失败（脚本退 0）→ 覆盖�
 
 test('finding3：size 标签打失败 → 抛 → WRITE_FAILED（不静默漏 weekly-load 口径），不 approve', async () => {
   labelOk = false;
-  await assert.rejects(() => doWrites(sess({ gate_b_draft_path: draft(SINGLE) }), {}), /size 标签打失败/);
+  await assert.rejects(() => doWrites(sess({ gate_b_draft_path: draft(SINGLE) }), {}), /size label\(s\) failed/);
   assert.equal(approveCalls, 0); // label 失败先于 approve，不放行
 });
 
@@ -204,7 +204,7 @@ test('多仓 retry：created_issues 仍缺子仓且 GitHub 也没补 → 仍抛 
     gate_b_draft_path: draft(MULTI),
     created_issues: JSON.stringify([{ repo: 'example-project', number: 10, url: 'http://x/10' }, { repo: 'demo', number: 11, url: 'http://x/11' }]),
   });
-  await assert.rejects(() => doWrites(s, {}), /子 issue 缺失/);
+  await assert.rejects(() => doWrites(s, {}), /sub-issues are missing/);
   assert.equal(epicCalls, 0); // 不重建
   assert.equal(listChildrenCalls, 1); // 尝试从 GitHub 重新发现缺仓
   assert.equal(approveCalls, 0); // 缺子 issue 不放行 status:3

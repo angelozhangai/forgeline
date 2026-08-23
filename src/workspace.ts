@@ -1,20 +1,23 @@
-// 对主仓现有脚本的类型化封装。服务"调用、不重写"。
-// 注：飞书文档那几支（read/comment-add/token/docx raw）已在 Phase 1 迁到 src/docs/feishu.ts——
-// 它们是**文档源**的实现细节，不是通用的项目脚本封装。
+// Typed wrappers around the main repo's existing scripts. The service calls them, and never rewrites them.
+// Note: the Feishu document calls (read, comment-add, token, docx raw) moved to src/docs/feishu.ts in phase 1
+// — they are a **document source's** implementation detail, not a general wrapper around a project script.
 import { resolve } from 'node:path';
 import { run } from './util/proc.ts';
 import { SCRIPTS_DIR } from './root.ts';
 import type { CreatedIssue } from './types.ts';
 
-// 默认项目 GitHub org 兜底；生产路径由调用方按 project(s.project_id).owner 显式传入（见 writes.ts / reconcile.ts）。
+// The default project's GitHub org as a fallback; on the production path the caller passes
+// project(s.project_id).owner explicitly (see writes.ts and reconcile.ts).
 const DEFAULT_OWNER = 'your-org';
 
 function escapeRe(s: string): string {
   return s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 }
 
-// dir：目标项目的 scripts 目录（多项目：调用方传 project(s.project_id).scriptsDir）。
-// 缺省回退默认项目 SCRIPTS_DIR——供共享基建脚本及未线程化的调用用。
+// dir is the target project's scripts directory (with several projects, the caller passes
+// project(s.project_id).scriptsDir).
+// It falls back to the default project's SCRIPTS_DIR, for shared infrastructure scripts and for callers that
+// have not been threaded through yet.
 function scriptPath(name: string, dir: string = SCRIPTS_DIR): string {
   return resolve(dir, name);
 }
@@ -43,7 +46,7 @@ function parseIssues(stdout: string, owner: string = DEFAULT_OWNER): CreatedIssu
   return out;
 }
 
-// ── 闸A ──────────────────────────────────────────────
+// ── Gate A ──────────────────────────────────────────────
 export interface ScaffoldOpts {
   slug: string;
   prd?: string | null;
@@ -53,7 +56,7 @@ export interface ScaffoldOpts {
   title?: string | null;
   force?: boolean;
   dryRun?: boolean;
-  scriptsDir?: string; // 目标项目 scripts 目录（缺省默认项目）
+  scriptsDir?: string; // the target project's scripts directory (defaulting to the default project's)
 }
 
 export function reviewReqScaffold(o: ScaffoldOpts) {
@@ -68,7 +71,7 @@ export function reviewReqScaffold(o: ScaffoldOpts) {
   return bash('review-req.sh', a, o.scriptsDir);
 }
 
-// ── 闸B ──────────────────────────────────────────────
+// ── Gate B ──────────────────────────────────────────────
 export function techDesignScaffold(o: ScaffoldOpts) {
   const a = ['scaffold', o.slug];
   flag(a, '--prd', o.prd);
@@ -88,18 +91,18 @@ export function techDesignApprove(slug: string, issue?: string | null, rollup = 
   return bash('tech-design.sh', a, scriptsDir);
 }
 
-// ── 建需求 ───────────────────────────────────────────
+// ── Creating the work items ───────────────────────────────────────────
 export interface IssueCommon {
   type?: string | null;
   prio?: string | null;
   area?: string | null;
   status?: number | null;
-  assignee?: string | null; // 短码/login
+  assignee?: string | null; // a short code, or a login
   docUrl?: string | null;
   body?: string | null;
   dryRun?: boolean;
-  scriptsDir?: string; // 目标项目 scripts 目录（缺省默认项目）
-  owner?: string; // 该项目 GitHub org（解析建好的 issue URL）；缺省 DEFAULT_OWNER
+  scriptsDir?: string; // the target project's scripts directory (defaulting to the default project's)
+  owner?: string; // that project's GitHub org (used to parse the created issue's URL); DEFAULT_OWNER by default
 }
 
 function commonFlags(a: string[], o: IssueCommon): void {
@@ -142,7 +145,8 @@ export async function newReqEpic(
   return { ...r, issues: parseIssues(r.stdout, o.owner) };
 }
 
-// 发布技术方案 doc 到主仓（提交+PR+merge，见 scripts/publish-tech-design.sh）。幂等：已发布则脚本跳过退 0。
+// Publish the technical-design document to the main repo (commit, PR, merge — see
+// scripts/publish-tech-design.sh). Idempotent: if it is already published the script skips and exits 0.
 export async function publishTechDesign(
   slug: string,
   o: { base: string; dryRun?: boolean; scriptsDir?: string },
@@ -152,8 +156,10 @@ export async function publishTechDesign(
   return bash('publish-tech-design.sh', a, o.scriptsDir);
 }
 
-// 按 epic:<slug> 标签查某仓已存在的子 issue（含人工 add-child 补建的）。多仓 retry 时据此刷新 created_issues：
-// 主仓 epic 脚本子 issue 只打印 `✓ C#n`（无完整 URL），故部分失败后重跑只能从 GitHub 重新发现。
+// Find the sub-issues that already exist in a repo by their epic:<slug> label (including any filled in by
+// hand with add-child). A multi-repo retry refreshes created_issues from this: the main repo's epic script
+// prints a sub-issue as just `✓ C#n` with no full URL, so after a partial failure a re-run can only
+// rediscover them from GitHub.
 export async function listEpicChildren(repo: string, slug: string, owner: string = DEFAULT_OWNER): Promise<{ ok: boolean; issues: CreatedIssue[]; stderr: string }> {
   const r = await run('gh', ['issue', 'list', '-R', `${owner}/${repo}`, '-l', `epic:${slug}`, '--state', 'all', '--json', 'number,url'], { timeoutMs: 60000 });
   if (r.code !== 0 || r.timedOut) return { ok: false, issues: [], stderr: r.stderr || `exit ${r.code}` };
@@ -164,18 +170,20 @@ export async function listEpicChildren(repo: string, slug: string, owner: string
       .map((a) => ({ repo, number: a.number as number, url: a.url as string }));
     return { ok: true, issues, stderr: '' };
   } catch {
-    return { ok: false, issues: [], stderr: 'gh issue list --json 解析失败' };
+    return { ok: false, issues: [], stderr: 'gh issue list --json could not be parsed' };
   }
 }
 
-// 查 issue 开闭态 + 关闭原因（漂移闭环用）。逐条 gh issue view。
-// state：OPEN/CLOSED/UNKNOWN（取不到=gh 失败/超时/坏 JSON → UNKNOWN，绝不把取不到当成「已合并」）。
-// reason：CLOSED 的 stateReason（COMPLETED=正常完成 ≈ 已落地；NOT_PLANNED/DUPLICATE=废弃，不该当作落地对账）。
+// Read an issue's open/closed state and why it was closed (used by the drift loop). One gh issue view each.
+// state is OPEN / CLOSED / UNKNOWN — an answer that cannot be obtained (gh failed, timed out, or returned
+// malformed JSON) is UNKNOWN, and is never treated as "merged".
+// reason is a closed issue's stateReason: COMPLETED means it finished normally and is roughly "it landed";
+// NOT_PLANNED and DUPLICATE mean it was dropped and must not be reconciled as if it had landed.
 export interface IssueStateRow {
   repo: string;
   number: number;
   state: 'OPEN' | 'CLOSED' | 'UNKNOWN';
-  reason: string; // 原始 stateReason（COMPLETED/NOT_PLANNED/DUPLICATE/''），取不到=''
+  reason: string; // the raw stateReason (COMPLETED / NOT_PLANNED / DUPLICATE / ''); '' when it could not be read
 }
 export async function issueStates(issues: CreatedIssue[], owner: string = DEFAULT_OWNER): Promise<IssueStateRow[]> {
   const out: IssueStateRow[] = [];
@@ -189,7 +197,7 @@ export async function issueStates(issues: CreatedIssue[], owner: string = DEFAUL
         if (j.state === 'OPEN' || j.state === 'CLOSED') state = j.state;
         if (typeof j.stateReason === 'string') reason = j.stateReason;
       } catch {
-        /* 坏 JSON → 维持 UNKNOWN */
+        /* malformed JSON -> it stays UNKNOWN */
       }
     }
     out.push({ repo: it.repo, number: it.number, state, reason });
@@ -197,8 +205,10 @@ export async function issueStates(issues: CreatedIssue[], owner: string = DEFAUL
   return out;
 }
 
-// 查一个 PR 是否真的合并了（confirm-merge 不可逆清理前核验；取不到绝不当已合并）。
-// 直接喂 PR URL 给 gh（无需拆 owner/repo）。state===MERGED 或有 mergedAt 即视为已合并。
+// Check whether a PR really was merged (the verification before confirm-merge's irreversible cleanup; an
+// answer that cannot be obtained is never treated as merged).
+// The PR's URL goes straight to gh, with no need to split out owner/repo. state===MERGED, or a mergedAt being
+// present, counts as merged.
 export async function prMergeState(prUrl: string): Promise<{ ok: boolean; merged: boolean; state: string; error?: string }> {
   const r = await run('gh', ['pr', 'view', prUrl, '--json', 'state,mergedAt'], { timeoutMs: 60000 });
   if (r.code !== 0 || r.timedOut) return { ok: false, merged: false, state: 'UNKNOWN', error: r.stderr.slice(0, 300) || `exit ${r.code}` };
@@ -206,32 +216,36 @@ export async function prMergeState(prUrl: string): Promise<{ ok: boolean; merged
     const j = JSON.parse(r.stdout || '{}') as { state?: string; mergedAt?: string | null };
     return { ok: true, merged: j.state === 'MERGED' || !!j.mergedAt, state: j.state ?? 'UNKNOWN' };
   } catch {
-    return { ok: false, merged: false, state: 'UNKNOWN', error: 'gh pr view --json 解析失败' };
+    return { ok: false, merged: false, state: 'UNKNOWN', error: 'gh pr view --json could not be parsed' };
   }
 }
 
-// ── 标签 ─────────────────────────────────────────────
-// 给已建 issue 追加标签（size:* 等）。size 标签四仓已由 sync-labels 预置，直接 add。
+// ── Labels ─────────────────────────────────────────────
+// Add a label (size:*, and so on) to an issue that already exists. The size labels are pre-created in every
+// repo by sync-labels, so this just adds them.
 export async function addLabel(repo: string, num: number, label: string, owner: string = DEFAULT_OWNER): Promise<{ ok: boolean; stderr: string }> {
   const r = await run('gh', ['issue', 'edit', String(num), '-R', `${owner}/${repo}`, '--add-label', label], { timeoutMs: 60000 });
   return { ok: r.code === 0 && !r.timedOut, stderr: r.stderr };
 }
 
-// ── 交付文档自动提交（config 门控、默认关、**绝不 push**）────────────────────
-// 把目标项目里的 docs/delivery/<slug>/ 提交到**当前分支**。安全边界（与 README 顾虑对齐）：
-//  · 仅 `-- docs/delivery/<slug>` pathspec：只动该 slug 的交付文档，绝不 sweep 其它已暂存改动；
-//  · 不 git checkout/切分支——绝不扰动 gates 锚定所依赖的活 checkout；
-//  · 绝不 git push（顶层铁律）；
-//  · 幂等：无该路径变更则跳过 commit（committed:false, ok:true）。
+// ── Committing the delivery documents automatically (gated by config, off by default, and it **never
+// pushes**) ────────────────────
+// It commits the target project's docs/delivery/<slug>/ onto **the current branch**. The safety boundaries
+// (matching the concerns raised in the README):
+//  · the `-- docs/delivery/<slug>` pathspec only: it touches that slug's delivery documents and never sweeps
+//    up anything else that happens to be staged;
+//  · no git checkout and no branch switching — it never disturbs the live checkout the gates anchor to;
+//  · it never runs git push (an absolute rule);
+//  · idempotent: with no change under that path the commit is skipped (committed:false, ok:true).
 export async function commitDeliveryDocs(opts: { root: string; slug: string; refNum?: number }): Promise<{ ok: boolean; committed: boolean; stderr: string }> {
   const pathspec = `docs/delivery/${opts.slug}`;
   const C = ['-C', opts.root];
   const add = await run('git', [...C, 'add', '--', pathspec], { timeoutMs: 30000 });
   if (add.code !== 0) return { ok: false, committed: false, stderr: add.stderr.slice(0, 300) };
-  // diff --cached --quiet：exit 0=暂存区无该路径变更（跳过），1=有变更（提交）。
+  // diff --cached --quiet: exit 0 means nothing is staged under that path (skip), 1 means there is (commit).
   const diff = await run('git', [...C, 'diff', '--cached', '--quiet', '--', pathspec], { timeoutMs: 30000 });
   if (diff.code === 0) return { ok: true, committed: false, stderr: '' };
-  const msg = `docs(delivery): ${opts.refNum != null ? `REQ-${opts.refNum} ` : ''}${opts.slug} 评审/技术方案归档（forge 自动提交，未 push）`;
+  const msg = `docs(delivery): archive ${opts.refNum != null ? `REQ-${opts.refNum} ` : ''}${opts.slug}'s review and technical plan (committed automatically by forge; not pushed)`;
   const commit = await run('git', [...C, 'commit', '-m', msg, '--', pathspec], { timeoutMs: 30000 });
   if (commit.code !== 0) return { ok: false, committed: false, stderr: commit.stderr.slice(0, 300) };
   return { ok: true, committed: true, stderr: '' };

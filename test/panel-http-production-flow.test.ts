@@ -171,7 +171,7 @@ test('面板 HTTP 生产流：无权 web_actor 点 retry 不会重新点燃失�
 
   assert.equal(r.status, 400);
   assert.equal(j.ok, false);
-  assert.match(j.msg, /无重试权限/);
+  assert.match(j.msg, /may not retry/);
   assert.equal((await sessions.get('panel-retry-denied'))!.state, 'GATE_C_FAILED');
   assert.ok((await sessions.events('panel-retry-denied')).some((e) => e.kind === 'permission_denied' && (e.detail ?? '').includes('"by":"BD"')));
   assert.equal(writeCalls, 0);

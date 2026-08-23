@@ -77,7 +77,7 @@ test('addPrd：同一飞书 PRD 重复投递只复用已有 session，不重复�
   assert.equal(second.duplicate, true);
   assert.equal(second.session?.id, first.session?.id);
   assert.equal(readCalls, 1);
-  assert.match(second.msg, /已经评审过|不会被再次评审/); // 明确回复 PM「本次不再评审」
+  assert.match(second.msg, /already been reviewed|will not start another review/); // 明确回复 PM「本次不再评审」
   assert.equal((await sessions.listAll()).filter((s) => s.prd_url === 'https://x.feishu.cn/docx/ABC').length, 1);
 });
 
@@ -113,7 +113,7 @@ test('addPrd：显式 slug/branch 优先，文档读取失败不创建 session',
   const before = (await sessions.listAll()).length;
   const fail = await addPrd({ doc: ref('https://x.feishu.cn/docx/NOACCESS') });
   assert.equal(fail.ok, false);
-  assert.match(fail.msg, /读需求文档失败/);
+  assert.match(fail.msg, /could not read the requirement document/);
   assert.match(fail.msg, /文档无权限/); // 原始错因透传，不含糊
   assert.equal((await sessions.listAll()).length, before);
 });
@@ -130,7 +130,7 @@ test('addPrd：未注册的文档源直接拒收（登记进去也读不出正�
   const before = (await sessions.listAll()).length;
   const r = await addPrd({ doc: { source: 'notion', token: 'p1' } });
   assert.equal(r.ok, false);
-  assert.match(r.msg, /未注册的文档源/);
+  assert.match(r.msg, /unregistered document source/);
   assert.equal((await sessions.listAll()).length, before);
 });
 
@@ -154,7 +154,7 @@ test('addPrd：同一段文本再贴一遍 → 命中去重（内容即身份）
   const again = await addPrd({ doc });
   assert.equal(again.created, false);
   assert.equal(again.duplicate, true);
-  assert.match(again.msg, /已经评审过|不会被再次评审/);
+  assert.match(again.msg, /already been reviewed|will not start another review/);
 });
 
 test('addPrd：存量 plaintext ref 没有 raw → 如实报读不了，不建 session', async () => {
@@ -194,6 +194,6 @@ test('addPrd：竞态——读文档期间被抢跑，建库撞唯一索引 → 
   assert.equal(dup.created, false); // 没建第二条
   assert.equal(dup.duplicate, true);
   assert.equal(dup.session?.id, 'race-winner'); // 复用抢先建好的那条
-  assert.match(dup.msg, /已经评审过|不会被再次评审/);
+  assert.match(dup.msg, /already been reviewed|will not start another review/);
   assert.equal((await sessions.listAll()).filter((s) => s.doc_ref === 'feishu:COLLIDE').length, 1); // 仍只一条
 });

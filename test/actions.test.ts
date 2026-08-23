@@ -94,10 +94,10 @@ test('confirm：M 在 GATE_A_STALLED 裁决 → CONFIRMED', async () => {
 
 test('confirm：保留多轮 PM 答复历史（不覆盖，闸B 要读）', async () => {
   const id = await at('AWAITING_PM_CONFIRM');
-  await sessions.patch(id, { confirmed_notes: '[第1轮答复] Q1 恒0' });
+  await sessions.patch(id, { confirmed_notes: '[round 1 answers] Q1 恒0' });
   await actions.confirm(id, 'M', '强制通过：剩余问题线下敲定');
   const notes = (await sessions.get(id))!.confirmed_notes ?? '';
-  assert.match(notes, /第1轮答复/);
+  assert.match(notes, /\[round 1 answers\]/);
   assert.match(notes, /强制通过/);
 });
 
@@ -126,7 +126,7 @@ test('submitPmAnswers：AWAITING_PM_CONFIRM → GATE_A_REVISION_REQUESTED + 落 
   const s = (await sessions.get(id))!;
   assert.equal(s.state, 'GATE_A_REVISION_REQUESTED');
   assert.equal(s.gate_a_pending_input, 'Q1 不做过期，恒0');
-  assert.match(s.confirmed_notes ?? '', /第1轮答复/);
+  assert.match(s.confirmed_notes ?? '', /\[round 1 answers\]/);
   assert.ok((await sessions.events(id)).some((e) => e.kind === 'pm_answer'));
 });
 
@@ -181,7 +181,7 @@ test('go：外环验收不达标 → 阻止真建 issue，停在 AWAITING_GO 并
   const r = await actions.go(id, 'M');
   const s = (await sessions.get(id))!;
   assert.equal(r.ok, false);
-  assert.match(r.msg, /外环验收未达标/);
+  assert.match(r.msg, /the outer-ring acceptance is not up to standard/);
   assert.equal(s.state, 'AWAITING_GO');
   assert.equal(writeCalls.length, 0);
   assert.ok((await sessions.events(id)).some((e) => e.kind === 'acceptance_lint_blocked'));
@@ -193,7 +193,7 @@ test('go --dry-run：外环验收不达标只预警，不改变状态', async ()
   await sessions.patch(id, { gate_b_draft_path: draftPath(id, invalidGateB) });
   const r = await actions.go(id, 'M', { dryRun: true });
   assert.ok(r.ok);
-  assert.match(r.msg, /外环验收 lint 未过/);
+  assert.match(r.msg, /the outer-ring acceptance lint did not pass/);
   assert.equal((await sessions.get(id))!.state, 'AWAITING_GO');
   assert.deepEqual(writeCalls.at(-1), { slug: id, dryRun: true });
 });
@@ -232,7 +232,7 @@ test('go：未指派 DRI → 阻止真建，停在 AWAITING_GO 并留审计（�
   await sessions.patch(id, { assignee: null }); // 清掉 at() 的默认指派，模拟自动推荐失败/未指派
   const r = await actions.go(id, 'M');
   assert.equal(r.ok, false);
-  assert.match(r.msg, /未指派 DRI/);
+  assert.match(r.msg, /no DRI is assigned/);
   assert.equal((await sessions.get(id))!.state, 'AWAITING_GO');
   assert.equal(writeCalls.length, 0);
   assert.ok((await sessions.events(id)).some((e) => e.kind === 'go_blocked_no_assignee'));
@@ -261,7 +261,7 @@ test('go --assignee：非池内短码 → 挡 GO', async () => {
   const id = await at('AWAITING_GO');
   const r = await actions.go(id, 'M', { assignee: 'BD' }); // BD 不在 pool
   assert.equal(r.ok, false);
-  assert.match(r.msg, /非法指派/);
+  assert.match(r.msg, /is not a valid assignee/);
   assert.equal((await sessions.get(id))!.state, 'AWAITING_GO');
 });
 
@@ -280,14 +280,14 @@ test('assign 手动：非池内短码被拒', async () => {
   const id = await at('AWAITING_GO');
   const r = await actions.assign(id, 'M', { to: 'BD' }); // BD 不在 pool
   assert.equal(r.ok, false);
-  assert.match(r.msg, /非法指派/);
+  assert.match(r.msg, /is not a valid assignee/);
 });
 
 test('assign：无权限被拒', async () => {
   const id = await at('AWAITING_GO');
   const r = await actions.assign(id, 'CC', { to: 'DE' }); // CC 不在 go_approvers
   assert.equal(r.ok, false);
-  assert.match(r.msg, /无指派权限/);
+  assert.match(r.msg, /may not assign/);
 });
 
 test('assign --auto：全探测失败 → 清掉上一条 auto 指派，强制人工（回归）', async () => {
@@ -295,7 +295,7 @@ test('assign --auto：全探测失败 → 清掉上一条 auto 指派，强制�
   await sessions.patch(id, { assignee: 'EO', assignee_source: 'auto' }); // 模拟上一轮自动推荐 EO
   const r = await actions.assign(id, 'M', { auto: true }); // probeLoad mock=[] → pick=null
   assert.equal(r.ok, false);
-  assert.match(r.msg, /已清除上一条自动指派/);
+  assert.match(r.msg, /the previous automatic assignment has been cleared/);
   const s = (await sessions.get(id))!;
   assert.equal(s.assignee, null); // 陈旧 auto 已清，不再蒙混过 GO 闸
   assert.equal(s.assignee_source, null);
@@ -313,13 +313,13 @@ test('assign --auto：全探测失败但上一条是人工指派 → 保留不�
 
 test('confirmCommentText：PM 部分采纳 / 总监强制 / 空批注', () => {
   const partial = actions.confirmCommentText(2, { who: 'PM', verdict: 'partial', notes: 'Q3 不做过期' });
-  assert.match(partial, /【PM确认 · 第2轮】/);
-  assert.match(partial, /选择：部分采纳/);
-  assert.match(partial, /批注：Q3 不做过期/);
+  assert.match(partial, /\[Product confirmed · round 2\]/);
+  assert.match(partial, /Choice: partially accepted/);
+  assert.match(partial, /Notes: Q3 \u4e0d\u505a\u8fc7\u671f/);
   const force = actions.confirmCommentText(1, { who: 'M', verdict: 'force', notes: '' });
-  assert.match(force, /技术总监确认/);
-  assert.match(force, /强制通过/);
-  assert.match(force, /批注：（无）/);
+  assert.match(force, /Engineering lead confirmed/);
+  assert.match(force, /forced through/);
+  assert.match(force, /Notes: \(none\)/);
 });
 
 test('deny：AWAITING_GO → GO_DENIED', async () => {
