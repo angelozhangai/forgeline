@@ -1,13 +1,19 @@
-// 传输层薄缝——**provider 选择点（唯一接线处）**。
-// 核心（notify/listen/worker/actions）只 `import { port } from './messaging/index.ts'`，永不直接依赖某个具体 IM adapter。
+// Thin transport seam — **the provider selection point (single wiring point)**.
+// The core (notify/listen/worker/actions) only does `import { port } from './messaging/index.ts'` and
+// never depends on a concrete IM adapter.
 //
-// 选哪个由 `FORGE_MESSAGING_PROVIDER` 决定（缺省 feishu —— 既有部署零变化）。
-// **认不出的值一律硬抛，绝不静默回退飞书**：这条缝的头号失效模式就是「配错了但看起来在跑」——
-// 拼错成 `slak` 之后所有审批卡照发飞书，没有任何症状，直到有人发现 Slack 那边一片空白。
-// 这条规则与 ext/ 的「present but unloadable → hard error」是同一条：宁可起不来，不可假装好着。
+// Which one is chosen is decided by `FORGE_MESSAGING_PROVIDER` (defaulting to feishu, so existing
+// deployments see no change).
+// **An unrecognised value always throws; it never silently falls back to Feishu.** This seam's number
+// one failure mode is "misconfigured but apparently running" — typo it as `slak` and every approval
+// card keeps going to Feishu with no symptom at all, until someone notices Slack has been blank the
+// whole time.
+// This is the same rule as ext/'s "present but unloadable -> hard error": better to fail to start than
+// to pretend to be fine.
 //
-// 读法（设计文档 D2）：process.env 优先，其次直接读 forge.env。**故意不走 loadConfig()**——
-// 本模块被半个仓库 import，在模块加载期拖进 yaml+zod 全量校验会把启动顺序和测试都搞脆。
+// How it is read (design doc D2): process.env first, then forge.env directly. **Deliberately not via
+// loadConfig()** — half the repo imports this module, and dragging the full yaml + zod validation into
+// module-load time would make both the startup order and the tests fragile.
 import { loadEnvFile } from '../root.ts';
 import { feishuPort } from './feishu.ts';
 import { slackPort } from './slack.ts';
@@ -20,14 +26,15 @@ const PROVIDERS: Record<string, MessagingPort> = {
 
 export const DEFAULT_PROVIDER = 'feishu';
 
-// 导出供单测直接覆盖：选择逻辑本身（含"认不出就抛"）比接线结果更值得钉死。
+// Exported so unit tests can override it directly: the selection logic itself (including "throw on an
+// unknown value") is more worth pinning down than the wiring result.
 export function selectPort(id: string | undefined, providers: Record<string, MessagingPort> = PROVIDERS): MessagingPort {
   const key = (id ?? '').trim() || DEFAULT_PROVIDER;
   const chosen = providers[key];
   if (!chosen) {
     throw new Error(
-      `FORGE_MESSAGING_PROVIDER=「${key}」不是已知的 IM provider（可选：${Object.keys(providers).join(' / ')}）。` +
-        '拒绝以「静默回退到默认 provider」的形态启动——那会让配置错误完全没有症状。',
+      `FORGE_MESSAGING_PROVIDER="${key}" is not a known IM provider (available: ${Object.keys(providers).join(' / ')}). ` +
+        'Refusing to start by silently falling back to the default provider — that would leave a configuration error with no symptom at all.',
     );
   }
   return chosen;
