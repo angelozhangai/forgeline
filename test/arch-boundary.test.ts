@@ -1,13 +1,16 @@
-// 架构边界 fitness 测试（仿 ArchUnit）：核心层不得直连飞书 raw（feishu/* 目录）或 lark SDK——
-// 所有 IM 传输细节必须收敛在 messaging/feishu.ts adapter 后，核心只依赖 provider 无关的 MessagingPort。
-// 这是 README「接 Slack 核心一行不动」论断的机器守护：任何人再把 feishu/lark import 漏进核心 → CI 红。
+// An architecture-fitness test in the ArchUnit style: core code may not reach the Feishu raw layer (the
+// feishu/* directory) or the lark SDK directly. Every IM transport detail lives behind the
+// messaging/feishu.ts adapter, and the core depends only on the provider-neutral MessagingPort.
+// This is the machine guard behind the README's claim that wiring up Slack changes no core line: the moment
+// a feishu or lark import leaks back into the core, CI goes red.
 //
-// 关键：白名单按 **「文件 → 允许的 specifier」** 精确控制，而非整文件放行——否则一个文件因某一条合法
-// import 被整体放行后，未来在它里面直 import lark SDK 仍能过 CI。
+// The point: the allowlist is keyed **file -> permitted specifier**, never a whole-file pass. Otherwise a
+// file waved through for one legitimate import could later import the lark SDK directly and still be green.
 //
-// 白名单是**棘轮，只许变短**：daemon/listen.ts 那条（离线补拉直连 feishu/backfill）在 Phase 0 拿掉，
-// intake.ts 那条（直读 feishu/doc）在 Phase 1 拿掉——读文档收进 docs/feishu.ts，核心只见 DocRef。
-// 现在只剩 messaging/feishu.ts 这一个 IM adapter。
+// The allowlist is a **ratchet that may only get shorter**: daemon/listen.ts's entry (offline backfill
+// reaching straight for feishu/backfill) was removed in Phase 0, and intake.ts's (reading feishu/doc
+// directly) in Phase 1 -- reading documents moved into docs/feishu.ts, and the core only ever sees a DocRef.
+// What is left is the one IM adapter, messaging/feishu.ts.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
@@ -16,15 +19,17 @@ import { fileURLToPath } from 'node:url';
 
 const SRC = join(fileURLToPath(new URL('..', import.meta.url)), 'src');
 
-// 每个文件允许直连的飞书/lark import specifier 子串。未列出的文件：一律不许出现 feishu/ 或 larksuiteoapi。
+// The specifier substrings each file may import directly. Any file not listed here may not mention feishu/
+// or larksuiteoapi at all.
 const ALLOW: Record<string, string[]> = {
-  'messaging/feishu.ts': ['feishu/', 'larksuiteoapi'], // 飞书 adapter：lark 长连接 + feishu/* 收发渲染 + 群历史 + im 探针
-  'messaging/slack.ts': ['slack/'], // Slack adapter：slack/* 的 Web API + Socket Mode + 模态
+  'messaging/feishu.ts': ['feishu/', 'larksuiteoapi'], // the Feishu adapter: the lark long connection, feishu/* send/receive and rendering, channel history, and the IM probe
+  'messaging/slack.ts': ['slack/'], // the Slack adapter: slack/*'s Web API, Socket Mode and modals
 };
-// feishu/* 目录本就是飞书 provider 层：内部互相 import + 可用 lark SDK。
+// The feishu/* directory is the Feishu provider layer itself: its files may import each other and use the
+// lark SDK.
 function allowedFor(rel: string): string[] {
   if (rel.startsWith('feishu/')) return ['feishu/', 'larksuiteoapi'];
-  if (rel.startsWith('slack/')) return ['slack/']; // slack/* 目录本就是 Slack provider 层：内部可互相 import
+  if (rel.startsWith('slack/')) return ['slack/']; // likewise slack/* is the Slack provider layer, whose files may import each other
   return ALLOW[rel] ?? [];
 }
 
@@ -38,17 +43,22 @@ function walk(dir: string, rel = ''): string[] {
   return out;
 }
 
-// 摘出「直连飞书 raw / lark SDK」（specifier 含 'feishu/' 目录 或 'larksuiteoapi' SDK）的 import。
-// 覆盖全部导入形态——绝不只看 `from '...'`：动态 import() 在本仓真实存在（index.ts await import 'eval/*'），
-// 故 `await import('@larksuiteoapi/...')` 这类绕过必须也逮到；连同副作用 import 与 require 一并覆盖。
-//  · 静态/再导出：import X from '...' / export ... from '...'
-//  · 动态：import('...')（含 await/空白）
-//  · 副作用：import '...'（无 from）
-//  · CJS：require('...')
-// 只匹配真正的 import 字符串字面量，不误伤散落字符串（如 index.ts doctor 探测 node_modules 路径的字面量）。
-// 注意：'messaging/feishu.ts'（子串 'feishu.'，非 'feishu/'）= adapter 自身路径，不算直连。
-// provider raw 层的目录前缀：核心层一律不许直连，只能经各自的 messaging/<provider>.ts adapter。
-// feishu/ 与 lark SDK 由 feishuImports 管；slack/ 由 slackImports 管（两条对称的闸）。
+// Pull out the imports that reach the raw layer directly -- a specifier containing the 'feishu/' directory or
+// the 'larksuiteoapi' SDK.
+// Every import form is covered, never just `from '...'`: dynamic import() genuinely occurs in this repo
+// (index.ts awaits import of 'eval/*'), so a bypass like `await import('@larksuiteoapi/...')` has to be
+// caught too, along with side-effect imports and require.
+//  * static and re-export: import X from '...' / export ... from '...'
+//  * dynamic: import('...'), with or without await and whitespace
+//  * side-effect: import '...' with no from
+//  * CJS: require('...')
+// Only real import string literals match, so stray strings are not hit by mistake -- such as the
+// node_modules path index.ts's doctor probes for.
+// Note that 'messaging/feishu.ts' contains 'feishu.', not 'feishu/': that is the adapter's own path and does
+// not count as reaching the raw layer.
+// These are the directory prefixes of the provider raw layers. The core may never reach them directly, only
+// through each provider's own messaging/<provider>.ts adapter.
+// feishu/ and the lark SDK are handled by feishuImports; slack/ by slackImports -- two symmetric gates.
 const SPEC_RES = [
   /\bfrom\s*['"]([^'"]+)['"]/g, // import X from '...' / export ... from '...'
   /\bimport\s*\(\s*['"]([^'"]+)['"]/g, // dynamic import('...')
@@ -85,19 +95,20 @@ function srcFiles(): { rel: string; content: string }[] {
   return files;
 }
 
-test('架构边界：真实 src 上线闸不允许核心层直连 feishu/* 或 lark SDK', () => {
+test('architecture boundary: against the real src, the release gate refuses any core file reaching feishu/* or the lark SDK', () => {
   const offenders = boundaryOffenders(srcFiles());
   assert.deepEqual(
     offenders,
     [],
-    `这些直连飞书 raw / lark SDK 的 import 不在该文件白名单内，应改走 MessagingPort（startInbound/probe/出站卡）：\n  ${offenders.join('\n  ')}`,
+    `these imports reach the Feishu raw layer or the lark SDK and are not on that file's allowlist -- go through MessagingPort instead (startInbound / probe / outbound cards):\n  ${offenders.join('\n  ')}`,
   );
 });
 
-// Phase 0 关缝：listen 连「离线补拉」这条唯一合法豁免都不再有了。补拉循环走 messaging/backfill.ts，
-// 群历史那一次 API 往返收在 adapter 里（port.listHistorySince）。这条用例钉死缝已合上——
-// 谁再把 feishu/* 拉回 listen（哪怕是当年那条合法的 backfill），闸就红。
-test('架构边界：Phase 0 后 listen 连合法补拉都不许直连 feishu/*', () => {
+// Phase 0 closed the seam: listen no longer has even its one legitimate exemption, offline backfill. The
+// backfill loop goes through messaging/backfill.ts and the single channel-history round trip lives inside the
+// adapter (port.listHistorySince). This test pins the seam shut -- pull feishu/* back into listen, even the
+// backfill that used to be legitimate, and the gate goes red.
+test('architecture boundary: after Phase 0, listen may not reach feishu/* even for backfill', () => {
   const offenders = boundaryOffenders([
     {
       rel: 'daemon/listen.ts',
@@ -113,14 +124,16 @@ test('架构边界：Phase 0 后 listen 连合法补拉都不许直连 feishu/*'
   assert.deepEqual(offenders, ['daemon/listen.ts → ../feishu/backfill.ts', 'daemon/listen.ts → @larksuiteoapi/node-sdk']);
 });
 
-// 白名单是棘轮：加一条豁免 = 往缝里开一个洞，必须是有意的（改这个断言）而非顺手加一行。
-test('架构边界：豁免白名单只有各 IM adapter 自己（每个 provider 一条，不许有别的）', () => {
+// The allowlist is a ratchet: adding an exemption punches a hole in the seam, so it has to be deliberate --
+// changing this assertion -- rather than one more line added in passing.
+test('architecture boundary: the allowlist holds nothing but the IM adapters themselves, one per provider', () => {
   assert.deepEqual(Object.keys(ALLOW).sort(), ['messaging/feishu.ts', 'messaging/slack.ts']);
 });
 
-// ── 第三条边界（Phase 3 新增）：Slack raw 层对称守护 ─────────────────────
-// 飞书那条闸是事后补的（核心一度直连 feishu/backfill）。Slack 从第一天就上闸，
-// 免得再走一遍「先漏进去、再花一个 phase 收回来」。
+// -- The third boundary, added in Phase 3: the symmetric guard over the Slack raw layer -----------------
+// The Feishu gate was retrofitted, after the core had already been reaching feishu/backfill directly. Slack
+// gets its gate from day one, so nobody repeats the "let it leak in, then spend a phase pulling it back"
+// cycle.
 function slackImports(content: string): string[] {
   const specs = new Set<string>();
   for (const re of SPEC_RES) {
@@ -139,12 +152,12 @@ function slackOffenders(files: { rel: string; content: string }[]): string[] {
   return out;
 }
 
-test('架构边界：真实 src 里只有 messaging/slack.ts 能碰 slack/*', () => {
+test('architecture boundary: in the real src, only messaging/slack.ts may touch slack/*', () => {
   const offenders = slackOffenders(srcFiles());
-  assert.deepEqual(offenders, [], `这些直连 Slack raw 层的 import 应改走 MessagingPort：\n  ${offenders.join('\n  ')}`);
+  assert.deepEqual(offenders, [], `these imports reach the Slack raw layer and should go through MessagingPort:\n  ${offenders.join('\n  ')}`);
 });
 
-test('架构边界：核心层直连 slack/web 或 slack/socket 会被逮；adapter 自己放行', () => {
+test('architecture boundary: a core file reaching slack/web or slack/socket is caught, while the adapter itself passes', () => {
   assert.deepEqual(
     slackOffenders([
       { rel: 'daemon/listen.ts', content: `import { slackApi } from '../slack/web.ts';` },
@@ -156,7 +169,7 @@ test('架构边界：核心层直连 slack/web 或 slack/socket 会被逮；adap
   );
 });
 
-test('架构边界：核心层用副作用 import 或 require 偷接 lark SDK 时发布闸必须红', () => {
+test('architecture boundary: sneaking the lark SDK into a core file through a side-effect import or require turns the release gate red', () => {
   const offenders = boundaryOffenders([
     { rel: 'orchestrator/worker.ts', content: `import '@larksuiteoapi/node-sdk';` },
     { rel: 'notify.ts', content: `const lark = require('@larksuiteoapi/node-sdk');` },
@@ -167,8 +180,9 @@ test('架构边界：核心层用副作用 import 或 require 偷接 lark SDK �
   ]);
 });
 
-// Phase 1 关缝：intake 连「读飞书文档」这条豁免也没了——读文档走 docs 注册表（DocSource.read）。
-test('架构边界：Phase 1 后 intake 连读飞书文档都不许直连 feishu/*', () => {
+// Phase 1 closed the seam: intake lost its exemption for reading Feishu documents too -- reading goes
+// through the docs registry (DocSource.read).
+test('architecture boundary: after Phase 1, intake may not reach feishu/* even to read a document', () => {
   const offenders = boundaryOffenders([
     {
       rel: 'intake.ts',
@@ -181,14 +195,16 @@ test('架构边界：Phase 1 后 intake 连读飞书文档都不许直连 feishu
   assert.deepEqual(offenders, ['intake.ts → ./feishu/doc.ts', 'intake.ts → ./feishu/dm.ts']);
 });
 
-// ── 第二条边界（Phase 1 新增）：文档源也只能经注册表用 ───────────────────
-// docs/<source>.ts 是**实现**，docs/index.ts 是**接线处**。核心一旦直接 import 某个源，
-// 「加一个源=加一行注册」就不成立了：那份直连会跟着源一起腐烂，而且绕过 fallback/去重的解析规则。
-// 例外只有两类：docs/ 目录内部（index 注册 + 源之间共用）、以及测试。
+// -- The second boundary, added in Phase 1: document sources are used only through the registry -----------
+// docs/<source>.ts is the **implementation**; docs/index.ts is where it is **wired in**. The moment the core
+// imports one source directly, "adding a source is adding one line of registration" stops being true: that
+// direct import rots along with the source, and it bypasses the fallback and deduplication rules in the
+// resolver. There are only two exceptions: inside docs/ itself (the registry, and what the sources share)
+// and the tests.
 function docSourceOffenders(files: { rel: string; content: string }[]): string[] {
   const offenders: string[] = [];
   for (const { rel, content } of files) {
-    if (rel.startsWith('docs/')) continue; // 注册表自己 + 源内部
+    if (rel.startsWith('docs/')) continue; // the registry itself, and the sources' own internals
     for (const re of SPEC_RES) {
       for (const m of content.matchAll(re)) {
         const spec = m[1];
@@ -201,12 +217,12 @@ function docSourceOffenders(files: { rel: string; content: string }[]): string[]
   return offenders;
 }
 
-test('架构边界：真实 src 里核心层只经 docs/index.ts 用文档源，不直连某个具体源', () => {
+test('architecture boundary: in the real src, core files use document sources only through docs/index.ts, never a concrete source', () => {
   const offenders = docSourceOffenders(srcFiles());
-  assert.deepEqual(offenders, [], `这些直连具体文档源的 import 应改走 docs/index.ts：\n  ${offenders.join('\n  ')}`);
+  assert.deepEqual(offenders, [], `these imports reach a concrete document source and should go through docs/index.ts:\n  ${offenders.join('\n  ')}`);
 });
 
-test('架构边界：直连 docs/feishu.ts 会被逮；走 docs/index.ts 放行', () => {
+test('architecture boundary: importing docs/feishu.ts directly is caught, while going through docs/index.ts passes', () => {
   assert.deepEqual(
     docSourceOffenders([
       { rel: 'intake.ts', content: `import { feishuDocs } from './docs/feishu.ts';` },
@@ -216,7 +232,7 @@ test('架构边界：直连 docs/feishu.ts 会被逮；走 docs/index.ts 放行'
   );
 });
 
-test('架构边界：非 import 字符串只作 doctor/文档文本时不误伤', () => {
+test('architecture boundary: strings that are not imports -- doctor probes, documentation text -- are not hit by mistake', () => {
   const offenders = boundaryOffenders([
     {
       rel: 'index.ts',

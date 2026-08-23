@@ -1,4 +1,5 @@
-// 集成：operator 从 CLI 手动跑 golden eval 的真实入口。外部 Claude 用临时 fake binary 代替，避免测试花钱。
+// Integration: the real entry point an operator uses to run the golden eval by hand from the CLI. The
+// external claude is replaced by a temporary fake binary, so the tests cost nothing.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { spawnSync } from 'node:child_process';
@@ -13,7 +14,7 @@ function evalRunCount(): number {
   return existsSync(dir) ? readdirSync(dir).filter((f) => f.endsWith('.json')).length : 0;
 }
 
-test('./forge eval --fixture 不存在：非 0 退出，且不打印付费调用提示', () => {
+test('./forge eval --fixture with a name that does not exist: a non-zero exit, and no message suggesting a paid call', () => {
   const r = spawnSync(process.execPath, ['--no-warnings', 'src/index.ts', 'eval', '--fixture', 'definitely-not-a-fixture'], {
     cwd: repo,
     env: { ...process.env, FORGE_DB: resolve(tmpdir(), `forge-eval-cli-${process.pid}.db`) },
@@ -22,10 +23,10 @@ test('./forge eval --fixture 不存在：非 0 退出，且不打印付费调用
 
   assert.equal(r.status, 1, r.stderr);
   assert.match(r.stdout, /no such fixture: definitely-not-a-fixture/);
-  assert.doesNotMatch(`${r.stdout}\n${r.stderr}`, /真实调用 claude|逐个真评审/);
+  assert.doesNotMatch(`${r.stdout}\n${r.stderr}`, /calling claude for real|reviewing each one for real/);
 });
 
-test('./forge eval 真实 CLI 链路：跨仓 fixture 缺前端 issue 会红，judge 成本/调用数/首个失败样本可见', () => {
+test('./forge eval through the real CLI: a cross-repo fixture missing its front-end issue turns red, and the judge cost, the call count and the first failing sample are all visible', () => {
   const binDir = mkdtempSync(join(tmpdir(), 'forge-fake-claude-'));
   const state = join(binDir, 'count.txt');
   const fakeClaude = join(binDir, 'claude');
@@ -41,20 +42,20 @@ process.stdin.on('data', (d) => { input += d.toString(); });
 process.stdin.on('end', () => {
   const isJudge = input.includes('Acceptance under judgment');
   const badGateB = {
-    summary: '钱包充值技术方案',
-    key_decisions: { repos: ['C', 'U'], release_order: '后端先行 -> 前端' },
-    tech_design_markdown: '## 方案\\n余额账户、支付回调、流水、钱包入口、商店充值入口。'.padEnd(260, '细'),
+    summary: 'the technical plan for topping up a wallet',
+    key_decisions: { repos: ['C', 'U'], release_order: 'the back end first, then the front end' },
+    tech_design_markdown: '## Design\\nthe balance account, the payment callback, the ledger, the wallet entry point and the top-up entry point in the shop.'.padEnd(260, '.'),
     acceptance: {
       contracts: [{ repo: 'C', surface: 'POST /api/v1/wallet/recharge {amount, idem_key} -> 200 {balance}' }],
-      scenarios: [{ id: 'AC1', repo: 'C', gherkin: 'Given 余额为0\\nWhen 充值100元成功\\nThen 余额为100且流水出现一条充值记录' }],
+      scenarios: [{ id: 'AC1', repo: 'C', gherkin: 'Given a balance of 0\\nWhen a top-up of 100 succeeds\\nThen the balance is 100 and a top-up entry appears in the ledger' }],
     },
     multi_repo: true,
-    issue_specs: [{ repo: 'C', title: 'feat(wallet): 充值后端' }, { repo: 'C', title: 'feat(wallet): 流水后端' }],
+    issue_specs: [{ repo: 'C', title: 'feat(wallet): the top-up back end' }, { repo: 'C', title: 'feat(wallet): the ledger back end' }],
     confidence: 0.8,
   };
   const goodGateB = {
     ...badGateB,
-    issue_specs: [{ repo: 'C', title: 'feat(wallet): 充值后端' }, { repo: 'U', title: 'feat(wallet): 充值入口和钱包页' }],
+    issue_specs: [{ repo: 'C', title: 'feat(wallet): the top-up back end' }, { repo: 'U', title: 'feat(wallet): the top-up entry point and the wallet page' }],
   };
   const judge = { coverage: 80, testability: 75, declarative: true, issues: [], verdict: 'good' };
   const payload = isJudge ? judge : (n === 0 ? badGateB : goodGateB);
@@ -79,7 +80,7 @@ process.stdin.on('end', () => {
   });
 
   assert.equal(r.status, 1, r.stderr);
-  assert.equal(Number(readFileSync(state, 'utf8')), 4, '1 个闸B fixture × 2 runs，且每次多 1 发 acceptance judge');
+  assert.equal(Number(readFileSync(state, 'utf8')), 4, 'one gate B fixture across two runs, each of which adds one acceptance-judge call');
   assert.match(r.stdout, /1 fixture\(s\) \(1 of them with an acceptance-judge, each costing one extra call\) x 2 run\(s\) = 4 claude calls/);
   assert.match(r.stdout, /✖ recharge-gateb/);
   assert.match(r.stdout, /\[1\/2 runs passed\]/);
@@ -87,6 +88,6 @@ process.stdin.on('end', () => {
   assert.match(r.stdout, /✔ issue_specs >= 2 \(actual 2\)/);
   assert.match(r.stdout, /✔ multi_repo=true \(actual true\)/);
   assert.match(r.stdout, /total cost \$1\.20/);
-  assert.doesNotMatch(r.stdout, /已落盘：/);
-  assert.equal(evalRunCount(), before, '--no-save 不应写 logs/eval');
+  assert.doesNotMatch(r.stdout, /written to disk:/);
+  assert.equal(evalRunCount(), before, '--no-save should write nothing into logs/eval');
 });

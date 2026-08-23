@@ -1,8 +1,10 @@
-// workspace.ts 是「调目标项目脚本、不重写」的类型化封装层——它的真实逻辑是**命令构造 + 输出解析**：
-// 参数拼装(flag/commonFlags)、parseIssues 去重/多仓抽取、issueStates/listEpicChildren 的 JSON 解析与
-// UNKNOWN 兜底。这些靠 mock proc.run 捕获 (bin,args,opts) 直接断言，不真 shell-out。
-// （飞书文档那几支已迁到 src/docs/feishu.ts，用例随之搬到 docs-feishu.test.ts。）
-// （commitDeliveryDocs 另有 commit-delivery-docs.test.ts 覆盖，此处不重复。）
+// workspace.ts is the typed wrapper that calls the target project's scripts rather than reimplementing them,
+// so the logic it really owns is **building the command and parsing the output**: assembling the flags
+// (flag / commonFlags), parseIssues deduplicating and pulling out several repos, and the JSON parsing plus
+// UNKNOWN fallback in issueStates / listEpicChildren. proc.run is mocked to capture (bin, args, opts) and
+// asserted on directly -- nothing shells out.
+// (The Feishu document calls moved to src/docs/feishu.ts, and their tests moved to docs-feishu.test.ts.)
+// (commitDeliveryDocs has its own commit-delivery-docs.test.ts and is not repeated here.)
 process.env.FORGE_DB = ':memory:';
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
@@ -31,39 +33,39 @@ function reset(r?: (bin: string, args: string[]) => RunResult): void {
   responder = r ?? (() => ({ code: 0, stdout: '', stderr: '', timedOut: false }));
 }
 const last = (): Call => calls[calls.length - 1];
-// 取 flag 的值（--name value 形式）；不存在返回 undefined。
+// Read a flag's value from the `--name value` form; undefined when it is absent.
 const valOf = (args: string[], name: string): string | undefined => {
   const i = args.indexOf(name);
   return i >= 0 ? args[i + 1] : undefined;
 };
 
-// ── 参数构造 + flag 省略 + scriptsDir 路由 ───────────────────────────────────
-test('reviewReqScaffold：scaffold 参数构造，空/null flag 省略，force/dryRun 追加，scriptsDir 路由', async () => {
+// -- Building the arguments, omitting flags, and routing through scriptsDir ------------------
+test('reviewReqScaffold: builds the scaffold arguments, omits empty and null flags, appends force and dryRun, and routes through scriptsDir', async () => {
   reset();
   await ws.reviewReqScaffold({ slug: 's1', prd: 'P', repos: 'C,U', issues: '', owner: null, title: 'T', force: true, dryRun: true, scriptsDir: '/sd' });
   const c = last();
   assert.equal(c.bin, 'bash');
-  assert.equal(c.args[0], '/sd/review-req.sh'); // scriptsDir 路由 + 脚本名
+  assert.equal(c.args[0], '/sd/review-req.sh'); // routed through scriptsDir, with the script's own name
   const rest = c.args.slice(1);
   assert.deepEqual(rest.slice(0, 2), ['scaffold', 's1']);
   assert.equal(valOf(rest, '--prd'), 'P');
   assert.equal(valOf(rest, '--repos'), 'C,U');
   assert.equal(valOf(rest, '--title'), 'T');
-  assert.ok(!rest.includes('--issues'), 'issues 空串应被省略');
-  assert.ok(!rest.includes('--owner'), 'owner null 应被省略');
+  assert.ok(!rest.includes('--issues'), 'an empty issues string should be omitted');
+  assert.ok(!rest.includes('--owner'), 'a null owner should be omitted');
   assert.ok(rest.includes('--force') && rest.includes('--dry-run'));
 });
 
-test('reviewReqScaffold：缺 scriptsDir → 回退默认项目 SCRIPTS_DIR（脚本名仍对）', async () => {
+test('reviewReqScaffold: with no scriptsDir it falls back to the default project\'s SCRIPTS_DIR, and the script name is still right', async () => {
   reset();
   await ws.reviewReqScaffold({ slug: 's' });
   assert.match(last().args[0], /[/\\]review-req\.sh$/);
-  assert.ok(last().args[0].includes('/'), '是解析后的绝对路径');
+  assert.ok(last().args[0].includes('/'), 'it is a resolved absolute path');
   const rest = last().args.slice(1);
-  assert.ok(!rest.includes('--force') && !rest.includes('--dry-run')); // 缺省不追加
+  assert.ok(!rest.includes('--force') && !rest.includes('--dry-run')); // neither is appended by default
 });
 
-test('techDesignScaffold：走 tech-design.sh（与 reviewReq 同构，仅脚本名不同）', async () => {
+test('techDesignScaffold: goes through tech-design.sh (the same shape as reviewReq, only the script name differs)', async () => {
   reset();
   await ws.techDesignScaffold({ slug: 's', dryRun: true, scriptsDir: '/sd' });
   assert.equal(last().args[0], '/sd/tech-design.sh');
@@ -71,7 +73,7 @@ test('techDesignScaffold：走 tech-design.sh（与 reviewReq 同构，仅脚本
   assert.ok(last().args.includes('--dry-run'));
 });
 
-test('techDesignApprove：approve <slug> + --issue + --rollup；rollup=false/issue 空则省略', async () => {
+test('techDesignApprove: approve <slug> with --issue and --rollup; rollup=false or an empty issue omits them', async () => {
   reset();
   await ws.techDesignApprove('sl', '42', true, '/sd');
   let rest = last().args.slice(1);
@@ -82,11 +84,11 @@ test('techDesignApprove：approve <slug> + --issue + --rollup；rollup=false/iss
   reset();
   await ws.techDesignApprove('sl');
   rest = last().args.slice(1);
-  assert.ok(!rest.includes('--rollup'), 'rollup=false 不加 --rollup');
-  assert.ok(!rest.includes('--issue'), 'issue 空省略');
+  assert.ok(!rest.includes('--rollup'), 'rollup=false does not add --rollup');
+  assert.ok(!rest.includes('--issue'), 'an empty issue is omitted');
 });
 
-test('publishTechDesign：<slug> --base + dryRun，走 publish-tech-design.sh', async () => {
+test('publishTechDesign: <slug> with --base and dryRun, through publish-tech-design.sh', async () => {
   reset();
   await ws.publishTechDesign('sl', { base: 'main', dryRun: true, scriptsDir: '/sd' });
   assert.match(last().args[0], /publish-tech-design\.sh$/);
@@ -96,29 +98,29 @@ test('publishTechDesign：<slug> --base + dryRun，走 publish-tech-design.sh', 
   assert.ok(rest.includes('--dry-run'));
 });
 
-// ── commonFlags + parseIssues ────────────────────────────────────────────────
-test('newReqSingle：single <repo> --title + commonFlags(status 数字→串, 省略 null) + 解析建好的 issue', async () => {
-  reset(() => ({ code: 0, stdout: '已建 https://github.com/your-org/demo/issues/12\n', stderr: '', timedOut: false }));
-  const r = await ws.newReqSingle('demo', '标题', { type: 'feature', prio: null, status: 31, assignee: 'az', scriptsDir: '/sd' });
+// -- commonFlags and parseIssues ---------------------------------------------
+test('newReqSingle: single <repo> --title plus commonFlags (a numeric status becomes a string, nulls are omitted), and the created issue is parsed out', async () => {
+  reset(() => ({ code: 0, stdout: 'created https://github.com/your-org/demo/issues/12\n', stderr: '', timedOut: false }));
+  const r = await ws.newReqSingle('demo', 'a title', { type: 'feature', prio: null, status: 31, assignee: 'az', scriptsDir: '/sd' });
   const rest = last().args.slice(1);
   assert.deepEqual(rest.slice(0, 2), ['single', 'demo']);
-  assert.equal(valOf(rest, '--title'), '标题');
+  assert.equal(valOf(rest, '--title'), 'a title');
   assert.equal(valOf(rest, '--type'), 'feature');
-  assert.equal(valOf(rest, '--status'), '31', 'status 数字转字符串');
+  assert.equal(valOf(rest, '--status'), '31', 'a numeric status is turned into a string');
   assert.equal(valOf(rest, '--assignee'), 'az');
-  assert.ok(!rest.includes('--prio'), 'prio null 省略');
+  assert.ok(!rest.includes('--prio'), 'a null prio is omitted');
   assert.deepEqual(r.issues, [{ repo: 'demo', number: 12, url: 'https://github.com/your-org/demo/issues/12' }]);
 });
 
-test('newReqEpic：epic <slug> + 每个 child 一个 --child repo:title；parseIssues 去重 + 仅抓 your-org 多仓', async () => {
+test('newReqEpic: epic <slug> with one --child repo:title per child; parseIssues deduplicates and picks up only the your-org repos', async () => {
   const stdout = [
     'https://github.com/your-org/demo/issues/1',
-    'https://github.com/your-org/demo/issues/1', // 重复 → 去重
+    'https://github.com/your-org/demo/issues/1', // a repeat -> deduplicated
     'https://github.com/your-org/example-admin/issues/9',
-    'https://github.com/other/repo/issues/5', // 非 your-org owner → 不抓
+    'https://github.com/other/repo/issues/5', // a different owner -> not picked up
   ].join('\n');
   reset(() => ({ code: 0, stdout, stderr: '', timedOut: false }));
-  const r = await ws.newReqEpic('ep', 'Epic 标题', [{ repo: 'C', title: 'a' }, { repo: 'U', title: 'b' }], {});
+  const r = await ws.newReqEpic('ep', 'an Epic title', [{ repo: 'C', title: 'a' }, { repo: 'U', title: 'b' }], {});
   const rest = last().args.slice(1);
   assert.deepEqual(rest.slice(0, 2), ['epic', 'ep']);
   const childVals: string[] = [];
@@ -130,8 +132,8 @@ test('newReqEpic：epic <slug> + 每个 child 一个 --child repo:title；parseI
   ]);
 });
 
-// ── gh 包装：addLabel / listEpicChildren / issueStates ────────────────────────
-test('addLabel：gh issue edit <n> -R your-org/<repo> --add-label；失败 → ok:false + stderr', async () => {
+// -- The gh wrappers: addLabel / listEpicChildren / issueStates ---------------------
+test('addLabel: gh issue edit <n> -R your-org/<repo> --add-label; a failure gives ok:false with the stderr', async () => {
   reset(() => ({ code: 0, stdout: '', stderr: '', timedOut: false }));
   let r = await ws.addLabel('demo', 7, 'size:M');
   assert.equal(last().bin, 'gh');
@@ -144,7 +146,7 @@ test('addLabel：gh issue edit <n> -R your-org/<repo> --add-label；失败 → o
   assert.equal(r.stderr, 'boom');
 });
 
-test('listEpicChildren：gh --json 解析为 issues（按 epic:<slug> 标签查）；坏 JSON → ok:false', async () => {
+test('listEpicChildren: gh --json is parsed into issues, queried by the epic:<slug> label; bad JSON gives ok:false', async () => {
   reset(() => ({ code: 0, stdout: '[{"number":3,"url":"https://github.com/your-org/demo/issues/3"}]', stderr: '', timedOut: false }));
   let r = await ws.listEpicChildren('demo', 'ep');
   assert.equal(r.ok, true);
@@ -154,29 +156,30 @@ test('listEpicChildren：gh --json 解析为 issues（按 epic:<slug> 标签查�
 
   reset(() => ({ code: 0, stdout: 'not json', stderr: '', timedOut: false }));
   r = await ws.listEpicChildren('demo', 'ep');
-  assert.equal(r.ok, false, '坏 JSON 不当成空成功，明确 ok:false');
+  assert.equal(r.ok, false, 'bad JSON is never an empty success -- it is an explicit ok:false');
 });
 
-test('issueStates：映射 state/reason；坏 JSON / 非零 → UNKNOWN + reason 空（取不到绝不当已合并）', async () => {
+test('issueStates: maps state and reason; bad JSON or a non-zero exit gives UNKNOWN with an empty reason (unreadable is never treated as merged)', async () => {
   let i = 0;
   reset(() => {
     i++;
     if (i === 1) return { code: 0, stdout: '{"state":"CLOSED","stateReason":"COMPLETED"}', stderr: '', timedOut: false };
-    return { code: 0, stdout: 'broken', stderr: '', timedOut: false }; // 第二条坏 JSON
+    return { code: 0, stdout: 'broken', stderr: '', timedOut: false }; // the second one is bad JSON
   });
   const rows = await ws.issueStates([{ repo: 'demo', number: 1, url: 'u' }, { repo: 'demo', number: 2, url: 'u' }]);
   assert.deepEqual(rows[0], { repo: 'demo', number: 1, state: 'CLOSED', reason: 'COMPLETED' });
   assert.deepEqual(rows[1], { repo: 'demo', number: 2, state: 'UNKNOWN', reason: '' });
 
-  reset(() => ({ code: 1, stdout: '', stderr: 'x', timedOut: false })); // gh 非零
+  reset(() => ({ code: 1, stdout: '', stderr: 'x', timedOut: false })); // gh exits non-zero
   const r2 = await ws.issueStates([{ repo: 'c', number: 9, url: 'u' }]);
   assert.equal(r2[0].state, 'UNKNOWN');
   assert.equal(r2[0].reason, '');
 });
 
-// ── owner 配置化（非默认项目，如 your-monorepo 在别的 GitHub org）────────────────
-test('owner 贯穿：newReqEpic/addLabel/listEpicChildren 按传入 owner 解析，不再写死 your-org', async () => {
-  // parseIssues 用传入 owner 的正则：只抓该 org，your-org 反而被排除。
+// -- The owner is configurable, for a non-default project whose repo lives in another GitHub org ----------
+test('the owner is threaded through: newReqEpic, addLabel and listEpicChildren all resolve against the owner passed in, with your-org no longer hard-coded', async () => {
+  // parseIssues builds its pattern from the owner passed in: only that org is picked up, and your-org is the
+  // one excluded.
   const stdout = ['https://github.com/acme/your-monorepo/issues/7', 'https://github.com/your-org/demo/issues/1'].join('\n');
   reset(() => ({ code: 0, stdout, stderr: '', timedOut: false }));
   const r = await ws.newReqEpic('ep', 'T', [{ repo: 'C', title: 'a' }], { owner: 'acme' });

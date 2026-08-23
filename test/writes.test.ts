@@ -1,30 +1,35 @@
-// 单测：doWrites 写需求节点幂等（P1-D）+ 失败不静默（approve/label/子 issue 部分失败 → 抛 WRITE_FAILED）。
+// Unit tests: doWrites is idempotent when it writes the requirement node (P1-D), and it never fails
+// silently -- a failed approve, a failed label, or a partly created set of sub-issues all throw and park as
+// WRITE_FAILED.
 import { test, mock, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 
-// workspace 建 issue/标签/放行：计数 + 可注入失败（与真实 bash() wrapper 一致：返回 {ok:false} 而非 throw）。
+// workspace creating issues, labels and the release: counted, with injectable failures that behave like the
+// real bash() wrapper -- it returns {ok:false} rather than throwing.
 let singleCalls = 0;
 let epicCalls = 0;
 let approveCalls = 0;
 let labelCalls = 0;
 let approveOk = true;
 let labelOk = true;
-let epicMissChild = false; // true → epic 输出缺一个子 issue 标记（模拟子 issue 建失败 continue）
-let epicChildrenByRepo: Record<string, { number: number; url: string }[]> = {}; // listEpicChildren 按仓返回（模拟人工 add-child 补建）
+let epicMissChild = false; // true -> the epic output is missing one sub-issue marker (simulating a child that failed to create and was skipped)
+let epicChildrenByRepo: Record<string, { number: number; url: string }[]> = {}; // what listEpicChildren returns per repo (simulating a child added by hand afterwards)
 let listChildrenCalls = 0;
-let lastSingleAssignee: string | null | undefined; // 捕获传给建 issue 的 assignee（验证会话 DRI 覆盖）
+let lastSingleAssignee: string | null | undefined; // captures the assignee passed when creating the issue (to check the session DRI override)
 let lastEpicAssignee: string | null | undefined;
-let publishCalls = 0; // F3：技术方案发布主仓（须在建 issue 之前）
+let publishCalls = 0; // F3: publishing the tech design to the main repo, which has to happen before any issue is created
 let lastPublishDryRun: boolean | undefined;
 let publishFail = false;
-const callOrder: string[] = []; // 断言 publish → newReq 顺序
+const callOrder: string[] = []; // to assert the publish -> newReq order
 
-// 真实 new-req.sh epic 输出：子 issue 只打印 `✓ C#n`（无完整 URL），仅 Epic 打印完整 URL。
+// What new-req.sh really prints for an epic: each sub-issue is only `✓ C#n` with no full URL, and only the
+// Epic gets one. The heading is reproduced as an escape because the target project's script prints it in its
+// own language -- this repo's source is English, but the output it parses is data.
 function epicStdout(): string {
-  const lines = ['═══ Epic ═══', '  ✓ Epic P#10', '  ── 子 issue ──', '    ✓ C#11  c'];
+  const lines = ['═══ Epic ═══', '  ✓ Epic P#10', '  ── \u5b50 issue ──', '    ✓ C#11  c'];
   if (!epicMissChild) lines.push('    ✓ U#12  u');
   lines.push('  → Epic: https://github.com/your-org/example-project/issues/10');
   return lines.join('\n');
@@ -49,16 +54,16 @@ mock.module('../src/workspace.ts', {
       epicCalls++;
       lastEpicAssignee = o.assignee;
       callOrder.push('epic');
-      // 真实 wrapper 的 issues 来自 parseIssues(stdout) → 只含 Epic（子 issue 无 URL）。
+      // The real wrapper's issues come from parseIssues(stdout), so they cover the Epic only (the children have no URL).
       return { ok: true, stdout: epicStdout(), stderr: '', issues: [{ repo: 'example-project', number: 10, url: 'https://github.com/your-org/example-project/issues/10' }] };
     },
     techDesignApprove: async () => {
       approveCalls++;
-      return { ok: approveOk, stdout: '', stderr: approveOk ? '' : 'approve 非零退出' };
+      return { ok: approveOk, stdout: '', stderr: approveOk ? '' : 'approve exited non-zero' };
     },
     addLabel: async () => {
       labelCalls++;
-      return { ok: labelOk, stderr: labelOk ? '' : 'label 没同步' };
+      return { ok: labelOk, stderr: labelOk ? '' : 'the label did not sync' };
     },
     listEpicChildren: async (repo: string) => {
       listChildrenCalls++;
@@ -76,7 +81,7 @@ function draft(env: unknown): string {
   writeFileSync(p, JSON.stringify(env));
   return p;
 }
-// biome-ignore lint/suspicious/noExplicitAny: 测试夹具，故意用 any 造任意形状的部分 session
+// biome-ignore lint/suspicious/noExplicitAny: a test fixture -- any is deliberate, to build partial sessions of any shape
 function sess(over: Record<string, unknown>): any {
   return { id: 'x', ref_num: 1, slug: 'feat-x', title: 'T', prd_url: null, size: 'M', created_issues: null, ...over };
 }
@@ -90,43 +95,44 @@ beforeEach(() => {
   publishCalls = 0; lastPublishDryRun = undefined; publishFail = false; callOrder.length = 0;
 });
 
-// ── F3：技术方案先发布主仓，再建 issue ──
-test('publish 在建 issue 之前（真跑）', async () => {
+// -- F3: publish the tech design to the main repo first, then create the issues --
+test('publish happens before any issue is created (a real run)', async () => {
   await doWrites(sess({ gate_b_draft_path: draft(SINGLE) }));
   assert.equal(publishCalls, 1);
-  assert.deepEqual(callOrder, ['publish', 'single']); // 先发布、后建
-  assert.equal(lastPublishDryRun, undefined); // 真跑非 dry
+  assert.deepEqual(callOrder, ['publish', 'single']); // publish first, create second
+  assert.equal(lastPublishDryRun, undefined); // a real run, not a dry one
 });
 
-test('publish 失败 → 抛 WRITE_FAILED，绝不建 issue', async () => {
+test('a failed publish throws and parks as WRITE_FAILED, and no issue is ever created', async () => {
   publishFail = true;
   await assert.rejects(() => doWrites(sess({ gate_b_draft_path: draft(SINGLE) })), /publishing the technical plan to the main repo failed/);
-  assert.equal(singleCalls, 0); // 发布没成，不建 issue
+  assert.equal(singleCalls, 0); // the publish did not land, so nothing is created
 });
 
-test('dryRun → publish 走 --dry-run（不真发）', async () => {
+test('dryRun makes publish pass --dry-run, so nothing is really published', async () => {
   await doWrites(sess({ gate_b_draft_path: draft(SINGLE) }), { dryRun: true });
   assert.equal(lastPublishDryRun, true);
 });
 
-// ── 会话 DRI 覆盖（指派层 → issue assignee；短码经 resolveLogin 解析）──
-test('会话 assignee 覆盖单仓 issue 的 assignee（短码→login）', async () => {
+// -- The session DRI override: the assignment layer sets the issue assignee, with short codes resolved
+// through resolveLogin --
+test('the session assignee overrides a single-repo issue\'s assignee (short code -> login)', async () => {
   await doWrites(sess({ assignee: 'DE', gate_b_draft_path: draft(SINGLE) }));
-  assert.equal(lastSingleAssignee, 'dave-eng'); // DE → login
+  assert.equal(lastSingleAssignee, 'dave-eng'); // DE -> the login
 });
 
-test('会话 assignee 覆盖 Epic 的 DRI（盖过 issue_spec.assignee）', async () => {
+test('the session assignee overrides the Epic\'s DRI, beating issue_spec.assignee', async () => {
   await doWrites(sess({ assignee: 'CC', gate_b_draft_path: draft({ ...MULTI, issue_specs: [{ repo: 'C', title: 'c', assignee: 'EO' }, { repo: 'U', title: 'u' }] }) }));
-  assert.equal(lastEpicAssignee, 'carol-codes'); // 会话 CC 盖过 spec 的 EO
+  assert.equal(lastEpicAssignee, 'carol-codes'); // the session's CC beats the spec's EO
 });
 
-test('无会话 assignee → 回退 issue_spec.assignee（不破坏既有行为）', async () => {
+test('with no session assignee it falls back to issue_spec.assignee (the existing behaviour is untouched)', async () => {
   await doWrites(sess({ gate_b_draft_path: draft({ issue_specs: [{ repo: 'A', title: 't', assignee: 'bob-dev' }], multi_repo: false }) }));
   assert.equal(lastSingleAssignee, 'bob-dev');
 });
 
-// ── 幂等（P1-D）──
-test('single 仓·首次：建 issue 一次 + onCreated 落库 + 跑 labels/approve', async () => {
+// -- Idempotence (P1-D) --
+test('a single repo, first time: one issue created, onCreated persists it, and labels and approve both run', async () => {
   const created: unknown[] = [];
   const r = await doWrites(sess({ gate_b_draft_path: draft(SINGLE) }), { onCreated: (iss) => created.push(...iss) });
   assert.equal(singleCalls, 1);
@@ -135,7 +141,7 @@ test('single 仓·首次：建 issue 一次 + onCreated 落库 + 跑 labels/appr
   assert.equal(created.length, 1);
 });
 
-test('single 仓·retry（created_issues 已有）：跳过重建，仅补跑 labels/approve', async () => {
+test('a single repo, on retry (created_issues already populated): skip the creation and only re-run labels and approve', async () => {
   const _r = await doWrites(sess({
     gate_b_draft_path: draft(SINGLE),
     created_issues: JSON.stringify([{ repo: 'example-admin', number: 1, url: 'http://x/1' }]),
@@ -145,11 +151,11 @@ test('single 仓·retry（created_issues 已有）：跳过重建，仅补跑 la
   assert.equal(labelCalls, 1);
 });
 
-test('多仓·首次建 Epic 一次 + 落 Epic+子 issue；retry 跳过重建', async () => {
+test('several repos, first time: one Epic created, with the Epic and its children persisted; a retry skips the creation', async () => {
   const created: CreatedIssueT[] = [];
   await doWrites(sess({ gate_b_draft_path: draft(MULTI) }), { onCreated: (iss) => created.push(...iss) });
   assert.equal(epicCalls, 1);
-  assert.equal(created.length, 3); // Epic + 2 子 issue（从 ✓ C#/U# 解析）
+  assert.equal(created.length, 3); // the Epic plus 2 children, parsed out of the ✓ C#/U# markers
   assert.deepEqual(created.map((c) => c.repo).sort(), ['demo', 'example-project', 'example-web']);
 
   epicCalls = 0;
@@ -161,7 +167,7 @@ test('多仓·首次建 Epic 一次 + 落 Epic+子 issue；retry 跳过重建', 
   assert.equal(r.issues.length, 3);
 });
 
-test('dryRun：永远完整预演（即便 created_issues 有值也不当 retry 跳过）', async () => {
+test('dryRun always rehearses the whole thing -- even with created_issues populated it is not treated as a retry to skip', async () => {
   await doWrites(sess({
     gate_b_draft_path: draft(SINGLE),
     created_issues: JSON.stringify([{ repo: 'example-admin', number: 1, url: 'http://x/1' }]),
@@ -170,60 +176,62 @@ test('dryRun：永远完整预演（即便 created_issues 有值也不当 retry 
   assert.equal(approveCalls, 0);
 });
 
-// ── 失败不静默（复审 finding 1/2/3）──
-test('finding1：approve 非零退出（{ok:false} 不 throw）→ doWrites 抛 → WRITE_FAILED；onCreated 已落库', async () => {
+// -- Failures are never silent (findings 1, 2 and 3 from the review) --
+test('finding 1: approve exits non-zero (returning {ok:false} rather than throwing) -> doWrites throws -> WRITE_FAILED, with onCreated already persisted', async () => {
   approveOk = false;
   const created: unknown[] = [];
   await assert.rejects(() => doWrites(sess({ gate_b_draft_path: draft(SINGLE) }), { onCreated: (iss) => created.push(...iss) }), /approve/);
   assert.equal(singleCalls, 1);
-  assert.equal(created.length, 1); // 抛前已落库 → retry 不重建
+  assert.equal(created.length, 1); // persisted before the throw, so a retry does not create it again
 });
 
-test('finding2：多仓子 issue 部分创建失败（脚本退 0）→ 覆盖校验抛；已建出的留 created_issues', async () => {
-  epicMissChild = true; // U 没建出
+test('finding 2: some children fail to create while the script still exits 0 -> the coverage check throws, and whatever was created stays in created_issues', async () => {
+  epicMissChild = true; // U was never created
   const created: CreatedIssueT[] = [];
   await assert.rejects(
     () => doWrites(sess({ gate_b_draft_path: draft(MULTI) }), { onCreated: (iss) => { created.length = 0; created.push(...iss); } }),
     /sub-issues are missing/,
   );
-  assert.equal(listChildrenCalls, 0); // fresh 路径不查 GitHub（靠 stdout 标记），直接挡
-  assert.equal(approveCalls, 0); // 缺子 issue 不放行 status:3
-  assert.deepEqual(created.map((c) => c.repo).sort(), ['demo', 'example-project']); // Epic + C 已落库（U 缺）
+  assert.equal(listChildrenCalls, 0); // the fresh path does not query GitHub -- it goes by the stdout markers and blocks straight away
+  assert.equal(approveCalls, 0); // a missing child means status:3 is not released
+  assert.deepEqual(created.map((c) => c.repo).sort(), ['demo', 'example-project']); // the Epic and C persisted; U is missing
 });
 
-test('finding3：size 标签打失败 → 抛 → WRITE_FAILED（不静默漏 weekly-load 口径），不 approve', async () => {
+test('finding 3: a failed size label throws and parks as WRITE_FAILED (never silently skewing the weekly-load numbers), and does not approve', async () => {
   labelOk = false;
   await assert.rejects(() => doWrites(sess({ gate_b_draft_path: draft(SINGLE) }), {}), /size label\(s\) failed/);
-  assert.equal(approveCalls, 0); // label 失败先于 approve，不放行
+  assert.equal(approveCalls, 0); // the label fails before approve, so nothing is released
 });
 
-// ── 复审 finding：resume 路径也校验多仓覆盖（堵「首次挡住、重跑从侧门进 DONE」）──
-test('多仓 retry：created_issues 仍缺子仓且 GitHub 也没补 → 仍抛 WRITE_FAILED，不 approve', async () => {
-  // 上一轮部分失败留下 Epic + C；U 缺。GitHub 查 example-web 也没有（人工没补）。
+// -- A review finding: the resume path checks multi-repo coverage too, closing the "blocked the first time,
+// slipped into DONE on the re-run" side door --
+test('several repos, on retry: created_issues is still missing a repo and GitHub has not filled it in -> still throws WRITE_FAILED, and does not approve', async () => {
+  // The previous round failed partway and left the Epic plus C, with U missing. Querying GitHub for
+  // example-web finds nothing either -- nobody added it by hand.
   const s = sess({
     gate_b_draft_path: draft(MULTI),
     created_issues: JSON.stringify([{ repo: 'example-project', number: 10, url: 'http://x/10' }, { repo: 'demo', number: 11, url: 'http://x/11' }]),
   });
   await assert.rejects(() => doWrites(s, {}), /sub-issues are missing/);
-  assert.equal(epicCalls, 0); // 不重建
-  assert.equal(listChildrenCalls, 1); // 尝试从 GitHub 重新发现缺仓
-  assert.equal(approveCalls, 0); // 缺子 issue 不放行 status:3
+  assert.equal(epicCalls, 0); // nothing is created again
+  assert.equal(listChildrenCalls, 1); // it does try to rediscover the missing repo from GitHub
+  assert.equal(approveCalls, 0); // a missing child means status:3 is not released
 });
 
-test('多仓 retry：人工 add-child 补建后 → 按 epic 标签重新发现、刷新 created_issues → approve→DONE', async () => {
-  epicChildrenByRepo = { 'example-web': [{ number: 12, url: 'http://x/12' }] }; // 人工已补 U
+test('several repos, on retry: once someone adds the child by hand it is rediscovered by the epic label, created_issues is refreshed, and it approves through to DONE', async () => {
+  epicChildrenByRepo = { 'example-web': [{ number: 12, url: 'http://x/12' }] }; // U was added by hand
   const created: CreatedIssueT[] = [];
   const s = sess({
     gate_b_draft_path: draft(MULTI),
     created_issues: JSON.stringify([{ repo: 'example-project', number: 10, url: 'http://x/10' }, { repo: 'demo', number: 11, url: 'http://x/11' }]),
   });
   const r = await doWrites(s, { onCreated: (iss) => { created.length = 0; created.push(...iss); } });
-  assert.equal(epicCalls, 0); // 不重建
-  assert.equal(listChildrenCalls, 1); // 查 example-web
-  assert.equal(approveCalls, 1); // 覆盖齐了 → 放行
-  assert.equal(r.issues.length, 3); // Epic + C + 补出来的 U
-  assert.deepEqual(created.map((c) => c.repo).sort(), ['demo', 'example-project', 'example-web']); // 刷新落库
+  assert.equal(epicCalls, 0); // nothing is created again
+  assert.equal(listChildrenCalls, 1); // it queries example-web
+  assert.equal(approveCalls, 1); // the coverage is complete -> released
+  assert.equal(r.issues.length, 3); // the Epic, C, and the U that was filled in
+  assert.deepEqual(created.map((c) => c.repo).sort(), ['demo', 'example-project', 'example-web']); // persisted again, refreshed
 });
 
-// 类型小助手（避免 any 散落）
+// A small type helper, so `any` does not spread through the file
 interface CreatedIssueT { repo: string; number: number; url: string }

@@ -1,10 +1,13 @@
-// Layer-1 契约漂移守卫的端到端单测：mock util/proc.ts 的 run，喂构造的 stdout，
-// 走真实 runClaude/runCodex，断言信封坍塌时返回 ok:false …_CONTRACT_DRIFT（而非旧的 ok:true 原文兜底），
-// 且合法路径（result 事件 / 反扫到 result 对象 / 正常 JSONL）不回归。
+// End-to-end unit tests for the layer-1 contract-drift guard: util/proc.ts's run is mocked and fed a
+// constructed stdout, the real runClaude and runCodex run over it, and the assertion is that a collapsed
+// envelope comes back as ok:false with a ..._CONTRACT_DRIFT error -- rather than the old ok:true that fell
+// back to the raw text -- while the legitimate paths (a result event, scanning back to a result object, and
+// ordinary JSONL) do not regress.
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 
-// mock run：由模块级变量控制本次返回的 stdout / 退出码 / 要回放给 onStdoutLine 的行。
+// The mocked run: module-level variables control the stdout, the exit code, and the lines replayed to
+// onStdoutLine for each call.
 let runStdout = '';
 let runCode: number | null = 0;
 let streamLines: string[] = [];
@@ -23,16 +26,16 @@ mock.module('../src/util/proc.ts', {
 const { runClaude } = await import('../src/llm/runClaude.ts');
 const { runCodex } = await import('../src/llm/runCodex.ts');
 
-test('runClaude：无 result 事件、反扫不到 result 对象 → CLAUDE_CONTRACT_DRIFT（停泊）', async () => {
-  streamLines = []; // 不回放任何 result 事件
+test('runClaude: no result event and no result object to scan back to -> CLAUDE_CONTRACT_DRIFT, and the session parks', async () => {
+  streamLines = []; // no result event is replayed
   runCode = 0;
-  runStdout = '{"type":"system","x":1}\n{"type":"telemetry","foo":"bar"}'; // 升级后的陌生 schema，无 result
+  runStdout = '{"type":"system","x":1}\n{"type":"telemetry","foo":"bar"}'; // an unfamiliar post-upgrade schema, carrying no result
   const r = await runClaude('hi');
   assert.equal(r.ok, false);
-  assert.ok((r.error ?? '').startsWith('CLAUDE_CONTRACT_DRIFT'), `应判契约漂移，实际：${r.error}`);
+  assert.ok((r.error ?? '').startsWith('CLAUDE_CONTRACT_DRIFT'), `this should be judged contract drift, but got: ${r.error}`);
 });
 
-test('runClaude：正常 result 事件 → ok:true（不回归）', async () => {
+test('runClaude: an ordinary result event gives ok:true (no regression)', async () => {
   const line = '{"type":"result","result":"hello","session_id":"s1","total_cost_usd":0.02}';
   streamLines = [line];
   runCode = 0;
@@ -43,8 +46,8 @@ test('runClaude：正常 result 事件 → ok:true（不回归）', async () => 
   assert.equal(r.sessionId, 's1');
 });
 
-test('runClaude：无 result 事件但反扫到 result 形状对象 → ok:true（合法框架变更，不误判漂移）', async () => {
-  streamLines = []; // result 事件没流式回放
+test('runClaude: no result event but a result-shaped object found by scanning back gives ok:true -- a legitimate framework change is not misjudged as drift', async () => {
+  streamLines = []; // the result event was never streamed back
   runCode = 0;
   runStdout = '{"type":"noise"}\n{"result":"recovered","session_id":"s2","total_cost_usd":0.01}';
   const r = await runClaude('hi');
@@ -52,27 +55,27 @@ test('runClaude：无 result 事件但反扫到 result 形状对象 → ok:true�
   assert.equal(r.result, 'recovered');
 });
 
-test('runClaude：退码非零 + is_error result（API 网络错塞进 stream-json）→ error 带上真实原因，可被判瞬时', async () => {
-  // claude CLI 把 "socket connection closed" 放进 result(is_error:true)、stderr 空、退码 1。
+test('runClaude: a non-zero exit plus an is_error result (an API network error packed into the stream-json) carries the real cause into error, so it can be judged transient', async () => {
+  // The claude CLI puts "socket connection closed" into result(is_error:true), leaves stderr empty, and exits 1.
   const line = '{"type":"result","is_error":true,"result":"API Error: The socket connection was closed unexpectedly.","session_id":"s3"}';
   streamLines = [line];
   runCode = 1;
   runStdout = line;
   const r = await runClaude('hi');
   assert.equal(r.ok, false);
-  assert.match(r.error ?? '', /socket connection was closed/); // 真实原因被并进 error（而非只剩「退出码 1」）
+  assert.match(r.error ?? '', /socket connection was closed/); // the real cause is folded into error, rather than leaving only "exit code 1"
 });
 
-test('runCodex：信封坍塌（事件全改名）→ CODEX_CONTRACT_DRIFT（停泊）', async () => {
+test('runCodex: a collapsed envelope, with every event renamed -> CODEX_CONTRACT_DRIFT, and the session parks', async () => {
   streamLines = [];
   runCode = 0;
   runStdout = ['{"type":"session.created","session_id":"x"}', '{"type":"item.done","item":{"type":"assistant_message","text":"OK"}}', '{"type":"turn.done"}'].join('\n');
   const r = await runCodex('hi');
   assert.equal(r.ok, false);
-  assert.ok((r.error ?? '').startsWith('CODEX_CONTRACT_DRIFT'), `应判契约漂移，实际：${r.error}`);
+  assert.ok((r.error ?? '').startsWith('CODEX_CONTRACT_DRIFT'), `this should be judged contract drift, but got: ${r.error}`);
 });
 
-test('runCodex：正常 JSONL → ok:true 且拿到 agent_message（不回归）', async () => {
+test('runCodex: ordinary JSONL gives ok:true with the agent_message in hand (no regression)', async () => {
   streamLines = [];
   runCode = 0;
   runStdout = [

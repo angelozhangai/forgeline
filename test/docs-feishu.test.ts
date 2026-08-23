@@ -1,7 +1,10 @@
-// 文档源——**飞书**（src/docs/feishu.ts）。两块内容：
-//  1) 命令构造 + 输出解析（feishu-doc.js 调用、剥代理 env）——迁自 workspace.test.ts，行为逐字不变；
-//  2) DocSource 契约本身：claim / parseRef / read 的分派与归一（PRD 级去重全靠 token 归一）。
-// 靠 mock proc.run 捕获 (bin,args,opts) 直接断言，不真 shell-out、不真联网。
+// The **Feishu** document source (src/docs/feishu.ts), in two parts:
+//  1) building the command and parsing the output (calling feishu-doc.js, stripping the proxy env) -- moved
+//     here from workspace.test.ts with the behaviour unchanged word for word;
+//  2) the DocSource contract itself: how claim / parseRef / read dispatch and normalise (deduplicating at
+//     the PRD level rests entirely on normalising the token).
+// proc.run is mocked to capture (bin, args, opts) and asserted on directly -- nothing shells out and nothing
+// goes over the network.
 process.env.FORGE_DB = ':memory:';
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
@@ -31,13 +34,13 @@ function reset(r?: (bin: string, args: string[]) => RunResult): void {
 }
 const last = (): Call => calls[calls.length - 1];
 
-// ── 链接识别（迁自 util/links.ts + daemon.test.ts）────────────────────────
-test('extractFeishuLinks：捞出 wiki/docx 链接', () => {
-  const t = '帮我评审下 https://example.feishu.cn/wiki/KRKfwhzDbiwncHk1QDvc2yFSnMd 谢谢';
+// -- Recognising links (moved here from util/links.ts and daemon.test.ts) ------------------
+test('extractFeishuLinks: picks wiki and docx links out of a message', () => {
+  const t = 'please review this https://example.feishu.cn/wiki/KRKfwhzDbiwncHk1QDvc2yFSnMd thanks';
   assert.deepEqual(fs.extractFeishuLinks(t), ['https://example.feishu.cn/wiki/KRKfwhzDbiwncHk1QDvc2yFSnMd']);
 });
 
-test('extractFeishuLinks：多链接 + 去重', () => {
+test('extractFeishuLinks: several links, deduplicated', () => {
   const t = 'a https://x.feishu.cn/docx/AAA b https://x.feishu.cn/docx/AAA c https://x.feishu.cn/wiki/BBB';
   const r = fs.extractFeishuLinks(t);
   assert.equal(r.length, 2);
@@ -45,109 +48,114 @@ test('extractFeishuLinks：多链接 + 去重', () => {
   assert.ok(r.includes('https://x.feishu.cn/wiki/BBB'));
 });
 
-test('extractFeishuLinks：无链接 → 空', () => {
-  assert.deepEqual(fs.extractFeishuLinks('今天天气不错'), []);
-  assert.deepEqual(fs.extractFeishuLinks('https://github.com/x/y'), []); // 非飞书不抓
+test('extractFeishuLinks: no link -> empty', () => {
+  assert.deepEqual(fs.extractFeishuLinks('nice weather today'), []);
+  assert.deepEqual(fs.extractFeishuLinks('https://github.com/x/y'), []); // anything that is not Feishu is left alone
 });
 
-// ── token / kind 解析（迁自 feishu/doc.ts + doc.test.ts）──────────────────
-test('parseFeishuDoc：/wiki/ → kind=wiki', () => {
+// -- Parsing the token and the kind (moved here from feishu/doc.ts and doc.test.ts) --------
+test('parseFeishuDoc: /wiki/ -> kind=wiki', () => {
   const r = fs.parseFeishuDoc('https://example.feishu.cn/wiki/KRKfwhzDbiwncHk1QDvc2yFSnMd');
   assert.equal(r.kind, 'wiki');
   assert.equal(r.token, 'KRKfwhzDbiwncHk1QDvc2yFSnMd');
 });
 
-test('parseFeishuDoc：/docx/ → kind=docx（关键：不能误判 wiki）', () => {
+test('parseFeishuDoc: /docx/ -> kind=docx (crucially, it must not be mistaken for a wiki)', () => {
   const r = fs.parseFeishuDoc('https://x.feishu.cn/docx/Tm9TdabcOEFxyz1234567890');
   assert.equal(r.kind, 'docx');
   assert.equal(r.token, 'Tm9TdabcOEFxyz1234567890');
 });
 
-test('parseFeishuDoc：/docs/ 旧链 → 归 docx 读法', () => {
+test('parseFeishuDoc: an old /docs/ link reads the docx way', () => {
   assert.equal(fs.parseFeishuDoc('https://x.feishu.cn/docs/abcDEF123').kind, 'docx');
 });
 
-test('parseFeishuDoc：带 query/锚点也能取对 token（PRD 去重的归一靠这条）', () => {
+test('parseFeishuDoc: the token still comes out right with a query string or a fragment (this is what PRD deduplication normalises on)', () => {
   const r = fs.parseFeishuDoc('https://x.feishu.cn/wiki/ABC123?from=share#heading');
   assert.equal(r.token, 'ABC123');
   assert.equal(r.kind, 'wiki');
 });
 
-test('parseFeishuDoc：裸 token → unknown，原样返回', () => {
+test('parseFeishuDoc: a bare token -> unknown, returned as it came in', () => {
   const r = fs.parseFeishuDoc('KRKfwhzDbiwncHk1QDvc2yFSnMd');
   assert.equal(r.kind, 'unknown');
   assert.equal(r.token, 'KRKfwhzDbiwncHk1QDvc2yFSnMd');
 });
 
-// ── DocSource 契约 ───────────────────────────────────────────────────────
-test('claim：正文里的链接 → 带 source/token/url 的 ref', () => {
-  const refs = fs.feishuDocs.claim({ text: '看下 https://x.feishu.cn/docx/AAA' });
+// -- The DocSource contract -----------------------------------------------
+test('claim: a link in the body -> a ref carrying source, token and url', () => {
+  const refs = fs.feishuDocs.claim({ text: 'have a look at https://x.feishu.cn/docx/AAA' });
   assert.deepEqual(refs, [{ source: 'feishu', token: 'AAA', url: 'https://x.feishu.cn/docx/AAA' }]);
 });
 
-test('claim：正文没有就扫兜底文本块，命中即停（分享卡/富文本的链接不在正文里）', () => {
-  const refs = fs.feishuDocs.claim({ text: '[分享文档]', searchTexts: ['无', '{"url":"https://x.feishu.cn/wiki/BBB"}', 'https://x.feishu.cn/docx/CCC'] });
-  assert.deepEqual(refs.map((r) => r.token), ['BBB']); // 第二块命中后不再看第三块
+test('claim: with nothing in the body it scans the fallback text blocks and stops at the first hit (a share card or rich text keeps its link outside the body)', () => {
+  const refs = fs.feishuDocs.claim({ text: '[a shared document]', searchTexts: ['nothing', '{"url":"https://x.feishu.cn/wiki/BBB"}', 'https://x.feishu.cn/docx/CCC'] });
+  assert.deepEqual(refs.map((r) => r.token), ['BBB']); // once the second block hits, the third is never read
 });
 
-test('claim：谁都不贴链接 → 不认领（空数组，不是猜一个）', () => {
-  assert.deepEqual(fs.feishuDocs.claim({ text: '今天天气不错' }), []);
+test('claim: nobody posted a link -> it claims nothing (an empty array, not a guess)', () => {
+  assert.deepEqual(fs.feishuDocs.claim({ text: 'nice weather today' }), []);
 });
 
-test('parseRef：飞书链接认；非飞书链接不认（留给别的源/兜底源）', () => {
+test('parseRef: it claims a Feishu link and refuses anything else, leaving that to the other sources', () => {
   assert.deepEqual(fs.feishuDocs.parseRef('https://x.feishu.cn/docx/AAA'), { source: 'feishu', token: 'AAA', url: 'https://x.feishu.cn/docx/AAA' });
   assert.equal(fs.feishuDocs.parseRef('https://www.notion.so/some-page-123'), null);
   assert.equal(fs.feishuDocs.parseRef('https://github.com/x/y'), null);
   assert.equal(fs.feishuDocs.parseRef(''), null);
 });
 
-test('parseRef：裸 token 也收（CLI 允许直接贴 token，沿用旧行为），无 url', () => {
+test('parseRef: a bare token is accepted too (the CLI lets you paste one, as it always has), with no url', () => {
   assert.deepEqual(fs.feishuDocs.parseRef('KRKfwhzDbiwnc'), { source: 'feishu', token: 'KRKfwhzDbiwnc' });
 });
 
-// 「任何不含 / 的字符串都算裸 token」曾经会把一整句需求收成飞书文档：既登记出一条读不出正文的需求，
-// 又把本该轮到兜底源（plaintext）的消息半路截走。裸 token 必须长得像 token。
-test('parseRef：一句话不是裸 token——不认，留给兜底源', () => {
-  assert.equal(fs.feishuDocs.parseRef('把退款按钮挪到订单详情页顶部'), null);
-  assert.equal(fs.feishuDocs.parseRef('help me review this'), null, '带空格的一律不是 token');
-  assert.equal(fs.feishuDocs.parseRef('ABC123'), null, '太短，不像真 token');
-  assert.equal(fs.feishuDocs.parseRef('tok_with_underscore_x'), null, '非字母数字');
+// "Anything without a / is a bare token" used to swallow a whole requirement sentence as a Feishu document:
+// it registered a requirement whose body could never be read, and it intercepted a message that should have
+// gone to the fallback source (plaintext). A bare token has to look like a token.
+//
+// The first case is written as escapes on purpose. A CJK sentence carries no spaces, so it is exactly the
+// input that slips past a naive "no spaces, long enough" check -- the repo's source is English, the input it
+// handles is not, and this is the case that has to stay non-English to mean anything.
+test('parseRef: a sentence is not a bare token -- refused, and left to the fallback source', () => {
+  assert.equal(fs.feishuDocs.parseRef('\u628a\u9000\u6b3e\u6309\u94ae\u632a\u5230\u8ba2\u5355\u8be6\u60c5\u9875\u9876\u90e8'), null);
+  assert.equal(fs.feishuDocs.parseRef('help me review this'), null, 'anything with a space is never a token');
+  assert.equal(fs.feishuDocs.parseRef('ABC123'), null, 'too short to be a real token');
+  assert.equal(fs.feishuDocs.parseRef('tok_with_underscore_x'), null, 'not alphanumeric');
 });
 
-test('read：/docx/ 直链走 docx raw_content，不走 feishu-doc.js read（旧坑：doc_id 会被当 wiki 节点解析失败）', async () => {
-  reset(() => ({ code: 0, stdout: 'utok', stderr: '', timedOut: false })); // feishu-doc.js token
+test('read: a direct /docx/ link goes to docx raw_content rather than feishu-doc.js read (the old trap: the doc_id was parsed as a wiki node and failed)', async () => {
+  reset(() => ({ code: 0, stdout: 'utok', stderr: '', timedOut: false })); // the feishu-doc.js token
   const origFetch = globalThis.fetch;
   let hitUrl = '';
   globalThis.fetch = (async (u: string | URL) => {
     hitUrl = String(u);
-    return { json: async () => ({ code: 0, data: { content: 'docx 正文' } }) } as never;
+    return { json: async () => ({ code: 0, data: { content: 'the docx body' } }) } as never;
   }) as typeof fetch;
   try {
     const r = await fs.feishuDocs.read({ source: 'feishu', token: 'DOCID', url: 'https://x.feishu.cn/docx/DOCID' });
-    assert.deepEqual(r, { ok: true, text: 'docx 正文' });
+    assert.deepEqual(r, { ok: true, text: 'the docx body' });
     assert.match(hitUrl, /docx\/v1\/documents\/DOCID\/raw_content/);
-    assert.deepEqual(last().args.slice(1), ['token']); // 只取了 user token，没走 read 子命令
+    assert.deepEqual(last().args.slice(1), ['token']); // it only fetched the user token, and never ran the read subcommand
   } finally {
     globalThis.fetch = origFetch;
   }
 });
 
-test('read：wiki / 裸 token 走 feishu-doc.js read', async () => {
-  reset(() => ({ code: 0, stdout: 'wiki 正文', stderr: '', timedOut: false }));
+test('read: a wiki link or a bare token goes through feishu-doc.js read', async () => {
+  reset(() => ({ code: 0, stdout: 'the wiki body', stderr: '', timedOut: false }));
   const r = await fs.feishuDocs.read({ source: 'feishu', token: 'WIKITOK', url: 'https://x.feishu.cn/wiki/WIKITOK' });
-  assert.deepEqual(r, { ok: true, text: 'wiki 正文', error: undefined });
+  assert.deepEqual(r, { ok: true, text: 'the wiki body', error: undefined });
   assert.deepEqual(last().args.slice(1), ['read', 'WIKITOK']);
 });
 
-test('read：读不到就如实报错，绝不返回空正文装作读到了（上游据此停泊）', async () => {
-  reset(() => ({ code: 2, stdout: '', stderr: '文档无权限', timedOut: false }));
+test('read: a failed read says so plainly and never returns an empty body pretending it worked (upstream parks on this)', async () => {
+  reset(() => ({ code: 2, stdout: '', stderr: 'no permission for this document', timedOut: false }));
   const r = await fs.feishuDocs.read({ source: 'feishu', token: 'NOPE' });
   assert.equal(r.ok, false);
-  assert.match(r.error ?? '', /文档无权限/);
+  assert.match(r.error ?? '', /no permission for this document/);
 });
 
-// ── feishu：剥代理 env ────────────────────────────────────────────────────────
-test('feishuRead：node feishu-doc.js read <token>，并剥离 http(s) 代理 env（飞书走国内代理会断）', async () => {
+// -- Feishu: stripping the proxy env --------------------------------------------------
+test('feishuRead: runs node feishu-doc.js read <token> and strips the http(s) proxy env (Feishu breaks when it goes through one)', async () => {
   const saved = { ...process.env };
   process.env.HTTPS_PROXY = 'http://p:1';
   process.env.https_proxy = 'http://p:1';
@@ -162,28 +170,28 @@ test('feishuRead：node feishu-doc.js read <token>，并剥离 http(s) 代理 en
   assert.deepEqual(last().args.slice(1), ['read', 'tok']);
   const env = last().opts.env as NodeJS.ProcessEnv;
   for (const k of ['https_proxy', 'http_proxy', 'HTTPS_PROXY', 'HTTP_PROXY']) {
-    assert.equal(env[k], undefined, `${k} 应被剥离`);
+    assert.equal(env[k], undefined, `${k} should have been stripped`);
   }
-  // 还原本进程 env（只删本测试加的，避免污染其它用例）
+  // Restore the process env, removing only what this test added so the other tests are unaffected.
   for (const k of ['HTTPS_PROXY', 'https_proxy', 'HTTP_PROXY', 'http_proxy']) {
     if (!(k in saved)) delete process.env[k];
   }
 });
 
-test('feishuRead：feishu-doc.js 非零退出 → ok:false + error（不静默放过）', async () => {
+test('feishuRead: feishu-doc.js exits non-zero -> ok:false with the error (never silently let through)', async () => {
   reset(() => ({ code: 2, stdout: '', stderr: 'token expired', timedOut: false }));
   const r = await fs.feishuRead('tok');
   assert.equal(r.ok, false);
   assert.match(r.error ?? '', /token expired/);
 });
 
-test('feishuCommentAdd：node feishu-doc.js comment-add <token> <text>；非零 → ok:false', async () => {
+test('feishuCommentAdd: runs node feishu-doc.js comment-add <token> <text>; a non-zero exit gives ok:false', async () => {
   reset(() => ({ code: 0, stdout: '', stderr: '', timedOut: false }));
-  let r = await fs.feishuCommentAdd('tok', '评论内容');
+  let r = await fs.feishuCommentAdd('tok', 'the comment text');
   assert.equal(r.ok, true);
   assert.equal(last().bin, 'node');
   assert.match(last().args[0], /feishu-doc\.js$/);
-  assert.deepEqual(last().args.slice(1), ['comment-add', 'tok', '评论内容']);
+  assert.deepEqual(last().args.slice(1), ['comment-add', 'tok', 'the comment text']);
 
   reset(() => ({ code: 1, stdout: '', stderr: 'boom', timedOut: false }));
   r = await fs.feishuCommentAdd('tok', 'x');
@@ -191,14 +199,14 @@ test('feishuCommentAdd：node feishu-doc.js comment-add <token> <text>；非零 
   assert.match(r.error ?? '', /boom/);
 });
 
-test('feishuUserToken：取 token（trim）；非零 → null；空输出 → null', async () => {
+test('feishuUserToken: reads the token (trimmed); a non-zero exit gives null, and so does empty output', async () => {
   reset(() => ({ code: 0, stdout: '  utok-123\n', stderr: '', timedOut: false }));
   assert.equal(await fs.feishuUserToken(), 'utok-123');
   assert.deepEqual(last().args.slice(1), ['token']);
 
   reset(() => ({ code: 1, stdout: 'utok', stderr: '', timedOut: false }));
-  assert.equal(await fs.feishuUserToken(), null, 'gh/node 非零 → null');
+  assert.equal(await fs.feishuUserToken(), null, 'a non-zero exit -> null');
 
   reset(() => ({ code: 0, stdout: '   \n', stderr: '', timedOut: false }));
-  assert.equal(await fs.feishuUserToken(), null, '空白输出 → null');
+  assert.equal(await fs.feishuUserToken(), null, 'whitespace-only output -> null');
 });
