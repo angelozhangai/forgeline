@@ -1,6 +1,8 @@
-// 集成：remotePull 垂直切片——runner 经**真 HTTP 回环**从控制面 /jobs 拉到期 job（GitHub-runner 模式）。
-// 证明 client(runner) ↔ server(控制面，dueJobsPayload(localJobSource)) 的 wire 契约对齐：序列化 + HTTP + 解析。
-// 必须在导入前设 FORGE_DB（真 node:sqlite，:memory:）。
+// Integration: a vertical slice of remotePull - a runner pulls due jobs from the control plane's /jobs over a
+// **real HTTP loopback** (the GitHub-runner model).
+// It proves the wire contract between client (the runner) and server (the control plane, via
+// dueJobsPayload(localJobSource)) lines up: serialisation + HTTP + parsing.
+// FORGE_DB must be set before the imports (real node:sqlite, :memory:).
 process.env.FORGE_DB = ':memory:';
 import { test, after } from 'node:test';
 import assert from 'node:assert/strict';
@@ -10,11 +12,12 @@ const { store } = await import('../src/store/index.ts');
 const { localJobSource } = await import('../src/orchestrator/jobs/local.ts');
 const { makeRemoteJobSource, dueJobsPayload } = await import('../src/orchestrator/jobs/remote.ts');
 
-// 控制面：以 localJobSource 为后端的 /jobs HTTP 端点（=未来挂进控制面 server 的那段）。
+// The control plane: a /jobs HTTP endpoint backed by localJobSource (exactly the piece that will later be
+// mounted into the control-plane server).
 const server: Server = createServer(async (req, res) => {
   const u = new URL(req.url ?? '/', 'http://x');
   if (u.pathname === '/jobs') {
-    const limit = Number(u.searchParams.get('limit')) || 100; // runner 带的本轮容量（缺省宽松）
+    const limit = Number(u.searchParams.get('limit')) || 100; // the capacity the runner sent for this round (generous when absent)
     res.writeHead(200, { 'Content-Type': 'application/json' });
     res.end(await dueJobsPayload(localJobSource, limit));
     return;
@@ -32,31 +35,32 @@ function mk(id: string, state: string): void {
   store.create({ id, slug: id, title: `T ${id}`, branch: 'dev', state: state as never });
 }
 
-test('remotePull：经 HTTP 从控制面 /jobs 拉到期 job（只 POLLER_DRIVEN，跨进程序列化往返一致）', async () => {
-  mk('r-intake', 'INTAKE'); // 到期
-  mk('r-dloop', 'GATE_D_LOOP'); // 到期
-  mk('r-go', 'AWAITING_GO'); // 人等态——不该被拉到
+test('remotePull: pulls due jobs from the control plane\'s /jobs over HTTP (POLLER_DRIVEN only, and the cross-process serialisation round-trips intact)', async () => {
+  mk('r-intake', 'INTAKE'); // due
+  mk('r-dloop', 'GATE_D_LOOP'); // due
+  mk('r-go', 'AWAITING_GO'); // waiting on a human - it must not be pulled
   const remote = makeRemoteJobSource(baseUrl);
   const jobs = await remote.claimDueJobs(100);
   assert.deepEqual(jobs.map((s) => s.id).sort(), ['r-dloop', 'r-intake']);
-  // 字段经 JSON 往返完整（非只 id/state）：slug/branch 等也回得来。
+  // The fields survive the JSON round trip intact (not just id and state): slug, branch and the rest come back
+  // too.
   const intake = jobs.find((s) => s.id === 'r-intake');
   assert.equal(intake?.slug, 'r-intake');
   assert.equal(intake?.branch, 'dev');
 });
 
-test('remotePull：baseUrl 末尾斜杠归一（不打成 //jobs）', async () => {
+test('remotePull: a trailing slash on baseUrl is normalised away (so it never requests //jobs)', async () => {
   const remote = makeRemoteJobSource(`${baseUrl}/`);
-  const jobs = await remote.claimDueJobs(100); // 命中 /jobs（404 会抛）
+  const jobs = await remote.claimDueJobs(100); // it must hit /jobs (a 404 would throw)
   assert.ok(Array.isArray(jobs));
 });
 
-test('remotePull：控制面不可达 → 抛（失败不静默，runner 不把拉不到当无活）', async () => {
-  const dead = makeRemoteJobSource('http://127.0.0.1:1'); // 1 端口不可达
+test('remotePull: the control plane is unreachable -> throw (no silent failures; a runner must never treat a failed pull as "there is no work")', async () => {
+  const dead = makeRemoteJobSource('http://127.0.0.1:1'); // port 1 is unreachable
   await assert.rejects(() => dead.claimDueJobs(100));
 });
 
-test('remotePull：坏 payload（非数组）→ 抛（绝不信任外部输入）', async () => {
+test('remotePull: a bad payload (not an array) -> throw (external input is never trusted)', async () => {
   const bad = createServer((_q, s) => {
     s.writeHead(200, { 'Content-Type': 'application/json' });
     s.end('{"not":"an array"}');
@@ -71,9 +75,10 @@ test('remotePull：坏 payload（非数组）→ 抛（绝不信任外部输入�
   }
 });
 
-test('remotePull：HTTP 非 2xx → 抛', async () => {
+test('remotePull: a non-2xx HTTP response -> throw', async () => {
   const remote = makeRemoteJobSource(baseUrl);
-  // /jobs 之外的路径 server 回 404 —— 但 remotePull 固定打 /jobs，这里用一个总是 500 的 server 验非 2xx。
+  // The server returns 404 for paths other than /jobs, but remotePull always requests /jobs - so a server that
+  // always returns 500 is used here to exercise the non-2xx path.
   const err = createServer((_q, s) => { s.writeHead(500); s.end('boom'); });
   await new Promise<void>((r) => err.listen(0, '127.0.0.1', () => r()));
   const a = err.address();

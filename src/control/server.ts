@@ -1,21 +1,35 @@
-// 控制面 HTTP server——把 runner 拉 job(/jobs) 与读写状态(/store) 的 wire 端点对外服务。
-// 这是「control plane / runner 分离」里**控制面进程**的最小可运行体：runner（设了 FORGE_CONTROL_URL）经它
-// 拉到期 job + 读写中心 session 状态。**独立于** health/server.ts（那是 runner 本地 127.0.0.1 状态页/探针）。
+// The control-plane HTTP server - it serves the wire endpoints a runner uses to pull jobs (/jobs) and to read
+// and write state (/store).
+// This is the minimum runnable **control-plane process** in the control-plane / runner split: a runner (one
+// with FORGE_CONTROL_URL set) pulls its due jobs and reads and writes central session state through it. It is
+// **separate from** health/server.ts, which is the runner's own local 127.0.0.1 status page and probe.
 //
-//   GET  /healthz                  → 200 'ok'（**无鉴权**廉价探活，给 LB/runner 探）
-//   GET  /jobs?runner=<id>&limit=N → 原子领取该 runner 的到期 job（lease；FIFO 至多 N 条）        【需鉴权】
-//   POST /store                    → SessionStore RPC 信封（handleStoreCall(store, body)）         【需鉴权】
+//   GET  /healthz                  -> 200 'ok' (a cheap liveness probe, **unauthenticated**, for a load
+//                                     balancer or a runner)
+//   GET  /jobs?runner=<id>&limit=N -> atomically claim that runner's due jobs (a lease; FIFO, at most N)
+//                                     [authentication required]
+//   POST /store                    -> the SessionStore RPC envelope (handleStoreCall(store, body))
+//                                     [authentication required]
 //
-// **鉴权边界（shared secret）**：配了 token 则 /jobs+/store 要 `Authorization: Bearer <token>`
-// （timingSafeEqual 定长比较，防时序侧信）→ 否则 401。/healthz 不鉴权（纯存活探针）。
-// **fail-closed 两道**：
-//   ① 绑**非回环**地址却**无 token** → 启动即抛（无鉴权把读写全部 session 状态对网络开放=灾难）。回环允许无 token（本机开发）。
-//   ② 进程设了 **FORGE_CONTROL_URL**（=runner 标记）→ 启动即抛：控制面进程必须直连本地 sqlite，绝不把读写
-//      代理到别处（否则 store/jobSource 选择点会变远端，控制面对着空气服务）。本守门保证 `store`/`jobSource` 恒为本地实现。
+// **The authentication boundary (a shared secret)**: when a token is configured, /jobs and /store require
+// `Authorization: Bearer <token>` (compared with timingSafeEqual at a fixed length, which guards against a
+// timing side channel), and anything else gets a 401. /healthz is unauthenticated (it is purely a liveness
+// probe).
+// **Two fail-closed guards**:
+//   1. binding a **non-loopback** address with **no token** throws at startup (exposing read/write access to
+//      every session's state on the network without authentication would be a disaster). Loopback allows no
+//      token, for local development.
+//   2. the process having **FORGE_CONTROL_URL** set (the runner marker) throws at startup: a control-plane
+//      process must connect directly to the local sqlite and never proxy its reads and writes elsewhere
+//      (otherwise the store and jobSource selection points would resolve to a remote, and the control plane
+//      would be serving thin air). This guard is what guarantees `store` and `jobSource` are always the local
+//      implementations.
 //
-// **lease（多 runner 防重领，深水⑥）**：/jobs 经 `store.leaseClaim([...POLLER_DRIVEN], runner, ttl)` 原子领取——
-// 把到期 job 占租给 `?runner=<id>` 标识的 runner，别的 runner 同刻拉只能拿到无主/过期的剩余 job，绝不重领同一个。
-// runner 死亡 → 租约过期后另一 runner 可重领。缺 `?runner` → 用控制面自己的 RUNNER_ID（loopback/单 runner 兜底）。
+// **The lease (so several runners cannot claim the same job)**: /jobs claims atomically through
+// `store.leaseClaim([...POLLER_DRIVEN], runner, ttl)`, leasing due jobs to the runner identified by
+// `?runner=<id>`. Another runner pulling at the same moment can only get jobs that are unowned or expired, and
+// never claims the same one. If a runner dies, another may re-claim its jobs once the lease expires. Without
+// `?runner` the control plane uses its own RUNNER_ID (the loopback / single-runner fallback).
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import { timingSafeEqual } from 'node:crypto';
 import { log } from '../util/log.ts';
@@ -25,10 +39,11 @@ import { POLLER_DRIVEN } from '../statemachine/states.ts';
 import { RUNNER_ID, leaseTtlMs } from '../orchestrator/jobs/index.ts';
 
 const JSONT = 'application/json; charset=utf-8';
-const MAX_BODY = 1_000_000; // /store 请求体上限：session patch 信封最多几 KB，1MB 极宽松（防内存炸）。
-const MAX_CLAIM = 512; // 单次 /jobs 占租上限：防 buggy/恶意 runner 一把把整个 backlog 占租走。
+const MAX_BODY = 1_000_000; // the /store request-body cap: a session patch envelope is a few KB at most, so 1MB is very generous (it exists to prevent a memory blow-up).
+const MAX_CLAIM = 512; // the cap on one /jobs claim: it stops a buggy or malicious runner leasing the entire backlog in one go.
 
-// 请求方 runner 的本轮并发容量（?limit）。缺省/非法 → 控制面自身 max_parallel；一律钳到 [1, MAX_CLAIM]。
+// The requesting runner's concurrency capacity for this round (?limit). Missing or invalid falls back to the
+// control plane's own max_parallel, and it is always clamped to [1, MAX_CLAIM].
 function claimLimit(raw: string | null): number {
   const n = Number(raw);
   const want = Number.isFinite(n) && n >= 1 ? Math.floor(n) : loadConfig().runtime.max_parallel;
@@ -44,8 +59,11 @@ function isLoopback(host: string): boolean {
   return host === '127.0.0.1' || host === 'localhost' || host === '::1';
 }
 
-// 鉴权：配了 token 才校验（无 token 仅回环放行，由 startControlServer fail-closed① 守门）。
-// 定长 timingSafeEqual：长度不等先短路（长度本身非秘密），等长再常数时间比较，防按字节时序爆破 token。
+// Authentication: only checked when a token is configured (with no token, only loopback is allowed, which
+// fail-closed guard 1 in startControlServer enforces).
+// Fixed-length timingSafeEqual: unequal lengths short-circuit first (the length itself is not a secret), and
+// equal lengths are compared in constant time, which prevents brute-forcing the token byte by byte through
+// timing.
 function authorized(req: IncomingMessage, token: string | undefined): boolean {
   if (!token) return true;
   const m = /^Bearer (.+)$/.exec(req.headers.authorization ?? '');
@@ -55,7 +73,7 @@ function authorized(req: IncomingMessage, token: string | undefined): boolean {
   return got.length === want.length && timingSafeEqual(got, want);
 }
 
-// 累积请求体，超上限即断（绝不无界缓冲）。
+// Accumulate the request body, destroying the request once it exceeds the cap (never buffer without bound).
 function readBody(req: IncomingMessage): Promise<string> {
   return new Promise((resolve, reject) => {
     let body = '';
@@ -76,25 +94,30 @@ function readBody(req: IncomingMessage): Promise<string> {
 
 export interface ControlServerOpts {
   port: number;
-  host?: string; // 默认 127.0.0.1（回环安全默认）
-  token?: string; // shared secret；绑非回环必须给
+  host?: string; // defaults to 127.0.0.1 (the safe loopback default)
+  token?: string; // the shared secret; required when binding a non-loopback address
 }
 
-// 返回 **Promise<Server>**：绑定就绪(listening)→resolve；**listening 前绑定出错(EADDRINUSE 等)→reject**——
-// 控制面 HTTP 是「控制面进程」存在的理由，绑不上即半启动（tick/health 看着活、但额外 runner 的 /jobs+/store 不可用），
-// 必须 fail-fast 让调用方（listen/control）拿不到 HTTP 面就退出，绝不静默以「无控制面」形态活着。listening 后的运行期
-// 错误只 warn（不撤已起的服务）。两道 fail-closed 守门是**同步 throw**（在返回 Promise 前）：误配即刻炸，调用方
-// `await` 同步抛、测试 `assert.throws` 可捕。
+// It returns a **Promise<Server>**: it resolves once the socket is listening, and **rejects if binding fails
+// before that (EADDRINUSE and friends)**. The control-plane HTTP surface is the entire reason a control-plane
+// process exists, so failing to bind means a half-start (the tick and health page look alive, but /jobs and
+// /store are unavailable to every other runner). It must fail fast so the caller exits when it cannot get the
+// HTTP surface, rather than silently living on with no control plane. Runtime errors after it is listening only
+// warn, and do not tear down a running service. Both fail-closed guards **throw synchronously**, before the
+// Promise is returned: a misconfiguration blows up immediately, the caller's `await` sees a synchronous throw,
+// and a test can catch it with `assert.throws`.
 export function startControlServer(opts: ControlServerOpts): Promise<Server> {
   const host = opts.host ?? '127.0.0.1';
   const token = opts.token || undefined;
-  // fail-closed②：控制面进程不应是 runner——设了 FORGE_CONTROL_URL 则 store/jobSource 选择点会指向远端。
+  // Fail-closed guard 2: a control-plane process must not be a runner - with FORGE_CONTROL_URL set, the store
+  // and jobSource selection points would resolve to a remote.
   if (process.env.FORGE_CONTROL_URL) {
-    throw new Error('控制面进程不应设 FORGE_CONTROL_URL（那是 runner 标记）：会让 store/jobSource 代理到别处，控制面对着空气服务');
+    throw new Error('a control-plane process must not set FORGE_CONTROL_URL (that is the runner marker): it would proxy store/jobSource elsewhere, leaving the control plane serving thin air');
   }
-  // fail-closed①：非回环 + 无 token = 拒绝启动（绝不无鉴权把读写全部状态暴露到网络）。
+  // Fail-closed guard 1: a non-loopback address with no token refuses to start (read/write access to all state
+  // must never be exposed on the network without authentication).
   if (!isLoopback(host) && !token) {
-    throw new Error(`拒绝在非回环地址 ${host} 无鉴权启动控制面：/store 可读写全部 session 状态，必须配 FORGE_CONTROL_TOKEN`);
+    throw new Error(`refusing to start the control plane unauthenticated on the non-loopback address ${host}: /store can read and write every session's state, so FORGE_CONTROL_TOKEN must be configured`);
   }
   const server = createServer((req, res) => {
     void (async () => {
@@ -102,11 +125,11 @@ export function startControlServer(opts: ControlServerOpts): Promise<Server> {
         const url = new URL(req.url ?? '/', `http://${host}`);
         const path = url.pathname;
         if (req.method === 'GET' && path === '/healthz') return send(res, 200, 'text/plain; charset=utf-8', 'ok');
-        // 以下端点需鉴权。
-        if (!authorized(req, token)) return send(res, 401, JSONT, JSON.stringify({ ok: false, error: '未授权（缺/错 Bearer token）' }));
+        // The endpoints below require authentication.
+        if (!authorized(req, token)) return send(res, 401, JSONT, JSON.stringify({ ok: false, error: 'unauthorized (the Bearer token is missing or wrong)' }));
         if (req.method === 'GET' && path === '/jobs') {
-          const runner = url.searchParams.get('runner') || RUNNER_ID; // 缺省=控制面自身 id（loopback/单 runner 兜底）
-          const limit = claimLimit(url.searchParams.get('limit')); // 本 runner 本轮容量（FIFO 至多 limit 条）
+          const runner = url.searchParams.get('runner') || RUNNER_ID; // absent -> the control plane's own id (the loopback / single-runner fallback)
+          const limit = claimLimit(url.searchParams.get('limit')); // this runner's capacity for the round (FIFO, at most `limit`)
           const jobs = await store.leaseClaim([...POLLER_DRIVEN], runner, leaseTtlMs(), limit);
           return send(res, 200, JSONT, JSON.stringify(jobs));
         }
@@ -116,7 +139,7 @@ export function startControlServer(opts: ControlServerOpts): Promise<Server> {
         try {
           send(res, 500, JSONT, JSON.stringify({ ok: false, error: String(e).slice(0, 200) }));
         } catch {
-          /* 响应已发出 */
+          /* the response has already been sent */
         }
       }
     })();
@@ -125,15 +148,15 @@ export function startControlServer(opts: ControlServerOpts): Promise<Server> {
     let listening = false;
     server.on('error', (e: NodeJS.ErrnoException) => {
       if (listening) {
-        log.warn(`控制面 server 运行期出错：${String(e).slice(0, 160)}`); // 已起后的错误不撤服务
+        log.warn(`the control-plane server errored at runtime: ${String(e).slice(0, 160)}`); // an error after start-up does not tear the service down
         return;
       }
-      const why = e.code === 'EADDRINUSE' ? `端口 ${opts.port} 被占用` : String(e).slice(0, 160);
-      reject(new Error(`控制面 HTTP 绑定失败（${why}）→ 拒绝以「无控制面」形态启动`));
+      const why = e.code === 'EADDRINUSE' ? `port ${opts.port} is already in use` : String(e).slice(0, 160);
+      reject(new Error(`the control-plane HTTP bind failed (${why}) -> refusing to start with no control plane`));
     });
     server.listen(opts.port, host, () => {
       listening = true;
-      log.ok(`控制面已起：http://${host}:${opts.port}/（/jobs /store /healthz）· ${token ? '鉴权 on' : '回环·无鉴权'}`);
+      log.ok(`Control plane started: http://${host}:${opts.port}/ (/jobs /store /healthz) - ${token ? 'authentication on' : 'loopback, unauthenticated'}`);
       resolve(server);
     });
   });
