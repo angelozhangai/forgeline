@@ -1,16 +1,19 @@
-// 控制面 / Runner 边界——**JobSource 选择点（唯一接线处）**。
-// worker.tick 只 `import { jobSource }`，永不直接 DB 枚举到期 job。
+// The control-plane / runner boundary - **the JobSource selection point (the only place it is wired)**.
+// worker.tick only does `import { jobSource }` and never enumerates due jobs from the DB itself.
 //
-// 后端按 FORGE_CONTROL_URL 切（与 root.ts 读 FORGE_* infra env 同风格，模块加载即定）：
-//   · 设了 → 本进程是**纯 runner**：经 HTTP 从远端控制面拉 job（remotePull）。
-//   · 未设 → **all-in-one**：本地 DB 枚举（现状，行为不变）。
+// The backend is chosen by FORGE_CONTROL_URL (the same style as root.ts reading the FORGE_* infrastructure
+// variables, decided once at module load):
+//   - set     -> this process is a **pure runner**: it pulls jobs from the remote control plane over HTTP
+//                (remotePull).
+//   - unset   -> **all-in-one**: enumerate the local DB (the status quo, behaviour unchanged).
 import { localJobSource } from './local.ts';
 import { makeRemoteJobSource } from './remote.ts';
 import { RUNNER_ID } from './runner.ts';
 import type { JobSource } from './port.ts';
 
 const controlUrl = process.env.FORGE_CONTROL_URL;
-// 纯 runner：带本机 RUNNER_ID 拉 job（控制面据此把租约记在本 runner 名下、与别的 runner 分开领）。
+// A pure runner pulls jobs carrying this machine's RUNNER_ID, so the control plane records the lease under
+// this runner and hands different jobs to different runners.
 export const jobSource: JobSource = controlUrl ? makeRemoteJobSource(controlUrl, process.env.FORGE_CONTROL_TOKEN, RUNNER_ID) : localJobSource;
 export { makeRemoteJobSource, dueJobsPayload } from './remote.ts';
 export { RUNNER_ID, leaseTtlMs } from './runner.ts';

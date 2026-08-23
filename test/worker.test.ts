@@ -19,7 +19,7 @@ mock.module('../src/notify.ts', { namedExports: { notify: async (kind: string) =
 
 // 闸A：模拟成功（写入 routing），可切换为抛错；outcome 决定 afterGateA 的转移分支。
 let gateAThrows = false;
-let gateAErrorMsg = '闸A 解析失败'; // 可切换为瞬时错（如 'claude 超时'）测自动重试分类
+let gateAErrorMsg = '闸A 解析失败'; // 可切换为瞬时错（如 'claude timed out'）测自动重试分类
 let gateAOutcome = { round: 1, openQuestions: 2, resolved: false, stalled: false };
 const sessionsRef: { mod?: typeof import('../src/store/sessions.ts') } = {};
 mock.module('../src/gates/gateA.ts', {
@@ -682,7 +682,7 @@ test('tick：孤儿态(GATE_B_RUNNING·初稿中途死)自愈 → 回 GATE_B_REQ
 test('step(INTAKE)：瞬时失败(超时) → 排程退避自动重试（记 retry_count/next_retry_at，不发 failed）', async () => {
   notifyCalls.length = 0;
   benignMocks();
-  gateAThrows = true; gateAErrorMsg = '闸A claude 失败：claude 超时';
+  gateAThrows = true; gateAErrorMsg = 'Gate A claude failed: claude timed out';
   const id = await mk('rt1', 'INTAKE');
   await worker.step((await sessions.get(id))!);
   const s = (await sessions.get(id))!;
@@ -698,7 +698,7 @@ test('tick：退避到点 → reconcile 自动重试，成功推进后清重试�
   notifyCalls.length = 0;
   benignMocks();
   gateAOutcome = { round: 1, openQuestions: 2, resolved: false, stalled: false };
-  gateAThrows = true; gateAErrorMsg = 'claude 超时'; // 先制造一次瞬时失败排程
+  gateAThrows = true; gateAErrorMsg = 'claude timed out'; // 先制造一次瞬时失败排程
   const id = await mk('rt2', 'INTAKE');
   await worker.step((await sessions.get(id))!);
   assert.equal((await sessions.get(id))!.state, 'GATE_A_FAILED');
@@ -726,7 +726,7 @@ test('生产链路：闸A对抗首轮瞬时失败 → 退避到点后原地续�
   assert.equal(s.gate_a_adv_round, 0);
 
   gateALoopThrows = true;
-  gateALoopErrorMsg = 'codex 超时';
+  gateALoopErrorMsg = 'codex timed out';
   await worker.step((await sessions.get(id))!);
   s = (await sessions.get(id))!;
   assert.equal(s.state, 'GATE_A_FAILED');
@@ -755,7 +755,7 @@ test('生产链路：闸A对抗首轮瞬时失败 → 退避到点后原地续�
 test('step：瞬时失败重试耗尽（达上限）→ 转死信 + failed 通知', async () => {
   notifyCalls.length = 0;
   benignMocks();
-  gateAThrows = true; gateAErrorMsg = 'claude 超时';
+  gateAThrows = true; gateAErrorMsg = 'claude timed out';
   const id = await mk('rt3', 'INTAKE');
   await sessions.patch(id, { retry_count: 3 }); // 已达 max_auto_retries(3)
   await worker.step((await sessions.get(id))!);
