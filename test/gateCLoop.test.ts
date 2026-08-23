@@ -1,20 +1,34 @@
-// 集成：runGateCLoop 驱动真 reviewFixLoop 引擎（**reviewer = 确定性 CI，非 codex**；fixer = claude 改 worktree）。
-// mock LLM/CI/git/项目边界，用真 sessions(:memory:) + 真 render/strictParse/config/引擎。锁闸C 特有不变量：
-//  ① 未实现（base 后无提交）→ 直接判 unimplemented、**不跑 CI**（不浪费 CI 在空树，逼 claude 动工）；
-//  ② 实现→CI 绿→LGTM→resolved，且 diff/files 由 forge **现场从 git 重建**（绝不信模型文本——被对抗的是 worktree 状态）；
-//  ③ CI 红 → 失败摘要回喂 claude 续修（实现⇄CI 闭环）；④ 续修轮走 resume prompt；
-//  ⑤ CI 跑不起来（ran=false 基础设施错）→ **抛停泊**，绝不当成红让 claude 白改一轮；
-//  ⑥ CI 绿但 CI 自身改脏 worktree（green-but-dirty）→ 抛（对 HEAD 假阳性，绝不放行）；
-//  ⑦ commit 失败 / 提交后非 clean → 抛（绝不带脏树跑 CI——CI 须验 HEAD）；⑧ claude 瞬断→paused 不 commit；
-//  ⑨ claude 升级 needs_human→needsHuman 出口；⑩ REVISION：负责人答复 fix-first 落实后清 pending；
-//  ⑪ 到硬上限仍不绿→stalled + 残留落 gate_c_residual（交 M 裁决，绝不静默放行）。
-//  另：真渲染产物捕获断言无残留 {{X}}——证明 code 真喂全 gate-c-implement / gate-c-fix-resume 模板变量（SF3 抓 code 漏喂，闭口子①）。
+// Integration: runGateCLoop driving the real reviewFixLoop engine (**the reviewer is deterministic CI, not
+// codex**; the fixer is claude editing the worktree).
+// The LLM / CI / git / project boundaries are mocked, with a real sessions store (:memory:) and real
+// render / strictParse / config / engine. It pins the invariants specific to Gate C:
+//  1. not implemented (no commits after base) -> return unimplemented and **do not run CI** (no CI is wasted on
+//     an empty tree, and claude is forced to start working);
+//  2. implemented -> CI green -> LGTM -> resolved, with the diff and file list **rebuilt live from git by
+//     forge** (the model's text is never trusted - what is under adversarial review is the worktree state);
+//  3. CI red -> the failure summary is fed back to claude for another fix (the implement/CI loop closes);
+//  4. later fix rounds use the resume prompt;
+//  5. CI failing to run (ran=false, an infrastructure error) -> **throw and park**, never treated as red and
+//     never sent to claude to fix nothing;
+//  6. CI green but CI itself dirtied the worktree (green-but-dirty) -> throw (a false positive for HEAD, never
+//     let through);
+//  7. a failed commit, or a tree that is not clean after committing -> throw (CI must verify HEAD, never a
+//     dirty tree);
+//  8. a claude drop-out -> paused, with no commit;
+//  9. claude escalating needs_human -> the needsHuman exit;
+//  10. REVISION: after the owner's answer is applied fix-first, the pending input is cleared;
+//  11. still not green at the hard cap -> stalled, with the residue persisted to gate_c_residual (handed to the
+//      owner to arbitrate, never silently let through).
+// It also captures the really-rendered prompt and asserts there is no leftover {{X}} - proving the code feeds
+// every gate-c-implement / gate-c-fix-resume template variable (SF3, which catches the code forgetting one).
 process.env.FORGE_DB = ':memory:';
 import { test, mock, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-// 按模板「## 段标题」抽该段正文（到下一个 ## 或结尾）：断言变量落在**正确段落**，而非 prompt 里随便哪出现——
-// 抓「变量互换」（如 FINDINGS↔WORKTREE 互调时全局匹配仍绿、分段匹配必红，Codex 二审 SF5）。
+// Extract the body of one "## heading" section of the template (up to the next ## or the end): this asserts a
+// variable landed in the **right section** rather than merely appearing somewhere in the prompt - which is what
+// catches swapped variables (with FINDINGS and WORKTREE exchanged, a global match still passes while a
+// per-section match must fail; Codex, second review, SF5).
 function section(prompt: string, heading: string): string {
   const i = prompt.indexOf(heading);
   if (i < 0) return '';
@@ -22,29 +36,32 @@ function section(prompt: string, heading: string): string {
   const next = after.indexOf('\n## ');
   return next < 0 ? after : after.slice(0, next);
 }
-// intro = 第一个 ## 之前的正文（resume 模板把 {{WORKTREE}} 放开头、不在某个 ## 段下）。
+// intro = the body before the first ## (the resume template puts {{WORKTREE}} at the very top, not under any
+// ## section).
 function intro(prompt: string): string {
   const i = prompt.indexOf('\n## ');
   return i < 0 ? prompt : prompt.slice(0, i);
 }
 
-let claudeFix = JSON.stringify({ summary: '实现了登录态持久化', needs_human: [] });
-let claudeTextQueue: string[] = []; // runClaude.result 文本队列（按调用 shift；空→claudeFix）。用于坏 JSON 自愈
-let claudeOkQueue: boolean[] = []; // runClaude.ok 队列（按调用 shift；空→true）
-let ciOkQueue: boolean[] = []; // runCi.ok 队列（按调用 shift；空→ciOkDefault）
+let claudeFix = JSON.stringify({ summary: 'implemented login-session persistence', needs_human: [] });
+let claudeTextQueue: string[] = []; // a queue of runClaude.result texts (each call shifts one; empty -> claudeFix). Used for the broken-JSON self-healing case
+let claudeOkQueue: boolean[] = []; // a queue of runClaude.ok values (each call shifts one; empty -> true)
+let ciOkQueue: boolean[] = []; // a queue of runCi.ok values (each call shifts one; empty -> ciOkDefault)
 let ciOkDefault = true;
 let ciRan = true;
 let commitResult = { ok: true, committed: true, output: 'committed' };
-let commitQueue: { ok: boolean; committed: boolean; output: string }[] = []; // commitWorktree 队列（按调用 shift；空→commitResult）
-let cleanQueue: boolean[] = []; // worktreeClean 队列（按调用 shift；空→cleanDefault）
+let commitQueue: { ok: boolean; committed: boolean; output: string }[] = []; // a queue of commitWorktree results (each call shifts one; empty -> commitResult)
+let cleanQueue: boolean[] = []; // a queue of worktreeClean results (each call shifts one; empty -> cleanDefault)
 let cleanDefault = true;
-let hasCommits = false; // hasCommitsSince 标志；commit 成功后翻 true（模拟「实现落了提交」）
+let hasCommits = false; // the hasCommitsSince flag; flipped to true after a successful commit (simulating "the implementation landed a commit")
 let claudeCalls = 0;
 let ciCalls = 0;
 let commitCalls = 0;
-let lastClaudePrompt = ''; // 真渲染产物（证明 code 喂全 gate-c-* 模板变量）
-let lastPersisted: Record<string, unknown> | null = null; // persistArtifact 落的信封（验 forge 现场重建 diff/files）
-// 第二参数捕获（Codex SF1/SF2）：mock 不看入参 → 测试只验 prompt 文本，抓不住「driver 漏传/传错 sessionId/resume/cwd/base」的 wiring 退化。
+let lastClaudePrompt = ''; // the really-rendered prompt (proving the code feeds every gate-c-* template variable)
+let lastPersisted: Record<string, unknown> | null = null; // the envelope persistArtifact wrote (verifying forge rebuilds diff/files live)
+// Capturing the second argument (Codex SF1/SF2): a mock that ignores its arguments means the tests only check
+// the prompt text, and cannot catch a driver that stops passing - or passes the wrong - sessionId / resume /
+// cwd / base, which is a silent wiring regression.
 let claudeOptsLog: { sessionId: string | null; resume: string | null; cwd: string | undefined }[] = [];
 let ciArgsLog: { wt: string; script: string | undefined; base: string | undefined }[] = [];
 
@@ -58,7 +75,7 @@ mock.module('../src/llm/runClaude.ts', {
       const text = claudeTextQueue.length ? (claudeTextQueue.shift() as string) : claudeFix;
       return ok
         ? { ok: true, result: text, sessionId: null, costUsd: 0.01, raw: text, error: null }
-        : { ok: false, result: '', sessionId: null, costUsd: null, raw: '', error: 'claude 瞬断' };
+        : { ok: false, result: '', sessionId: null, costUsd: null, raw: '', error: 'claude dropped out' };
     },
   },
 });
@@ -68,7 +85,7 @@ mock.module('../src/gates/ci.ts', {
       ciCalls++;
       ciArgsLog.push({ wt, script, base: opts?.base });
       const ok = ciOkQueue.length ? (ciOkQueue.shift() as boolean) : ciOkDefault;
-      return { ok, ran: ciRan, summary: ok ? 'all green' : 'FAIL libs/x 测试未过' };
+      return { ok, ran: ciRan, summary: ok ? 'all green' : 'FAIL libs/x tests did not pass' };
     },
     hasCommitsSince: () => hasCommits,
     diffStatSince: () => ' libs/a.ts | 10 ++++',
@@ -76,7 +93,7 @@ mock.module('../src/gates/ci.ts', {
     commitWorktree: () => {
       commitCalls++;
       const r = commitQueue.length ? (commitQueue.shift() as { ok: boolean; committed: boolean; output: string }) : commitResult;
-      if (r.ok && r.committed) hasCommits = true; // 真落了提交 = base..HEAD 自此有提交（no-op committed:false 不翻）
+      if (r.ok && r.committed) hasCommits = true; // a real commit means base..HEAD has commits from now on (a no-op committed:false does not flip it)
       return r;
     },
     worktreeClean: () => (cleanQueue.length ? (cleanQueue.shift() as boolean) : cleanDefault),
@@ -90,7 +107,7 @@ mock.module('../src/gates/gateC.ts', {
   namedExports: {
     readImplEnvelope: () => env,
     persistGateC: (_s: unknown, e: Record<string, unknown>) => { lastPersisted = e; },
-    gateCContext: () => '技术方案：实现登录态持久化。外环验收：AC1 登录后刷新仍在线（当前红）',
+    gateCContext: () => 'Tech design: implement login-session persistence. Outer-loop acceptance: AC1 still signed in after a refresh (currently red)',
   },
 });
 mock.module('../src/projects.ts', {
@@ -111,7 +128,7 @@ async function mk(extra: Record<string, unknown> = {}): Promise<string> {
 }
 
 beforeEach(() => {
-  claudeFix = JSON.stringify({ summary: '实现了登录态持久化', needs_human: [] });
+  claudeFix = JSON.stringify({ summary: 'implemented login-session persistence', needs_human: [] });
   claudeTextQueue = [];
   claudeOkQueue = [];
   ciOkQueue = [];
@@ -131,175 +148,187 @@ beforeEach(() => {
   ciArgsLog = [];
 });
 
-test('未实现（base 后无提交）→ 判 unimplemented、**不跑 CI** 逼 claude 动工；gate-c-implement 真渲染无残留占位（SF3 闭口子①）', async () => {
+test('not implemented (no commits after base) -> unimplemented, **CI is not run**, and claude is forced to start; the real gate-c-implement render leaves no placeholder (SF3)', async () => {
   const out = await runGateCLoop((await sessions.get(await mk()))!);
-  assert.equal(ciCalls, 0); // 空树不浪费 CI——unimplemented 短路在 runCi 之前
-  assert.equal(claudeCalls, 1); // 直接逼 claude 实现
-  assert.equal(commitCalls, 1); // claude 写码后 forge 落提交
-  assert.equal(out.paused, true); // 每-tick=1（CI 重）：实现一轮即暂停，下个 tick 再过 CI
-  assert.doesNotMatch(lastClaudePrompt, /\{\{\w+\}\}/, 'gate-c-implement 真渲染有未喂变量（code 漏喂模板变量）');
-  // 分段哨兵（Codex 二审 SF5）：无残留 {{X}} 只抓「漏喂」，全局匹配抓不住「喂错/互换」。断值落在**正确段落**：
-  assert.match(section(lastClaudePrompt, '## Workspace'), /\/wt/, 'WORKTREE 须落在「Workspace」段');
-  assert.match(section(lastClaudePrompt, '## What to implement'), /技术方案：实现登录态持久化/, 'CONTEXT 须落在「What to implement」段');
-  assert.doesNotMatch(section(lastClaudePrompt, '## Workspace'), /技术方案：实现登录态持久化/, 'CONTEXT 串进 Workspace 段=变量互换，必红');
-  // 防注入护栏必须随 prompt 渲染出来（不可信需求文本→预批 Bash 的写码 claude，护栏不能被静默删掉）。
-  assert.match(lastClaudePrompt, /[Ss]ecurity boundary/, 'gate-c-implement 必须带防注入安全边界');
-  assert.match(lastClaudePrompt, /untrusted data/, '护栏须明确把上下文标为不可信数据');
+  assert.equal(ciCalls, 0); // no CI wasted on an empty tree - unimplemented short-circuits before runCi
+  assert.equal(claudeCalls, 1); // claude is pushed straight into implementing
+  assert.equal(commitCalls, 1); // once claude has written code, forge makes the commit
+  assert.equal(out.paused, true); // per-tick = 1 (CI is expensive): one implementation round then pause, and CI runs on the next tick
+  assert.doesNotMatch(lastClaudePrompt, /\{\{\w+\}\}/, 'the real gate-c-implement render has an unfed variable (the code forgot a template variable)');
+  // The per-section sentinels (Codex, second review, SF5): "no leftover {{X}}" only catches a variable that was
+  // never fed; a global match cannot catch one fed into the wrong place. These pin the values to their sections:
+  assert.match(section(lastClaudePrompt, '## Workspace'), /\/wt/, 'WORKTREE must land in the "Workspace" section');
+  assert.match(section(lastClaudePrompt, '## What to implement'), /Tech design: implement login-session persistence/, 'CONTEXT must land in the "What to implement" section');
+  assert.doesNotMatch(section(lastClaudePrompt, '## Workspace'), /Tech design: implement login-session persistence/, 'CONTEXT leaking into the Workspace section means the variables were swapped, and must fail');
+  // The prompt-injection guardrail must be rendered along with the prompt (untrusted requirement text reaches a
+  // code-writing claude with pre-approved Bash, so the guardrail must not be silently dropped).
+  assert.match(lastClaudePrompt, /[Ss]ecurity boundary/, 'gate-c-implement must carry the prompt-injection security boundary');
+  assert.match(lastClaudePrompt, /untrusted data/, 'the guardrail must explicitly mark the context as untrusted data');
 });
 
-test('happy（2 tick）：实现→CI 绿→LGTM→resolved；diff/files 由 forge 现场从 git 重建（不信模型文本）', async () => {
+test('happy path (2 ticks): implement -> CI green -> LGTM -> resolved; the diff and file list are rebuilt live from git by forge (the model text is not trusted)', async () => {
   const id = await mk();
-  const first = await runGateCLoop((await sessions.get(id))!); // tick1：unimplemented→实现→暂停（commit 翻 hasCommits）
+  const first = await runGateCLoop((await sessions.get(id))!); // tick 1: unimplemented -> implement -> pause (the commit flips hasCommits)
   assert.equal(first.paused, true);
-  // 关键回归（不变量⑥）：信封的 diff_stat/files_changed/implemented 来自 git 现场（diffStatSince/changedFilesSince/hasCommitsSince），
-  // 绝非 claude JSON——claude 只回 summary。
+  // The key regression (invariant 2): the envelope's diff_stat / files_changed / implemented come from git
+  // (diffStatSince / changedFilesSince / hasCommitsSince), never from claude's JSON - claude only returns a
+  // summary.
   assert.equal(lastPersisted!.implemented, true);
   assert.equal(lastPersisted!.diff_stat, ' libs/a.ts | 10 ++++');
   assert.deepEqual(lastPersisted!.files_changed, ['libs/a.ts']);
-  assert.equal(lastPersisted!.last_summary, '实现了登录态持久化'); // 唯一来自模型文本的字段
+  assert.equal(lastPersisted!.last_summary, 'implemented login-session persistence'); // the only field that comes from the model's text
 
-  const second = await runGateCLoop((await sessions.get(id))!); // tick2：HEAD 已有提交→跑 CI→绿
+  const second = await runGateCLoop((await sessions.get(id))!); // tick 2: HEAD now has commits -> run CI -> green
   assert.equal(second.resolved, true);
   assert.equal(second.verdict, 'LGTM');
-  assert.equal(ciCalls, 1); // tick1 未跑 CI（unimplemented）；tick2 才真跑一次
-  // CI 真跑在 worktree + 用 pin 的 base_sha（Codex SF2；防漏传 base / 传成移动 ref / 脚本路径 resolve 错——
-  // ciBase 纯函数对了不代表 driver 接对了）。
+  assert.equal(ciCalls, 1); // tick 1 ran no CI (unimplemented); tick 2 runs it exactly once
+  // CI really runs in the worktree, with the pinned base_sha (Codex SF2; this catches a missing base, a base
+  // that degraded into a moving ref, or a mis-resolved script path - ciBase being a correct pure function does
+  // not prove the driver wired it up).
   assert.deepEqual(ciArgsLog[0], { wt: '/wt', script: '/wt/tools/scripts/forge-ci.sh', base: 'PINSHA' });
 });
 
-test('CI 红 → 失败摘要回喂 claude 续修 → 绿 → resolved（实现⇄CI 闭环）', async () => {
+test('CI red -> the failure summary is fed back to claude for another fix -> green -> resolved (the implement/CI loop closes)', async () => {
   const id = await mk();
-  hasCommits = true; // 已实现（如续做）；reviewer 直接过 CI
-  ciOkQueue = [false, true]; // tick1 红、tick2 绿
+  hasCommits = true; // already implemented (as when resuming); the reviewer goes straight to CI
+  ciOkQueue = [false, true]; // tick 1 red, tick 2 green
   const first = await runGateCLoop((await sessions.get(id))!);
   assert.equal(first.paused, true);
-  assert.match(lastClaudePrompt, /FAIL libs\/x/, 'CI 失败摘要必须回喂 claude（否则它不知道哪红了）');
-  assert.deepEqual(ciArgsLog[0], { wt: '/wt', script: '/wt/tools/scripts/forge-ci.sh', base: 'PINSHA' }); // CI 跑在 worktree + pin base（SF2）
+  assert.match(lastClaudePrompt, /FAIL libs\/x/, 'the CI failure summary must be fed back to claude (otherwise it does not know what went red)');
+  assert.deepEqual(ciArgsLog[0], { wt: '/wt', script: '/wt/tools/scripts/forge-ci.sh', base: 'PINSHA' }); // CI runs in the worktree with the pinned base (SF2)
   const second = await runGateCLoop((await sessions.get(id))!);
   assert.equal(second.resolved, true);
   assert.equal(second.verdict, 'LGTM');
 });
 
-test('续修轮：真 resume 同一 fixer 会话（非每次新开）+ gate-c-fix-resume 真渲染喂全变量', async () => {
+test('later fix rounds: really resume the same fixer session (not a fresh one each time), and gate-c-fix-resume renders with every variable fed', async () => {
   const id = await mk();
   hasCommits = true;
-  ciOkDefault = false; // 两轮都红 → 两 tick 各一次 fix
-  await runGateCLoop((await sessions.get(id))!); // tick1：fix#1（initial，pin 新 fixer 会话）
-  await runGateCLoop((await sessions.get(id))!); // tick2：fix#2（resume，因 fixer 会话已存）
-  // 真 resume 续接（Codex SF1）：首轮 pin 新 sessionId（无 resume）；次轮 resume === 落库的 fixer 会话，cwd=worktree。
-  // 若 driver 退化成每轮新开 Claude session（但仍渲染 resume prompt），下面的断言会红——光验 prompt 文本抓不住。
+  ciOkDefault = false; // red both rounds -> one fix per tick across two ticks
+  await runGateCLoop((await sessions.get(id))!); // tick 1: fix #1 (initial, pinning a new fixer session)
+  await runGateCLoop((await sessions.get(id))!); // tick 2: fix #2 (resume, since the fixer session now exists)
+  // A real resume (Codex SF1): the first round pins a new sessionId (with no resume); the second round's resume
+  // equals the persisted fixer session, with cwd = the worktree.
+  // If the driver regressed into opening a fresh claude session every round (while still rendering the resume
+  // prompt), the assertions below go red - checking the prompt text alone would not catch it.
   const fixer = (await sessions.get(id))!.gate_c_fixer_session;
-  assert.ok(fixer, 'fixer 会话必须被 pin 落库');
-  assert.equal(claudeOptsLog[0].sessionId, fixer); // 首轮：新会话即落库那个
-  assert.equal(claudeOptsLog[0].resume, null); // 首轮不 resume
-  assert.equal(claudeOptsLog[0].cwd, '/wt'); // 改码必须在隔离 worktree
-  assert.equal(claudeOptsLog[1].resume, fixer); // 次轮：resume 同一会话（续上下文，不丢前轮）
+  assert.ok(fixer, 'the fixer session must be pinned and persisted');
+  assert.equal(claudeOptsLog[0].sessionId, fixer); // first round: the new session is the one that was persisted
+  assert.equal(claudeOptsLog[0].resume, null); // the first round does not resume
+  assert.equal(claudeOptsLog[0].cwd, '/wt'); // code edits must happen in the isolated worktree
+  assert.equal(claudeOptsLog[1].resume, fixer); // second round: resume the same session (carrying the context, losing nothing from the previous round)
   assert.equal(claudeOptsLog[1].cwd, '/wt');
-  assert.doesNotMatch(lastClaudePrompt, /\{\{\w+\}\}/, 'gate-c-fix-resume 真渲染有未喂变量');
-  // 分段哨兵（SF5）：抓变量互换——FINDINGS 落「Feedback to address this round」段、WORKTREE 落开头 intro。
-  assert.match(section(lastClaudePrompt, '## Feedback to address this round'), /FAIL libs\/x/, 'FINDINGS 须落在「Feedback to address this round」段');
-  assert.match(intro(lastClaudePrompt), /\/wt/, 'WORKTREE 须在 intro（resume 模板开头）');
-  assert.doesNotMatch(section(lastClaudePrompt, '## Feedback to address this round'), /\/wt/, 'worktree 路径串进反馈段=互换，必红');
+  assert.doesNotMatch(lastClaudePrompt, /\{\{\w+\}\}/, 'the real gate-c-fix-resume render has an unfed variable');
+  // Per-section sentinels (SF5) catching swapped variables: FINDINGS belongs in the "Feedback to address this
+  // round" section, WORKTREE in the intro.
+  assert.match(section(lastClaudePrompt, '## Feedback to address this round'), /FAIL libs\/x/, 'FINDINGS must land in the "Feedback to address this round" section');
+  assert.match(intro(lastClaudePrompt), /\/wt/, 'WORKTREE must be in the intro (the top of the resume template)');
+  assert.doesNotMatch(section(lastClaudePrompt, '## Feedback to address this round'), /\/wt/, 'the worktree path leaking into the feedback section means the variables were swapped, and must fail');
 });
 
-test('CI 跑不起来（ran=false 基础设施错）→ 抛停泊；绝不当成红让 claude 白改一轮', async () => {
+test('CI cannot run (ran=false, an infrastructure error) -> throw and park; never treated as red and never sent to claude to fix nothing', async () => {
   const id = await mk();
-  hasCommits = true; // 已实现 → review 直接过 CI
-  ciRan = false; // 脚本缺失/spawn 失败/超时
+  hasCommits = true; // already implemented -> the review goes straight to CI
+  ciRan = false; // a missing script, a spawn failure, or a timeout
   const s = (await sessions.get(id))!;
-  await assert.rejects(() => runGateCLoop(s)); // 引擎据 review ok:false 抛 → worker 停泊 GATE_C_FAILED
-  assert.equal(claudeCalls, 0); // 基础设施错 ≠ 红：绝不触发改方
+  await assert.rejects(() => runGateCLoop(s)); // the engine throws on review ok:false -> the worker parks at GATE_C_FAILED
+  assert.equal(claudeCalls, 0); // an infrastructure error is not a red result: no revision is triggered
   assert.equal(commitCalls, 0);
 });
 
-test('CI 绿但 CI 自身改脏 worktree（green-but-dirty）→ 抛停泊（对 HEAD 假阳性，绝不放行）', async () => {
+test('CI green but CI itself dirtied the worktree (green-but-dirty) -> throw and park (a false positive for HEAD, never let through)', async () => {
   const id = await mk();
   hasCommits = true;
-  ciOkQueue = [true]; // CI 退 0
-  cleanQueue = [false]; // 但 CI 跑后 worktree 脏（codegen/format 改了 tracked 文件）
+  ciOkQueue = [true]; // CI exits 0
+  cleanQueue = [false]; // but the worktree is dirty after CI ran (codegen or formatting touched tracked files)
   const s = (await sessions.get(id))!;
-  await assert.rejects(() => runGateCLoop(s), /改脏了 worktree/);
-  assert.equal(claudeCalls, 0); // review-first 抛，无改方
+  await assert.rejects(() => runGateCLoop(s), /dirtied the worktree/);
+  assert.equal(claudeCalls, 0); // review-first throws, so no revision happens
 });
 
-test('fix：commit 失败（worktree 可能脏）→ 抛停泊，且绝不带脏树跑 CI', async () => {
+test('fix: the commit fails (the worktree may be dirty) -> throw and park, and CI is never run on a dirty tree', async () => {
   const id = await mk();
   commitResult = { ok: false, committed: false, output: 'commit boom' };
   const s = (await sessions.get(id))!;
-  await assert.rejects(() => runGateCLoop(s), /落提交失败/);
+  await assert.rejects(() => runGateCLoop(s), /failed to make the commit/);
   assert.equal(commitCalls, 1);
-  assert.equal(ciCalls, 0); // unimplemented review 未跑 CI；fix 在 commit 处即抛，绝不带脏树过 CI
+  assert.equal(ciCalls, 0); // the unimplemented review ran no CI, and fix throws at the commit, so CI never sees a dirty tree
 });
 
-test('fix：提交后 worktree 仍非 clean → 抛停泊（CI 须验 HEAD，不验脏树）', async () => {
+test('fix: the worktree is still not clean after the commit -> throw and park (CI must verify HEAD, not a dirty tree)', async () => {
   const id = await mk();
-  cleanQueue = [false]; // commit 后 worktree 仍脏
+  cleanQueue = [false]; // still dirty after the commit
   const s = (await sessions.get(id))!;
-  await assert.rejects(() => runGateCLoop(s), /CI 须验 HEAD/);
+  await assert.rejects(() => runGateCLoop(s), /CI must verify HEAD/);
   assert.equal(commitCalls, 1);
   assert.equal(ciCalls, 0);
 });
 
-test('claude 改方调用失败（瞬断）→ paused、不推进、不 commit（不把失败误计为多轮未消解）', async () => {
+test('the claude revision call fails (a drop-out) -> paused, no advance, no commit (a failure must not be counted as another unresolved round)', async () => {
   const id = await mk();
-  claudeOkQueue = [false]; // 改方 claude 瞬断
+  claudeOkQueue = [false]; // the revision claude drops out
   const out = await runGateCLoop((await sessions.get(id))!);
   assert.equal(out.paused, true);
-  assert.equal(commitCalls, 0); // res.ok=false → 绝不落提交
+  assert.equal(commitCalls, 0); // res.ok = false -> nothing is ever committed
   assert.equal(claudeCalls, 1);
 });
 
-test('claude 升级 needs_human → needsHuman 出口（实现已落、等 M 拍板）', async () => {
+test('claude escalates needs_human -> the needsHuman exit (the implementation landed; it is waiting on the owner to decide)', async () => {
   const id = await mk();
-  claudeFix = JSON.stringify({ summary: '实现了但有取舍要拍板', needs_human: [{ id: 'H1', question: '退到余额还是原路退款？', options: [], context: '', severity: 'high' }] });
+  claudeFix = JSON.stringify({ summary: 'implemented, but there is a trade-off to decide', needs_human: [{ id: 'H1', question: 'refund as store credit, or back to the original route?', options: [], context: '', severity: 'high' }] });
   const out = await runGateCLoop((await sessions.get(id))!);
   assert.ok(out.needsHuman && out.needsHuman.length === 1);
-  assert.equal(commitCalls, 1); // 这轮实现已落提交，升级的是决策不是阻断
+  assert.equal(commitCalls, 1); // this round's implementation was committed; what escalated is a decision, not a blockage
 });
 
-test('REVISION：负责人答复 → fix-first 无条件落实（带回上一轮升级问 + 答复进 prompt）→ 成功后清 pending + 留痕', async () => {
+test('REVISION: the owner answers -> fix-first applies it unconditionally (carrying the previous round\'s escalated question and the answer into the prompt) -> on success the pending input is cleared and an event is recorded', async () => {
   const id = await mk({
-    gate_c_pending_input: '走原路退款，并加幂等键防重复退款',
-    // 上一轮 claude 升级、待拍板的点：peekHumanAnswer 须把它拼进上下文，让 claude 知道答的是哪问。
-    gate_c_human_asks: JSON.stringify([{ id: 'H1', question: '退款方式：退余额 or 走原路？', options: [], context: '', severity: 'high' }]),
+    gate_c_pending_input: 'refund back to the original route, and add an idempotency key to prevent double refunds',
+    // The point claude escalated last round, awaiting a decision: peekHumanAnswer must splice it into the
+    // context so claude knows which question is being answered.
+    gate_c_human_asks: JSON.stringify([{ id: 'H1', question: 'refund method: store credit or the original route?', options: [], context: '', severity: 'high' }]),
   });
   const out = await runGateCLoop((await sessions.get(id))!);
-  assert.match(lastClaudePrompt, /退款方式：退余额 or 走原路/, '须带回上一轮升级问做上下文（否则答复脱离问题）');
-  assert.match(lastClaudePrompt, /走原路退款/, '负责人答复必须喂进 fixer prompt（否则决定丢了）');
+  assert.match(lastClaudePrompt, /refund method: store credit or the original route/, 'the previous round\'s escalated question must be carried back as context (otherwise the answer floats free of the question)');
+  assert.match(lastClaudePrompt, /refund back to the original route/, 'the owner\'s answer must be fed into the fixer prompt (otherwise the decision is lost)');
   const s = (await sessions.get(id))!;
-  assert.equal(s.gate_c_pending_input, null); // 成功落盘才消费答复
-  assert.equal(s.gate_c_human_asks, null); // 答复消费时一并清掉旧升级问
+  assert.equal(s.gate_c_pending_input, null); // the answer is only consumed once it has been persisted successfully
+  assert.equal(s.gate_c_human_asks, null); // consuming the answer clears the stale escalated question too
   assert.ok((await sessions.events(id)).some((e) => e.kind === 'gatec_human_answer_consumed'));
-  assert.equal(out.resolved, true); // fix-first 后续审 CI 绿 → LGTM
+  assert.equal(out.resolved, true); // after fix-first, the follow-up review sees a green CI -> LGTM
 });
 
-test('改方坏 JSON → parseFixResult 返回 null 触发引擎自愈（resume 回喂重出）→ 恢复，绝不静默放行旧稿', async () => {
+test('a revision with broken JSON -> parseFixResult returns null, which triggers the engine\'s self-healing (resume and feed back for a re-emit) -> it recovers, and the old draft is never silently let through', async () => {
   const id = await mk();
-  // 首个改方输出坏 JSON（解析失败），重出后给合法 JSON。parseFixResult 须返回 null 让引擎走 parse-repair，而非吞掉静默放行。
-  claudeTextQueue = ['完全不是 JSON 的自然语言回答', JSON.stringify({ summary: '重出：实现完成', needs_human: [] })];
-  // 第二次（repair 重出）只是重出 JSON、未改文件 → 建模为 no-op 提交（committed:false）。driver 须容忍：不抛、不停。
-  commitQueue = [{ ok: true, committed: true, output: 'committed' }, { ok: true, committed: false, output: '无改动（repair 重出未改文件）' }];
+  // The first revision output is broken JSON (it fails to parse), and the re-emit returns valid JSON.
+  // parseFixResult must return null so the engine runs parse-repair, rather than swallowing it and letting the
+  // old draft through.
+  claudeTextQueue = ['a natural-language answer that is not JSON at all', JSON.stringify({ summary: 're-emitted: implementation complete', needs_human: [] })];
+  // The second call (the repair re-emit) only re-emits JSON and changes no files -> modelled as a no-op commit
+  // (committed:false). The driver must tolerate it: no throw, no stall.
+  commitQueue = [{ ok: true, committed: true, output: 'committed' }, { ok: true, committed: false, output: 'no changes (the repair re-emit edited no files)' }];
   const out = await runGateCLoop((await sessions.get(id))!);
   const s = (await sessions.get(id))!;
-  assert.equal(out.paused, true); // 自愈成功 → 正常推进（每-tick=1 → 暂停；不抛、不停泊）
-  assert.equal(lastPersisted!.last_summary, '重出：实现完成'); // 落的是重出后的合法稿
-  // 收紧（Codex SF3 + 二审 Nit1）：repair 重出不得污染轮次/计费；no-op 提交不得让 driver 抛/停。
-  assert.equal(claudeCalls, 2); // 恰：坏 JSON 一次 + resume 重出一次（不多吞、不少修）
-  assert.equal(s.gate_c_round, 1); // 自愈在「同一轮」内完成——绝不把 repair 误计成额外 round
-  assert.equal(commitCalls, 2); // driver 每次 claude 成功都试落提交；第二次返回 committed:false（no-op）driver 照常放行
-  assert.ok(Math.abs((s.gate_c_cost_usd ?? 0) - 0.02) < 1e-9, '两次 claude 调用都计费（repair 也付费），恰 0.02'); // 防计费漏/重
+  assert.equal(out.paused, true); // the self-heal succeeded -> normal progress (per-tick = 1 -> pause; no throw, no park)
+  assert.equal(lastPersisted!.last_summary, 're-emitted: implementation complete'); // what is persisted is the valid re-emitted draft
+  // Tightening (Codex SF3 + second review, nit 1): a repair re-emit must not pollute the round counter or the
+  // cost, and a no-op commit must not make the driver throw or stall.
+  assert.equal(claudeCalls, 2); // exactly: one broken JSON + one resume re-emit (nothing swallowed, nothing extra)
+  assert.equal(s.gate_c_round, 1); // the self-heal completes inside the *same* round - a repair is never counted as an extra round
+  assert.equal(commitCalls, 2); // the driver tries to commit after every successful claude call; the second returns committed:false (a no-op) and the driver carries on
+  assert.ok(Math.abs((s.gate_c_cost_usd ?? 0) - 0.02) < 1e-9, 'both claude calls are billed (a repair costs money too), so exactly 0.02'); // guards against missed or double billing
 });
 
-test('到硬上限仍不绿 → stalled + 残留落 gate_c_residual（交 M 裁决，绝不静默放行）', async () => {
+test('still not green at the hard cap -> stalled, with the residue persisted to gate_c_residual (handed to the owner to arbitrate, never silently let through)', async () => {
   const id = await mk();
   hasCommits = true;
-  ciOkDefault = false; // 每轮 CI 都红
+  ciOkDefault = false; // CI is red every round
   let out = await runGateCLoop((await sessions.get(id))!);
-  for (let i = 0; i < 4 && !out.stalled; i++) out = await runGateCLoop((await sessions.get(id))!); // max_rounds=4，per-tick=1 → 第 4 轮触顶
+  for (let i = 0; i < 4 && !out.stalled; i++) out = await runGateCLoop((await sessions.get(id))!); // max_rounds = 4, per-tick = 1 -> the cap is hit on round 4
   assert.equal(out.stalled, true);
   const residual = (await sessions.get(id))!.gate_c_residual;
-  assert.ok(residual, '到上限须落残留交人工裁决');
+  assert.ok(residual, 'reaching the cap must persist the residue for a human to arbitrate');
   const parsed = JSON.parse(residual!) as { used: string; findings: unknown[] };
-  assert.equal(parsed.used, 'ci'); // reviewer 是确定性 CI
-  assert.ok(parsed.findings.length >= 1); // 残留意见（CI 失败摘要）非空
+  assert.equal(parsed.used, 'ci'); // the reviewer is deterministic CI
+  assert.ok(parsed.findings.length >= 1); // the residual findings (the CI failure summary) are not empty
 });

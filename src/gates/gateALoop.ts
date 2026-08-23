@@ -5,7 +5,7 @@ import { strictParse } from '../llm/structured.ts';
 import { loadConfig } from '../config.ts';
 import { log } from '../util/log.ts';
 import { store } from '../store/index.ts';
-const { patch, get, appendEvent } = store; // 经 SessionStore 接缝取本地实现方法（自由函数无 this，解构安全）
+const { patch, get, appendEvent } = store; // take the local implementation methods through the SessionStore seam (free functions have no `this`, so destructuring is safe)
 import { GateASchema, VerdictSchema, GateAFixResultSchema, GATE_A_VERDICT_CONTRACT, GATE_A_FIX_CONTRACT, findingsToMd } from './envelopes.ts';
 import type { GateAEnvelope } from './envelopes.ts';
 import { projectForSession } from '../projects.ts';
@@ -14,12 +14,13 @@ import { makeReviewFixDrivers } from '../review/drivers.ts';
 import type { ReviewFixConfig, ReviewFixDrivers, ReviewFixOutcome } from '../review/reviewFixLoop.ts';
 import type { Session } from '../types.ts';
 
-// gate-a.json 路径与读写（对抗 loop 就地更新 claude 复评定稿，codex 审⇄claude 改 反复刷新它）。
+// The path to gate-a.json and its read/write helpers (the adversarial loop updates claude's re-reviewed
+// final draft in place, and the codex-reviews / claude-revises cycle refreshes it repeatedly).
 function gateAOutPath(s: Session): string {
   return s.gate_a_output_path ?? resolve(sessionLogDir(s.id), 'gate-a.json');
 }
 export function readGateAEnvelope(s: Session): GateAEnvelope {
-  return GateASchema.parse(JSON.parse(readFileSync(gateAOutPath(s), 'utf8'))); // 缺/坏 → 抛（worker 停泊 GATE_A_FAILED）
+  return GateASchema.parse(JSON.parse(readFileSync(gateAOutPath(s), 'utf8'))); // missing or broken -> throws (the worker parks at GATE_A_FAILED)
 }
 async function persistGateAEnvelope(s: Session, env: GateAEnvelope): Promise<void> {
   const p = gateAOutPath(s);
@@ -27,19 +28,21 @@ async function persistGateAEnvelope(s: Session, env: GateAEnvelope): Promise<voi
   if (s.gate_a_output_path !== p) await patch(s.id, { gate_a_output_path: p });
 }
 
-// 闸A 对抗复审的「评审⇄修订」引擎配置：reviewer=codex 审 PRD 评审结论、fixer=claude 改评审 envelope。
-// 与闸B 的关键差异：**不升级人在环**（PRD 拿不准走 PM loop）——peekHumanAnswer 恒 null、needsHuman 恒空。
+// The review/revise engine configuration for Gate A's adversarial pass: the reviewer is codex reviewing the
+// PRD review verdict, and the fixer is claude revising the review envelope.
+// The key difference from Gate B: it **never escalates to a human in the loop** (uncertain PRD points go
+// through the PM loop) — peekHumanAnswer is always null and needsHuman is always empty.
 function gateAConfig(s: Session): ReviewFixConfig<GateAEnvelope> {
   const cfg = loadConfig();
   const max = Math.max(1, cfg.runtime.adversarial.max_rounds ?? 3);
-  const perTick = Math.min(max, 2); // 每次 step() 最多跑 2 轮，防霸占 tick 锁
-  const cur = async (): Promise<Session> => (await get(s.id))!; // 每次现读 DB（get 现 async）
-  const pid = projectForSession(s).id; // 提示词按项目私有覆盖（缺省走默认）
+  const perTick = Math.min(max, 2); // at most 2 rounds per step(), so it cannot hog the tick lock
+  const cur = async (): Promise<Session> => (await get(s.id))!; // read the DB fresh each time (get is async now)
+  const pid = projectForSession(s).id; // prompts can be privately overridden per project (falling back to the default)
   const jstr = (v: unknown): string => JSON.stringify(v, null, 2);
   const prdText = s.prd_text_path && existsSync(s.prd_text_path) ? readFileSync(s.prd_text_path, 'utf8') : '';
 
   return {
-    label: '闸A 对抗',
+    label: 'Gate A adversarial',
     maxRounds: max,
     maxRoundsPerTick: perTick,
     maxParseRepairRetries: Math.max(0, cfg.runtime.parse_repair_retries ?? 2),
@@ -59,14 +62,18 @@ function gateAConfig(s: Session): ReviewFixConfig<GateAEnvelope> {
     setFixFailStreak: async (n) => { await patch(s.id, { gate_a_fix_fail_streak: n }); },
     loadArtifact: async () => readGateAEnvelope(await cur()),
     persistArtifact: async (art) => persistGateAEnvelope(await cur(), art),
-    // 闸A 不升级人在环：无人工答复管线。
+    // Gate A never escalates to a human in the loop: there is no human-answer pipeline.
     peekHumanAnswer: async () => null,
-    clearHumanAnswer: async () => { /* no-op：闸A 不收人工答复 */ },
-    // codex 首轮带 PRD + 评审结论（resume 续接后 codex 会话已留 PRD，无需重发）。纯构造器：取入参 art，不读 session。
+    clearHumanAnswer: async () => { /* no-op: Gate A takes no human answers */ },
+    // codex's first round carries the PRD plus the review verdict (after a resume, the codex session already
+    // holds the PRD, so it need not be resent). A pure constructor: it takes `art` as a parameter and does not
+    // read the session.
     buildInitialReviewPrompt: (art) => render(loadPrompt('gate-a-adversarial.md', pid), { PRD_TEXT: prdText, GATE_A_OUTPUT: jstr(art) }),
     buildResumeReviewPrompt: (art) => render(loadPrompt('gate-a-review-resume.md', pid), { GATE_A_OUTPUT: jstr(art) }),
     parseVerdict: (text) => strictParse(VerdictSchema, text),
-    // 纯构造器保持同步：用进入循环时的 session 快照 s 读信封（output_path 进 loop 前已定、循环内只增不变）。
+    // The pure constructors stay synchronous: they read the envelope through the session snapshot `s` taken
+    // when the loop was entered (output_path is fixed before the loop and only ever added, never changed,
+    // inside it).
     buildInitialFixPrompt: (findings) =>
       render(loadPrompt('gate-a-fix.md', pid), { GATE_A_OUTPUT: jstr(readGateAEnvelope(s)), FINDINGS: findingsToMd(findings) }),
     buildResumeFixPrompt: (findings) =>
@@ -74,38 +81,41 @@ function gateAConfig(s: Session): ReviewFixConfig<GateAEnvelope> {
     parseFixResult: (text) => {
       try {
         const r = strictParse(GateAFixResultSchema, text);
-        return { artifact: r.artifact, needsHuman: [] }; // 闸A 不升级，恒空
+        return { artifact: r.artifact, needsHuman: [] }; // Gate A never escalates, so this is always empty
       } catch (e) {
-        log.warn(`闸A 改方输出解析失败 → 交引擎自愈/停泊：${String(e).slice(0, 160)}`);
-        return null; // 引擎先自愈（resume 回喂重出），耗尽才停泊（绝不静默放行）
+        log.warn(`Gate A revision output failed to parse -> handing it to the engine to self-heal or park: ${String(e).slice(0, 160)}`);
+        return null; // the engine self-heals first (resume and feed back for a re-emit) and only parks once exhausted (never let it through silently)
       }
     },
     persistResidual: async (round, used, findings) => {
-      // 到上限仍未消解 → 落 gate_a_residual（codex 来源），交 M 裁决（needs_arbitration 卡展示）。
+      // Still unresolved at the cap -> persist into gate_a_residual (sourced from codex) for the maintainer to
+      // arbitrate (shown on the needs_arbitration card).
       await patch(s.id, { gate_a_residual: JSON.stringify({ round, source: 'codex', used, findings }) });
     },
     note: (kind, detail) => appendEvent(s.id, `gatea_adv_${kind}`, detail),
   };
 }
 
-// 真实驱动：复用 makeReviewFixDrivers 工厂（与闸B 同一份，仅 label/落盘名/skip 日志/成本列不同）。
+// The real drivers: reuses the makeReviewFixDrivers factory (the same one Gate B uses, differing only in the
+// labels, the dump filenames, the skip log line and the cost column).
 function gateADrivers(s: Session): ReviewFixDrivers {
   return makeReviewFixDrivers(s, {
-    reviewLabel: '闸A·对抗',
-    reviewClaudeLabel: '闸A·对抗·claude',
-    fixLabel: '闸A·改评审',
+    reviewLabel: 'Gate A · adversarial',
+    reviewClaudeLabel: 'Gate A · adversarial · claude',
+    fixLabel: 'Gate A · revise the review',
     reviewDumpName: 'gate-a-review.raw.txt',
     fixDumpName: 'gate-a-fix.raw.txt',
-    skipLog: 'codex 未安装，on_missing=skip → 跳过闸A 对抗复审',
+    skipLog: 'codex is not installed and on_missing=skip -> skipping the Gate A adversarial review',
     accrueFixCost: async (costUsd) => {
       const c = (await get(s.id))!;
-      await patch(s.id, { gate_a_cost_usd: (c.gate_a_cost_usd ?? 0) + costUsd }); // 累加，不覆盖评审成本
+      await patch(s.id, { gate_a_cost_usd: (c.gate_a_cost_usd ?? 0) + costUsd }); // accrue rather than overwrite the review cost
     },
-    // 闸A 不落 codex token 列（仅闸B 有 gate_b_reviewer_tokens）。
+    // Gate A does not persist a codex token column (only Gate B has gate_b_reviewer_tokens).
   });
 }
 
-// 跑一段闸A 对抗循环（worker 在 GATE_A_ADVERSARIAL 调用），返回结论交 worker 转移。
+// Run a stretch of the Gate A adversarial loop (the worker calls this in GATE_A_ADVERSARIAL) and return the
+// conclusion for the worker to transition on.
 export function runGateALoop(s: Session): Promise<ReviewFixOutcome> {
   return runReviewFixLoop(gateAConfig(s), gateADrivers(s));
 }

@@ -1,5 +1,7 @@
-// 评审⇄修订引擎控制流（用假驱动，不起真 codex/claude）。覆盖：clean / 升级人工 / 多轮收敛 /
-// 硬上限停泊 / 每-tick 上限暂停 / reviewer 不可用降级 / 会话只捕获一次复用 / 人工答复仅首轮带入 / 改方失败重试。
+// The control flow of the review/revise engine (driven by fakes; no real codex or claude runs). It covers:
+// a clean first round, escalating to a human, converging over several rounds, parking at the hard cap, pausing
+// at the per-tick cap, degrading when the reviewer is unavailable, capturing the session exactly once and
+// reusing it, the human answer being carried into the first fix only, and retrying a failed revision.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { runReviewFixLoop } from '../src/review/reviewFixLoop.ts';
@@ -28,7 +30,7 @@ function mkState(o: Partial<State> = {}): State {
   return {
     round: 0, reviewerSession: null, fixerSession: null, artifact: { v: 0 }, humanAnswer: null,
     residual: null, persists: 0, events: [], reviewCalls: [], fixCalls: [], fixHumanAnswers: [],
-    maxRounds: 3, maxRoundsPerTick: 99, maxParseRepairRetries: 0, fixFailStreak: 0, maxFixFailures: 5, ...o, // 默认 0：解析失败立即抛（旧行为），自愈用例显式开
+    maxRounds: 3, maxRoundsPerTick: 99, maxParseRepairRetries: 0, fixFailStreak: 0, maxFixFailures: 5, ...o, // 0 by default: a parse failure throws immediately; the self-healing cases opt in explicitly
   };
 }
 
@@ -39,7 +41,7 @@ function mkCfg(state: State): ReviewFixConfig<{ v: number }> {
     maxRoundsPerTick: state.maxRoundsPerTick,
     maxParseRepairRetries: state.maxParseRepairRetries,
     buildParseRepairPrompt: (kind, error) => `REPAIR:${kind}:${error}`,
-    parseRepairSleep: async () => {}, // 免真睡，回喂调用失败退避在测试中瞬时返回
+    parseRepairSleep: async () => {}, // no real sleeping: the backoff after a failed re-emit call returns instantly in tests
     getRound: () => state.round,
     setRound: (n) => { state.round = n; },
     getReviewerSession: () => state.reviewerSession,
@@ -75,7 +77,7 @@ function mkDrivers(state: State, reviewScript: RevStep[], fixScript: FixStep[]):
       const r = reviewScript[ri++] ?? { verdict: 'LGTM', findings: [] };
       return {
         ok: r.ok ?? true,
-        text: r.parseFail ? 'oops 这不是 JSON {{{' : JSON.stringify({ verdict: r.verdict ?? 'LGTM', findings: r.findings ?? [] }),
+        text: r.parseFail ? 'oops, this is not JSON {{{' : JSON.stringify({ verdict: r.verdict ?? 'LGTM', findings: r.findings ?? [] }),
         sessionId: r.sessionId === undefined ? 'codex-sid' : r.sessionId,
         available: r.available ?? true,
         used: r.used ?? 'codex',
@@ -87,7 +89,7 @@ function mkDrivers(state: State, reviewScript: RevStep[], fixScript: FixStep[]):
       const f = fixScript[fi++] ?? {};
       return {
         ok: f.ok ?? true,
-        text: f.badText ? '改方坏 JSON {{{' : JSON.stringify({ artifact: f.artifact ?? { v: fi }, needs_human: f.needsHuman ?? [] }),
+        text: f.badText ? 'a revision with broken JSON {{{' : JSON.stringify({ artifact: f.artifact ?? { v: fi }, needs_human: f.needsHuman ?? [] }),
         sessionId: f.sessionId === undefined ? 'claude-sid' : f.sessionId,
         costUsd: f.costUsd ?? 0.01,
       };
@@ -95,7 +97,7 @@ function mkDrivers(state: State, reviewScript: RevStep[], fixScript: FixStep[]):
   };
 }
 
-test('首轮 clean → resolved，捕获 reviewer 会话', async () => {
+test('a clean first round -> resolved, and the reviewer session is captured', async () => {
   const st = mkState();
   const out = await runReviewFixLoop(mkCfg(st), mkDrivers(st, [{ verdict: 'LGTM', findings: [] }], []));
   assert.equal(out.resolved, true);
@@ -104,7 +106,7 @@ test('首轮 clean → resolved，捕获 reviewer 会话', async () => {
   assert.equal(st.fixCalls.length, 0);
 });
 
-test('needs_revision → 改方升级 needs_human → 暂停等人工', async () => {
+test('needs_revision -> the revision escalates needs_human -> pause and wait for a human', async () => {
   const st = mkState();
   const out = await runReviewFixLoop(mkCfg(st),
     mkDrivers(st, [{ verdict: 'CHANGES_REQUESTED', findings: [{ issue: 'x' }] }], [{ artifact: { v: 1 }, needsHuman: [{ id: 'H1', question: 'q' }] }]));
@@ -113,22 +115,22 @@ test('needs_revision → 改方升级 needs_human → 暂停等人工', async ()
   assert.equal(out.paused, false);
   assert.equal(out.needsHuman?.length, 1);
   assert.equal(st.fixerSession, 'claude-sid');
-  assert.equal(st.persists, 1); // 改方稿已落盘
+  assert.equal(st.persists, 1); // the revised draft was persisted
 });
 
-test('两轮收敛：needs_revision→改→clean，第二轮 reviewer 走 resume（会话复用）', async () => {
+test('converging in two rounds: needs_revision -> revise -> clean, with the second round\'s reviewer resuming (the session is reused)', async () => {
   const st = mkState();
   const out = await runReviewFixLoop(mkCfg(st),
     mkDrivers(st, [{ verdict: 'CHANGES_REQUESTED', findings: [{ i: 1 }] }, { verdict: 'LGTM', findings: [] }], [{ artifact: { v: 1 }, needsHuman: [] }]));
   assert.equal(out.resolved, true);
   assert.equal(out.round, 2);
   assert.equal(st.reviewCalls[0].firstCall, true);
-  assert.equal(st.reviewCalls[1].firstCall, false); // 第二轮 resume
-  assert.equal(st.reviewCalls[1].sessionId, 'codex-sid'); // 复用同一会话
-  assert.equal(st.fixCalls[0].sessionId, null); // 首个 fix 是新会话
+  assert.equal(st.reviewCalls[1].firstCall, false); // the second round resumes
+  assert.equal(st.reviewCalls[1].sessionId, 'codex-sid'); // reusing the same session
+  assert.equal(st.fixCalls[0].sessionId, null); // the first fix opens a new session
 });
 
-test('到硬上限仍未消解 → stalled + 残留落盘', async () => {
+test('still unresolved at the hard cap -> stalled, with the residue persisted', async () => {
   const st = mkState({ maxRounds: 2 });
   const out = await runReviewFixLoop(mkCfg(st),
     mkDrivers(st, [{ verdict: 'CHANGES_REQUESTED', findings: [{ i: 1 }] }, { verdict: 'CHANGES_REQUESTED', findings: [{ i: 2 }, { i: 3 }] }], [{ artifact: { v: 1 }, needsHuman: [] }]));
@@ -138,75 +140,75 @@ test('到硬上限仍未消解 → stalled + 残留落盘', async () => {
   assert.equal(st.residual?.findings.length, 2);
 });
 
-test('到每-tick 上限 → paused（自转移，下个 tick 续）', async () => {
+test('reaching the per-tick cap -> paused (it transitions itself and continues on the next tick)', async () => {
   const st = mkState({ maxRoundsPerTick: 1 });
   const out = await runReviewFixLoop(mkCfg(st),
     mkDrivers(st, [{ verdict: 'CHANGES_REQUESTED', findings: [{ i: 1 }] }, { verdict: 'LGTM', findings: [] }], [{ artifact: { v: 1 }, needsHuman: [] }]));
   assert.equal(out.paused, true);
   assert.equal(out.round, 1);
-  assert.equal(st.reviewCalls.length, 1); // 没跑到第二轮评审
+  assert.equal(st.reviewCalls.length, 1); // it never reached a second review round
 });
 
-test('reviewer 不可用（on_missing=skip）→ resolved(unknown)，不丢稿', async () => {
+test('the reviewer is unavailable (on_missing=skip) -> resolved with verdict "unknown", and the draft is not lost', async () => {
   const st = mkState();
   const out = await runReviewFixLoop(mkCfg(st), mkDrivers(st, [{ available: false }], []));
   assert.equal(out.resolved, true);
   assert.equal(out.verdict, 'unknown');
-  assert.equal(st.round, 0); // 不计轮
+  assert.equal(st.round, 0); // no round is counted
 });
 
-test('reviewer 调用失败（available 但 !ok）→ 抛出（worker 停泊，绝不静默放行）', async () => {
+test('the reviewer call fails (available but !ok) -> throw (the worker parks; it is never let through silently)', async () => {
   const st = mkState();
   await assert.rejects(
     () => runReviewFixLoop(mkCfg(st), mkDrivers(st, [{ ok: false, available: true }], [])),
-    /调用失败/,
+    /review call failed/,
   );
 });
 
-test('reviewer 输出无法解析 → 抛出（绝不静默按通过）', async () => {
+test('the reviewer output cannot be parsed -> throw (it is never silently treated as approved)', async () => {
   const st = mkState();
   await assert.rejects(
     () => runReviewFixLoop(mkCfg(st), mkDrivers(st, [{ parseFail: true }], [])),
-    /解析失败/,
+    /failed to parse/,
   );
 });
 
-test('续修：带人工答复时强制先 fix——即便 reviewer 随后判 clean，答复也已落 artifact（核心回归）', async () => {
-  const st = mkState({ humanAnswer: 'M: 退到余额' });
-  // reviewer 首轮就 clean：若不 fix-first，答复会被消费却没改稿
+test('resuming: with a human answer present it fixes first - even if the reviewer then says clean, the answer has already landed in the artifact (the core regression)', async () => {
+  const st = mkState({ humanAnswer: 'M: refund as store credit' });
+  // the reviewer says clean on the very first round: without fix-first, the answer would be consumed without ever changing the draft
   const out = await runReviewFixLoop(mkCfg(st),
     mkDrivers(st, [{ verdict: 'LGTM', findings: [] }], [{ artifact: { v: 99 }, needsHuman: [] }]));
   assert.equal(out.resolved, true);
-  assert.equal(st.fixCalls.length, 1); // fixer 被调用（fix-first）
-  assert.equal(st.fixHumanAnswers[0], 'M: 退到余额'); // 答复进了 fixer
-  assert.equal(st.persists, 1); // artifact 落盘
-  assert.deepEqual(st.artifact, { v: 99 }); // 落的是 fixer 改后的稿
-  assert.equal(st.humanAnswer, null); // 成功后才清
+  assert.equal(st.fixCalls.length, 1); // the fixer was called (fix-first)
+  assert.equal(st.fixHumanAnswers[0], 'M: refund as store credit'); // the answer reached the fixer
+  assert.equal(st.persists, 1); // the artifact was persisted
+  assert.deepEqual(st.artifact, { v: 99 }); // what was persisted is the fixer's revised draft
+  assert.equal(st.humanAnswer, null); // only cleared after it succeeded
 });
 
-test('续修：负责人决定先落稿，随后复审意见继续被修订，且决定不被重复喂给第二次 fix', async () => {
-  const st = mkState({ humanAnswer: 'M: 接受余额退款，补幂等验收' });
+test('resuming: the owner\'s decision lands first, the review findings are then revised as well, and the decision is not fed again into the second fix', async () => {
+  const st = mkState({ humanAnswer: 'M: accept store-credit refunds, and add idempotency acceptance' });
   const out = await runReviewFixLoop(mkCfg(st),
     mkDrivers(
       st,
       [
-        { verdict: 'CHANGES_REQUESTED', findings: [{ issue: '缺少退款幂等验收' }] },
+        { verdict: 'CHANGES_REQUESTED', findings: [{ issue: 'refund idempotency acceptance is missing' }] },
         { verdict: 'LGTM', findings: [] },
       ],
       [
-        { artifact: { v: 10 }, needsHuman: [] }, // 先落实 M 的决定
-        { artifact: { v: 11 }, needsHuman: [] }, // 再消化复审意见
+        { artifact: { v: 10 }, needsHuman: [] }, // apply the owner's decision first
+        { artifact: { v: 11 }, needsHuman: [] }, // then work through the review findings
       ],
     ));
   assert.equal(out.resolved, true);
   assert.deepEqual(st.artifact, { v: 11 });
-  assert.deepEqual(st.fixHumanAnswers, ['M: 接受余额退款，补幂等验收', null]);
+  assert.deepEqual(st.fixHumanAnswers, ['M: accept store-credit refunds, and add idempotency acceptance', null]);
   assert.equal(st.persists, 2);
   assert.equal(st.humanAnswer, null);
 });
 
-test('续修：on_missing=skip 也先 fix（reviewer 不可用不让答复白丢）', async () => {
-  const st = mkState({ humanAnswer: 'M: 退到余额' });
+test('resuming: it fixes first under on_missing=skip too (an unavailable reviewer must not throw the answer away)', async () => {
+  const st = mkState({ humanAnswer: 'M: refund as store credit' });
   const out = await runReviewFixLoop(mkCfg(st),
     mkDrivers(st, [{ available: false }], [{ artifact: { v: 7 }, needsHuman: [] }]));
   assert.equal(out.resolved, true);
@@ -215,168 +217,171 @@ test('续修：on_missing=skip 也先 fix（reviewer 不可用不让答复白丢
   assert.deepEqual(st.artifact, { v: 7 });
 });
 
-test('续修：fix-first 调用失败 → paused 且不清 humanAnswer（下个 tick 重试，答复不丢）', async () => {
-  const st = mkState({ humanAnswer: 'M: 退到余额' });
+test('resuming: the fix-first call fails -> paused, and humanAnswer is not cleared (the next tick retries and the answer is not lost)', async () => {
+  const st = mkState({ humanAnswer: 'M: refund as store credit' });
   const out = await runReviewFixLoop(mkCfg(st),
     mkDrivers(st, [{ verdict: 'LGTM', findings: [] }], [{ ok: false }]));
   assert.equal(out.paused, true);
-  assert.equal(st.humanAnswer, 'M: 退到余额'); // 未清 → 下个 tick 重试
+  assert.equal(st.humanAnswer, 'M: refund as store credit'); // not cleared -> the next tick retries
   assert.equal(st.persists, 0);
 });
 
-test('续修：fix-first 又引出新 needs_human → 再次停泊（答复已落、再升级）', async () => {
-  const st = mkState({ humanAnswer: 'M: 部分采纳' });
+test('resuming: fix-first raises a fresh needs_human -> park again (the answer landed, and it escalates once more)', async () => {
+  const st = mkState({ humanAnswer: 'M: partially accepted' });
   const out = await runReviewFixLoop(mkCfg(st),
-    mkDrivers(st, [], [{ artifact: { v: 5 }, needsHuman: [{ id: 'H2', question: '那退款时效？' }] }]));
+    mkDrivers(st, [], [{ artifact: { v: 5 }, needsHuman: [{ id: 'H2', question: 'then what is the refund window?' }] }]));
   assert.equal(out.needsHuman?.length, 1);
-  assert.equal(st.persists, 1); // 已落 artifact
-  assert.equal(st.humanAnswer, null); // 旧答复已消费
+  assert.equal(st.persists, 1); // the artifact was persisted
+  assert.equal(st.humanAnswer, null); // the old answer was consumed
 });
 
-test('续修：fix-first 输出坏 JSON → 抛出，且不清 humanAnswer、不落 fallback（核心回归）', async () => {
-  const st = mkState({ humanAnswer: 'M: 退到余额' });
+test('resuming: the fix-first output is broken JSON -> throw, without clearing humanAnswer and without falling back (the core regression)', async () => {
+  const st = mkState({ humanAnswer: 'M: refund as store credit' });
   await assert.rejects(
     () => runReviewFixLoop(mkCfg(st), mkDrivers(st, [{ verdict: 'LGTM', findings: [] }], [{ badText: true }])),
-    /解析失败/,
+    /failed to parse/,
   );
-  assert.equal(st.humanAnswer, 'M: 退到余额'); // 未清 → retry 后重新落实
-  assert.equal(st.persists, 0); // 绝不 fallback 旧稿
+  assert.equal(st.humanAnswer, 'M: refund as store credit'); // not cleared -> the retry applies it again
+  assert.equal(st.persists, 0); // it never falls back to the old draft
 });
 
-test('续修：fix-first 首发坏 JSON → 自愈 resume **同 fixer 会话** 重出 → 好（落实后才清答复）', async () => {
-  // 不变量：fix-first 成功调用即 pin fixer 会话（setFixerSession），故自愈回喂走 resume 同会话——
-  // 否则重出会开新会话、丢掉首发时带入的负责人答复上下文。answer 只在最终落盘成功后才清。
-  const st = mkState({ humanAnswer: 'M: 退到余额', maxParseRepairRetries: 1 });
+test('resuming: the first fix-first output is broken JSON -> self-heal by resuming **the same fixer session** for a re-emit -> good (the answer is only cleared once it has landed)', async () => {
+  // The invariant: a successful fix-first call pins the fixer session (setFixerSession), so the self-healing
+  // re-emit resumes that same session - otherwise the re-emit would open a new session and lose the owner's
+  // answer that the first call carried in. The answer is only cleared once it has been persisted successfully.
+  const st = mkState({ humanAnswer: 'M: refund as store credit', maxParseRepairRetries: 1 });
   const out = await runReviewFixLoop(mkCfg(st),
     mkDrivers(st, [{ verdict: 'LGTM', findings: [] }], [{ badText: true }, { artifact: { v: 88 } }]));
   assert.equal(out.resolved, true);
-  assert.equal(st.fixCalls.length, 2); // fix-first + 一次自愈重出
-  assert.equal(st.fixCalls[0].sessionId, null); // 首发是新会话
-  assert.equal(st.fixCalls[1].sessionId, 'claude-sid'); // 关键：自愈走 resume 同 fixer 会话（不丢答复上下文）
-  assert.deepEqual(st.artifact, { v: 88 }); // 落的是重出后的稿
+  assert.equal(st.fixCalls.length, 2); // fix-first plus one self-healing re-emit
+  assert.equal(st.fixCalls[0].sessionId, null); // the first call opens a new session
+  assert.equal(st.fixCalls[1].sessionId, 'claude-sid'); // the key point: the self-heal resumes the same fixer session (so the answer's context is not lost)
+  assert.deepEqual(st.artifact, { v: 88 }); // what is persisted is the re-emitted draft
   assert.equal(st.persists, 1);
-  assert.equal(st.humanAnswer, null); // 落盘成功后才清
+  assert.equal(st.humanAnswer, null); // only cleared once it persisted successfully
 });
 
-test('改方输出坏 JSON（循环内）→ 抛出（不静默保留旧稿放行）', async () => {
+test('the revision output is broken JSON (inside the loop) -> throw (the old draft is never silently kept and let through)', async () => {
   const st = mkState();
   await assert.rejects(
     () => runReviewFixLoop(mkCfg(st), mkDrivers(st, [{ verdict: 'CHANGES_REQUESTED', findings: [{ i: 1 }] }], [{ badText: true }])),
-    /解析失败/,
+    /failed to parse/,
   );
   assert.equal(st.persists, 0);
-  assert.equal(st.round, 0); // 坏输出不是一轮有效修订，不能消耗轮次
+  assert.equal(st.round, 0); // a bad output is not a valid revision round, so it must not consume one
 });
 
-test('人工答复仅首个 fix 带入，之后为 null', async () => {
-  const st = mkState({ humanAnswer: 'M说原路退' });
+test('the human answer is carried into the first fix only, and is null thereafter', async () => {
+  const st = mkState({ humanAnswer: 'M says refund via the original route' });
   const out = await runReviewFixLoop(mkCfg(st),
     mkDrivers(st,
       [{ verdict: 'CHANGES_REQUESTED', findings: [{ i: 1 }] }, { verdict: 'CHANGES_REQUESTED', findings: [{ i: 2 }] }, { verdict: 'LGTM', findings: [] }],
       [{ artifact: { v: 1 }, needsHuman: [] }, { artifact: { v: 2 }, needsHuman: [] }]));
   assert.equal(out.resolved, true);
-  assert.equal(st.fixHumanAnswers[0], 'M说原路退');
+  assert.equal(st.fixHumanAnswers[0], 'M says refund via the original route');
   assert.equal(st.fixHumanAnswers[1], null);
 });
 
-test('改方调用失败 → paused，且不推进 round（避免临时故障误计多轮未消解）', async () => {
+test('the revision call fails -> paused, without advancing the round (so a transient fault is not miscounted as several unresolved rounds)', async () => {
   const st = mkState();
   const out = await runReviewFixLoop(mkCfg(st),
     mkDrivers(st, [{ verdict: 'CHANGES_REQUESTED', findings: [{ i: 1 }] }], [{ ok: false }]));
   assert.equal(out.paused, true);
-  assert.equal(st.persists, 0); // 改方失败，没落盘
-  assert.equal(st.round, 0); // 关键：失败轮不计入，下个 tick 重审同一轮号
+  assert.equal(st.persists, 0); // the revision failed, so nothing was persisted
+  assert.equal(st.round, 0); // the key point: a failed round does not count, and the next tick reviews the same round number again
 });
 
-test('断路器：连续 fix 调用失败到 maxFixFailures → stalled（绝不无限 paused 空转，社区 maxAttempts/circuit-breaker 实践）', async () => {
-  const st = mkState({ maxFixFailures: 3 }); // streak 持久在 state，跨「tick」累加
-  // tick 1：review CHANGES → fix ok:false → paused，streak 1
+test('circuit breaker: consecutive fix-call failures reaching maxFixFailures -> stalled (never spin forever in paused; the same maxAttempts / circuit-breaker practice used elsewhere)', async () => {
+  const st = mkState({ maxFixFailures: 3 }); // the streak lives in state and accumulates across "ticks"
+  // tick 1: review CHANGES -> fix ok:false -> paused, streak 1
   let out = await runReviewFixLoop(mkCfg(st),
     mkDrivers(st, [{ verdict: 'CHANGES_REQUESTED', findings: [{ i: 1 }] }], [{ ok: false }]));
   assert.equal(out.paused, true); assert.equal(out.stalled, false); assert.equal(st.fixFailStreak, 1);
-  // tick 2：再失败 → paused，streak 2
+  // tick 2: it fails again -> paused, streak 2
   out = await runReviewFixLoop(mkCfg(st),
     mkDrivers(st, [{ verdict: 'CHANGES_REQUESTED', findings: [{ i: 1 }] }], [{ ok: false }]));
   assert.equal(out.paused, true); assert.equal(st.fixFailStreak, 2);
-  // tick 3：到上限 → 断路器跳闸 stalled（交人），落残留
+  // tick 3: the cap is reached -> the breaker trips into stalled (handed to a human) and the residue is persisted
   out = await runReviewFixLoop(mkCfg(st),
     mkDrivers(st, [{ verdict: 'CHANGES_REQUESTED', findings: [{ i: 1 }, { i: 2 }] }], [{ ok: false }]));
   assert.equal(out.stalled, true);
   assert.equal(out.paused, false);
   assert.equal(st.fixFailStreak, 3);
-  assert.ok(st.events.some((e) => e.k === 'stalled_fix_failures')); // 显式断路事件
-  assert.equal(st.residual?.findings.length, 2); // 残留落盘供人工裁决
-  assert.equal(st.round, 0); // 失败从不推进 round（与 maxRounds 正交，断路器独立兜底）
+  assert.ok(st.events.some((e) => e.k === 'stalled_fix_failures')); // an explicit breaker event
+  assert.equal(st.residual?.findings.length, 2); // the residue is persisted for a human to arbitrate
+  assert.equal(st.round, 0); // failures never advance the round (orthogonal to maxRounds; the breaker is an independent backstop)
 });
 
-test('断路器：fix 成功落盘 → 连续失败计数清零（电路复位）', async () => {
+test('circuit breaker: a fix that persists successfully -> the consecutive-failure count resets (the circuit closes again)', async () => {
   const st = mkState({ maxFixFailures: 3 });
   await runReviewFixLoop(mkCfg(st),
     mkDrivers(st, [{ verdict: 'CHANGES_REQUESTED', findings: [{ i: 1 }] }], [{ ok: false }]));
-  assert.equal(st.fixFailStreak, 1); // 先攒一次失败
+  assert.equal(st.fixFailStreak, 1); // one failure accumulated first
   const out = await runReviewFixLoop(mkCfg(st),
     mkDrivers(st, [{ verdict: 'CHANGES_REQUESTED', findings: [{ i: 1 }] }, { verdict: 'LGTM', findings: [] }], [{ artifact: { v: 1 }, needsHuman: [] }]));
   assert.equal(out.resolved, true);
-  assert.equal(st.fixFailStreak, 0); // 成功 → 复位，不会被旧 streak 误判跳闸
+  assert.equal(st.fixFailStreak, 0); // success resets it, so a stale streak cannot trip the breaker later
 });
 
-// ── 自愈：解析失败 → resume 同会话回喂重出 ──────────────────────────
-test('自愈：verdict 坏一次 → resume 重发 → 好（最终通过，走了二次 review 调用）', async () => {
+// -- Self-healing: a parse failure resumes the same session and feeds it back for a re-emit --
+test('self-healing: the verdict is bad once -> resume and resend -> good (it passes in the end, after a second review call)', async () => {
   const st = mkState({ maxParseRepairRetries: 1 });
   const out = await runReviewFixLoop(mkCfg(st),
     mkDrivers(st, [{ parseFail: true }, { verdict: 'LGTM', findings: [] }], []));
   assert.equal(out.resolved, true);
   assert.equal(out.verdict, 'LGTM');
-  assert.equal(st.reviewCalls.length, 2); // 初评 + 一次自愈重发
-  assert.equal(st.reviewCalls[1].firstCall, false); // 自愈走 resume
+  assert.equal(st.reviewCalls.length, 2); // the initial review plus one self-healing resend
+  assert.equal(st.reviewCalls[1].firstCall, false); // the self-heal resumes
   assert.ok(st.events.some((e) => e.k === 'parse_repair_attempt'));
 });
 
-test('自愈：FixResult 坏一次 → resume 重发 → 好（改方落盘，收敛）', async () => {
+test('self-healing: the FixResult is bad once -> resume and resend -> good (the revision persists and it converges)', async () => {
   const st = mkState({ maxParseRepairRetries: 1 });
   const out = await runReviewFixLoop(mkCfg(st),
     mkDrivers(st,
       [{ verdict: 'CHANGES_REQUESTED', findings: [{ i: 1 }] }, { verdict: 'LGTM', findings: [] }],
       [{ badText: true }, { artifact: { v: 42 } }]));
   assert.equal(out.resolved, true);
-  assert.equal(st.fixCalls.length, 2); // 改方 + 一次自愈重发
-  assert.equal(st.fixCalls[1].sessionId, 'claude-sid'); // 自愈 resume 同 fixer 会话
+  assert.equal(st.fixCalls.length, 2); // the revision plus one self-healing resend
+  assert.equal(st.fixCalls[1].sessionId, 'claude-sid'); // the self-heal resumes the same fixer session
   assert.deepEqual(st.artifact, { v: 42 });
 });
 
-test('自愈：重试耗尽仍坏 → 抛出停泊（绝不静默放行）', async () => {
+test('self-healing: still bad once the retries are exhausted -> throw and park (never let through silently)', async () => {
   const st = mkState({ maxParseRepairRetries: 1 });
   await assert.rejects(
     () => runReviewFixLoop(mkCfg(st), mkDrivers(st, [{ parseFail: true }, { parseFail: true }], [])),
-    /解析失败/,
+    /failed to parse/,
   );
-  assert.equal(st.reviewCalls.length, 2); // 初评 + 1 次自愈，均坏 → 抛
+  assert.equal(st.reviewCalls.length, 2); // the initial review plus one self-heal, both bad -> throw
   assert.ok(st.events.some((e) => e.k === 'parse_repair_exhausted'));
 });
 
-test('自愈：回喂调用持续失败(null) → 内层有限重试后抛（P1-1：不再一抖就终结）', async () => {
+test('self-healing: the re-emit call keeps failing (null) -> throw after the inner bounded retries (so a single blip no longer ends it)', async () => {
   const st = mkState({ maxParseRepairRetries: 2 });
-  // 初评坏 JSON + 之后回喂调用一直 ok:false（null）。内层 reEmitCallRetries 默认 2 → 单轮回喂 3 次仍 null 才抛。
+  // The initial review returns broken JSON, and every re-emit call afterwards is ok:false (null). The inner
+  // reEmitCallRetries defaults to 2, so one repair round calls the re-emit 3 times and only then throws.
   await assert.rejects(
     () => runReviewFixLoop(
       mkCfg(st),
       mkDrivers(st, [{ parseFail: true }, { ok: false, available: true }, { ok: false, available: true }, { ok: false, available: true }], []),
     ),
-    /解析失败/,
+    /failed to parse/,
   );
-  assert.equal(st.reviewCalls.length, 4); // 初评 1 + 回喂重试 3（callRetries+1）
+  assert.equal(st.reviewCalls.length, 4); // 1 initial review + 3 re-emit attempts (callRetries + 1)
   assert.ok(st.events.some((e) => e.k === 'parse_repair_reemit_failed'));
   assert.ok(st.events.some((e) => e.k === 'parse_repair_no_reemit'));
 });
 
-test('自愈：回喂调用先瞬时失败(null)后成功 → 自愈续上不停泊（P1-1）', async () => {
+test('self-healing: the re-emit call fails transiently (null) and then succeeds -> the self-heal carries on without parking', async () => {
   const st = mkState({ maxParseRepairRetries: 2 });
-  // 初评坏 JSON → 回喂第一次 ok:false（瞬时失败）→ 退避后第二次 LGTM（成功自愈）。
+  // The initial review returns broken JSON -> the first re-emit is ok:false (a transient failure) -> after the
+  // backoff the second returns LGTM (the self-heal succeeds).
   const out = await runReviewFixLoop(
     mkCfg(st),
     mkDrivers(st, [{ parseFail: true }, { ok: false, available: true }, { verdict: 'LGTM', findings: [] }], []),
   );
   assert.equal(out.resolved, true);
-  assert.equal(st.reviewCalls.length, 3); // 初评 + 失败1 + 成功1
+  assert.equal(st.reviewCalls.length, 3); // the initial review + 1 failure + 1 success
   assert.ok(st.events.some((e) => e.k === 'parse_repair_reemit_failed'));
 });
