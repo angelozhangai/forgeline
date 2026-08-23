@@ -1,9 +1,14 @@
-// golden eval 的**花钱**部分：用 fixture PRD 真跑闸A 提示词（真 claude），解析产出、对照期望。
-// ⚠️ 调真实 claude（花钱）——**不进 npm run ci**，只由手动 `forge eval` 触发。
+// The part of the golden eval that **costs money**: running the real Gate A prompt (a real claude call) over
+// a fixture PRD, parsing the output and comparing it against the expectations.
+// ⚠️ It calls claude for real and costs money, so it is **not part of npm run ci** and only a manual
+// `forge eval` triggers it.
 //
-// 设计：复用**生产同款** gate-a.md 模板 + output-contract + GateASchema（正是要保护的资产），
-// 只把代码真源换成合成块 + cwd 用中性临时目录 → 隔离、可复现、零副作用（不写库/不发飞书/不动 git）。
-// 评的是「提示词/评审方法在给定 PRD 上的产出形状」，刻意不接活代码真源（那是另一层，留作后续扩展）。
+// The design: reuse the **exact production** gate-a.md template, output-contract and GateASchema (they are
+// the asset being protected), swapping only the code source-of-truth block for a synthetic one and using a
+// neutral temporary cwd — isolated, reproducible and free of side effects (nothing is written to the
+// database, nothing is sent to Feishu, git is untouched).
+// What it measures is "the shape of what the prompt and the review method produce for a given PRD"; it
+// deliberately does not attach a live code source of truth (that is another layer, left for later).
 import { mkdtempSync, rmSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
@@ -20,11 +25,13 @@ import { aggregateFixture, summarize, type AggregatedFixture, type EvalReport } 
 import { judgeAcceptance, acceptanceJudgeChecks } from './judge.ts';
 import { acceptanceMarkdown } from '../util/acceptance.ts';
 
-// 代码真源占位（eval 隔离模式）——明确告诉模型本轮不抓代码、仅凭 PRD/真源文本产出。
+// The code source-of-truth placeholder (eval's isolated mode) — it tells the model plainly that no code is
+// fetched this round and the output comes from the PRD or source-of-truth text alone.
 const EVAL_FRESHNESS =
   '(eval offline mode: code source-of-truth fetching is skipped this round — produce from the text alone. This eval protects the output shape of the gate prompts/review method; it does not represent production code alignment.)';
 
-// 构造与生产 runGateA **同款**的闸A提示词，仅替换代码真源块 + slug（用 fixture 名）。
+// Build the **same** Gate A prompt production's runGateA does, replacing only the code source-of-truth block
+// and the slug (which becomes the fixture's name).
 export function buildGateAEvalPrompt(name: string, prdText: string): string {
   const proj = project();
   return render(loadPrompt('gate-a.md', proj.id), {
@@ -35,31 +42,35 @@ export function buildGateAEvalPrompt(name: string, prdText: string): string {
   });
 }
 
-// 构造与生产 runGateB **同款**的闸B提示词，输入用 fixture 的 prd-truth.md。
+// Build the **same** Gate B prompt production's runGateB does, with the fixture's prd-truth.md as input.
 export function buildGateBEvalPrompt(name: string, prdTruth: string): string {
   const proj = project();
   return render(loadPrompt('gate-b.md', proj.id), { REPO_FRESHNESS: EVAL_FRESHNESS, SLUG: name, PRD_TRUTH: prdTruth });
 }
 
-// 一次评判：形状达标 → 逐条 check + 关键指标（+ judge 等额外 claude 的 extraCost）；否则给出退化原因。
+// One judgement: if the shape holds, the checks and the key metrics (plus the extraCost of any additional
+// claude call such as the judge); otherwise, the reason it degraded.
 type Judgement = { error: string } | { checks: CheckResult[]; metrics: Record<string, number>; extraCost?: number | null };
 
-// 通用 eval 骨架：中性临时 cwd（隔离可复现、零副作用）→ 真 claude → 抽原始 JSON → 交 judge 判（可异步，闸B 的 LLM-judge 要）。
+// The shared eval skeleton: a neutral temporary cwd (isolated, reproducible, no side effects) -> a real
+// claude call -> extract the raw JSON -> hand it to the judge (which may be async, as Gate B's LLM judge
+// needs).
 async function evalOnce(fx: Fixture, buildPrompt: (name: string, input: string) => string, label: string, judge: (raw: unknown, fx: Fixture) => Judgement | Promise<Judgement>): Promise<FixtureResult> {
   const tmp = mkdtempSync(join(tmpdir(), 'forge-eval-'));
   try {
     const res = await runClaude(buildPrompt(fx.name, fx.inputText), { label, cwd: tmp });
     const base = { name: fx.name, desc: fx.expect.desc, checks: [] as CheckResult[], costUsd: res.costUsd };
-    if (!res.ok) return { ...base, schemaValid: false, error: `claude 调用失败：${res.error ?? '未知'}` };
+    if (!res.ok) return { ...base, schemaValid: false, error: `the claude call failed: ${res.error ?? 'unknown'}` };
     let raw: unknown;
     try {
-      raw = extractJsonBlock(res.result); // zod 注入默认值之前抽原始 JSON，供形状合约查显式字段
+      raw = extractJsonBlock(res.result); // extract the raw JSON before zod injects any defaults, so the shape contract can check for explicit fields
     } catch (e) {
-      return { ...base, schemaValid: false, error: `产出无可解析 JSON：${String(e).slice(0, 120)}` };
+      return { ...base, schemaValid: false, error: `the output has no parseable JSON: ${String(e).slice(0, 120)}` };
     }
     const v = await judge(raw, fx);
     if ('error' in v) return { ...base, schemaValid: false, error: v.error };
-    // judge 等额外 claude 的成本累加进 sample（否则总成本/落盘少算）。无 extraCost 时保留原 costUsd（含 null 语义）。
+    // The cost of an extra claude call such as the judge is added to the sample (otherwise the total and what
+    // is persisted under-count it). With no extraCost, the original costUsd is kept, null semantics included.
     const costUsd = v.extraCost != null ? (res.costUsd ?? 0) + v.extraCost : res.costUsd;
     return { ...base, costUsd, schemaValid: true, checks: v.checks, metrics: v.metrics };
   } finally {
@@ -69,26 +80,27 @@ async function evalOnce(fx: Fixture, buildPrompt: (name: string, input: string) 
 
 function judgeGateA(raw: unknown, fx: Fixture): Judgement {
   const missing = missingRawFields(raw);
-  if (missing.length) return { error: `闸A产出形状退化：原始输出缺显式字段 [${missing.join(', ')}]（生产 schema 会默认补全，eval 须挡住「没打分/形状退化的评审」）` };
+  if (missing.length) return { error: `the Gate A output shape has degraded: the raw output is missing the explicit fields [${missing.join(', ')}] (the production schema would fill them in by default, and the eval has to block "a review that scored nothing, with a degraded shape")` };
   const parsed = GateASchema.safeParse(raw);
-  if (!parsed.success) return { error: `产出不符合闸A合约：${formatZodError(parsed.error).slice(0, 160)}` };
+  if (!parsed.success) return { error: `the output does not match the Gate A contract: ${formatZodError(parsed.error).slice(0, 160)}` };
   const env = parsed.data;
   return { checks: checkGateA(env, fx.expect), metrics: { open_questions: env.open_questions.length, risks: env.risks.length, confidence: env.confidence, prd_score: env.prd_score } };
 }
 
 async function judgeGateB(raw: unknown, fx: Fixture): Promise<Judgement> {
   const missing = missingGateBFields(raw);
-  if (missing.length) return { error: `闸B产出形状退化：原始输出缺显式字段 [${missing.join(', ')}]（生产 schema 会默认补全，eval 须挡住技术方案/验收契约退化）` };
+  if (missing.length) return { error: `the Gate B output shape has degraded: the raw output is missing the explicit fields [${missing.join(', ')}] (the production schema would fill them in by default, and the eval has to block a degraded technical plan or acceptance contract)` };
   const parsed = GateBSchema.safeParse(raw);
-  if (!parsed.success) return { error: `产出不符合闸B合约：${formatZodError(parsed.error).slice(0, 160)}` };
+  if (!parsed.success) return { error: `the output does not match the Gate B contract: ${formatZodError(parsed.error).slice(0, 160)}` };
   const env = parsed.data;
   const checks = checkGateB(env, fx.expect);
   const metrics: Record<string, number> = { issue_specs: env.issue_specs.length, acceptance_contracts: env.acceptance.contracts.length, acceptance_scenarios: env.acceptance.scenarios.length, confidence: env.confidence };
-  // 可选 LLM-judge：评 acceptance 语义质量（设了 acceptance_judge 才跑，多一发 claude）。judge 失败 → 转成一条失败 check，不中断整轮。
+  // The optional LLM judge on the acceptance's semantic quality (it only runs when acceptance_judge is set,
+  // since it is another claude call). A failed judge becomes one failing check rather than aborting the round.
   let extraCost: number | null | undefined;
   if (fx.expect.acceptance_judge) {
     const jr = await judgeAcceptance(fx.inputText, acceptanceMarkdown(env.acceptance));
-    extraCost = jr.costUsd; // 不管 judge 过/弱/失败，这一发都已花钱，累加进 sample 成本
+    extraCost = jr.costUsd; // whether the judge passed, called it weak, or failed, the call already cost money, so it is added to the sample's cost
     if (!jr.ok) {
       checks.push({ name: 'acceptance LLM-judge', pass: false, detail: jr.error });
     } else {
@@ -100,12 +112,15 @@ async function judgeGateB(raw: unknown, fx: Fixture): Promise<Judgement> {
   return { checks, metrics, extraCost };
 }
 
-// 跑一个 fixture（按 gate 选闸A/闸B 评判）。cwd 用临时空目录（无项目代码 → 纯凭文本，可复现）。
+// Run one fixture (choosing the Gate A or Gate B judgement by its gate). The cwd is an empty temporary
+// directory, so with no project code around it produces from the text alone and is reproducible.
 export const evalGateA = (fx: Fixture): Promise<FixtureResult> => evalOnce(fx, buildGateAEvalPrompt, `eval:${fx.name}`, judgeGateA);
 export const evalGateB = (fx: Fixture): Promise<FixtureResult> => evalOnce(fx, buildGateBEvalPrompt, `evalB:${fx.name}`, judgeGateB);
 
-// eval 入口：加载 fixtures → 每条顺序真跑 runs 次（避免并发砸限流、成本可控）→ 聚合报告。
-// runs>1：每条跑多次看 LLM 抖动，全过才算过（golden 该稳）。
+// The eval entry point: load the fixtures -> run each of them `runs` times in sequence (avoiding a burst of
+// concurrent calls hitting the rate limit, and keeping the cost predictable) -> aggregate into a report.
+// runs > 1: run each case several times to see the LLM's jitter; every run must pass (a golden case should
+// be stable).
 export async function runEval(opts: { only?: string; runs?: number } = {}): Promise<EvalReport> {
   const runs = Math.max(1, opts.runs ?? 1);
   const fixtures = loadFixtures(undefined, opts.only);

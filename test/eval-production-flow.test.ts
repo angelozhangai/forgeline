@@ -71,7 +71,7 @@ test('退化成 {} → fail（不给「啥都没产出」的评审发绿灯，�
   claudeResult = { ok: true, result: '{}', costUsd: 0.01 };
   const r = await evalGateA(fx);
   assert.equal(r.schemaValid, false);
-  assert.match(r.error ?? '', /形状退化|缺显式字段/);
+  assert.match(r.error ?? '', /shape has degraded|missing the explicit fields/);
 });
 
 test('漏 prd_score / confidence → fail（守「不再打分」这条核心回归）', async () => {
@@ -110,14 +110,14 @@ test('claude 调用失败 → fail，不误判为通过', async () => {
   claudeResult = { ok: false, result: '', costUsd: null, error: '超时' };
   const r = await evalGateA(fx);
   assert.equal(r.schemaValid, false);
-  assert.match(r.error ?? '', /claude 调用失败/);
+  assert.match(r.error ?? '', /the claude call failed/);
 });
 
 test('输出里根本没有 JSON 块 → fail', async () => {
   claudeResult = { ok: true, result: '抱歉我无法完成', costUsd: 0.01 };
   const r = await evalGateA(fx);
   assert.equal(r.schemaValid, false);
-  assert.match(r.error ?? '', /无可解析 JSON/);
+  assert.match(r.error ?? '', /no parseable JSON/);
 });
 
 // ── 闸B（#2）裁判链路 ──
@@ -173,7 +173,7 @@ test('acceptance judge 通过 → judge 的 check 进逐条 + 指标落 metrics'
   const r = await evalGateB(fxBJudge);
   assert.equal(r.schemaValid, true, r.error);
   assert.equal(r.checks.every((c) => c.pass), true, JSON.stringify(r.checks));
-  assert.equal(r.checks.some((c) => c.name.includes('覆盖')), true);
+  assert.equal(r.checks.some((c) => c.name.includes('coverage')), true);
   assert.equal(r.metrics?.acceptance_coverage, 80);
   // judge 这一发的成本累加进 sample（主调用 0.05 + judge 0.02）——否则总成本/落盘少算
   assert.equal(Math.round((r.costUsd ?? 0) * 100) / 100, 0.07);
@@ -184,9 +184,9 @@ test('acceptance judge 判弱 → 覆盖/声明式 check 失败，问题带进 d
   judgeResult = { ok: true, result: JSON.stringify({ coverage: 30, testability: 40, declarative: false, issues: ['漏退款路径'], verdict: 'weak' }), costUsd: 0.02 };
   const r = await evalGateB(fxBJudge);
   assert.equal(r.schemaValid, true); // 结构没问题，是语义弱
-  assert.equal(r.checks.find((c) => c.name.includes('覆盖'))?.pass, false);
-  assert.match(r.checks.find((c) => c.name.includes('覆盖'))!.detail, /漏退款路径/);
-  assert.equal(r.checks.find((c) => c.name.includes('声明式'))?.pass, false);
+  assert.equal(r.checks.find((c) => c.name.includes('coverage'))?.pass, false);
+  assert.match(r.checks.find((c) => c.name.includes('coverage'))!.detail, /\u6f0f\u9000\u6b3e\u8def\u5f84/);
+  assert.equal(r.checks.find((c) => c.name.includes('declarative'))?.pass, false);
 });
 
 test('acceptance judge 调用失败 → 转成一条失败 check，不中断整轮', async () => {
