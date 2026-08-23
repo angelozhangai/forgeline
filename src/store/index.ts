@@ -1,26 +1,34 @@
-// 状态层薄缝——**存储后端选择点（唯一接线处）**。
-// 核心（gates/worker/actions/daemon…）只 `import { store } from './store/index.ts'`，永不直接依赖 store/sessions.ts。
+// The thin seam over the state layer - **the storage-backend selection point (the only place it is wired)**.
+// The core (gates, worker, actions, daemon, ...) only does `import { store } from './store/index.ts'` and never
+// depends on store/sessions.ts directly.
 //
-// 后端按 FORGE_CONTROL_URL 切（与 jobs/index.ts 同风格，模块加载即定）：
-//   · 设了 → 本进程是**纯 runner**：经 HTTP 读写远端控制面状态（remoteApi）。
-//   · 未设 → **all-in-one**：本地 sqlite（现状，行为不变）。
+// The backend is chosen by FORGE_CONTROL_URL, decided once at module load:
+//   - set     -> this process is a **pure runner**: it reads and writes remote control-plane state over HTTP
+//                (remoteApi).
+//   - unset   -> **all-in-one**: local sqlite (the status quo, behaviour unchanged).
 //
-// 选好的后端再包一层**扩展钩子装饰器**（withTransitionHook）：全仓 40 处 `.transition(` 调用点本就
-// 全部收敛在这一个方法上，所以生命周期钩子在这里装一次就覆盖全部，调用点一行都不用改。
+// The chosen backend is then wrapped in an **extension-hook decorator** (withTransitionHook): all forty
+// `.transition(` call sites in this repo already funnel through this one method, so installing the lifecycle
+// hook here covers every one of them without touching a single call site.
 import { localSqliteStore } from './sessions.ts';
 import { makeRemoteStore } from './remote.ts';
 import { hooks, fireTransition } from '../ext/index.ts';
 import type { SessionStore } from './port.ts';
 
 /**
- * 给 transition 挂上扩展钩子。**未装扩展时是零开销直通**——连查旧态的那次读都不发生，
- * 所以纯 OSS 路径与引入本装饰器之前逐字节一致（远端后端下那会是一次多余的 HTTP 往返，不能白付）。
+ * Attach the extension hook to transition. **With no extension installed this is a zero-overhead
+ * pass-through** - not even the read of the previous state happens, so the plain open-source path is
+ * byte-for-byte what it was before this decorator existed (against a remote backend that read would be a
+ * wasted HTTP round trip, which must not be paid for nothing).
  *
- * 钩子在 transition **成功之后**才发：失败的转移（状态机守门抛错）不产生事件，
- * 否则下游会收到一个从未发生过的流转。查旧态失败按 from=null 处理，绝不因此挡住转移本身。
+ * The hook fires only **after** a transition succeeds: a failed transition (the state machine throwing at the
+ * gate) produces no event, because otherwise downstream would be told about a transition that never happened.
+ * A failed lookup of the previous state is treated as from=null and never blocks the transition itself.
  *
- * 导出是为了能拿假 store 直接测这三条语义（发在成功之后 / 未装钩子零开销 / 旧态查不到不挡路）。
- * 走真 sqlite 测会把这些语义和建表迁移、状态机守门混在一起，失败时分不清是谁的锅。
+ * It is exported so these three semantics can be tested directly against a fake store (fires only after
+ * success / zero overhead with no hook / a missing previous state does not block). Testing through real sqlite
+ * would tangle them up with table migrations and the state machine's own gating, so a failure would not say
+ * which part broke.
  */
 export function withTransitionHook(inner: SessionStore): SessionStore {
   return {
