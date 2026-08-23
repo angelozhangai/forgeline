@@ -10,6 +10,15 @@ import { log } from '../util/log.ts';
 
 export const SLACK_BASE = 'https://slack.com/api';
 
+// Web API 的根地址是**唯一**写死的外部地址（Socket Mode 那条连到哪由 apps.connections.open 现给）。
+// 留一个覆写口子有两个正当理由，都不是"为了测试而测试"：
+//  · 本地验收回路（test/slack-live-loop.test.ts）把整条「发卡 → 点按钮 → 开模态 → 提交」跑在
+//    一个假 Slack 上，那是唯一能在没有工作区的机器上验到 form 编码与模态往返的办法；
+//  · 出口受限的部署要走企业代理。
+function apiBase(): string {
+  return loadConfig().env.SLACK_API_BASE || SLACK_BASE;
+}
+
 // Slack 的响应一律是 200 + body.ok。我们把网络异常/非 JSON/限流耗尽也归一成同一个形状——
 // 调用方只需要看 ok/error，不必分辨"是 HTTP 挂了还是 Slack 说不行"。
 export interface SlackResp {
@@ -52,15 +61,18 @@ function formBody(body: Record<string, unknown>): string {
 export async function slackApi(
   method: string,
   body: Record<string, unknown> = {},
-  opts: { token?: string; sleep?: (ms: number) => Promise<void> } = {},
+  opts: { token?: string; sleep?: (ms: number) => Promise<void>; retry?: boolean } = {},
 ): Promise<SlackResp> {
   const token = opts.token ?? botToken();
   if (!token) return { ok: false, error: 'not_configured：缺 SLACK_BOT_TOKEN' };
   const sleep = opts.sleep ?? ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  // retry:false 是给**有时限的调用**用的（views.open 的 trigger_id 只活 3 秒）：那种调用退避重试
+  // 换来的只是一个 expired_trigger_id，还把真正的失败原因盖掉。见 messaging/slack.ts openModal。
+  const maxRetry = opts.retry === false ? 0 : MAX_RETRY;
   for (let attempt = 0; ; attempt++) {
     let res: Response;
     try {
-      res = await fetch(`${SLACK_BASE}/${method}`, {
+      res = await fetch(`${apiBase()}/${method}`, {
         method: 'POST',
         headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/x-www-form-urlencoded; charset=utf-8' },
         body: formBody(body),
@@ -68,11 +80,11 @@ export async function slackApi(
     } catch (e) {
       return { ok: false, error: `network: ${String(e).slice(0, 200)}` };
     }
-    if (res.status === 429 && attempt < MAX_RETRY) {
+    if (res.status === 429 && attempt < maxRetry) {
       // Slack 明确给了 Retry-After（秒）。缺/坏时按 1s×2^n 退避，绝不空转重试。
       const hinted = Number(res.headers.get('retry-after'));
       const waitMs = Number.isFinite(hinted) && hinted > 0 ? hinted * 1000 : 1000 * 2 ** attempt;
-      log.warn(`Slack 限流（${method}），${waitMs}ms 后重试（第 ${attempt + 1}/${MAX_RETRY} 次）`);
+      log.warn(`Slack 限流（${method}），${waitMs}ms 后重试（第 ${attempt + 1}/${maxRetry} 次）`);
       await sleep(waitMs);
       continue;
     }
