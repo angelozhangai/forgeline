@@ -161,7 +161,7 @@ test('addPrd：存量 plaintext ref 没有 raw → 如实报读不了，不建 s
   const before = (await sessions.listAll()).length;
   const r = await addPrd({ doc: { source: 'plaintext', token: 'hash-stale' } });
   assert.equal(r.ok, false);
-  assert.match(r.msg, /不可回源/);
+  assert.match(r.msg, /cannot be re-read/);
   assert.equal((await sessions.listAll()).length, before);
 });
 

@@ -1,14 +1,19 @@
-// 文档源——**纯文本兜底源**（src/docs/plaintext.ts）：正文就是那条 IM 消息本身。
-// 三件必须钉死的事：① 默认关（开了就是自动花钱）；② 归一后内容寻址——同一段话怎么贴都算同一份需求；
-// ③ 实质性下限挡寒暄，且**不静默**（看得见我们判它太短）。
+// Document source — the **plain-text fallback source** (src/docs/plaintext.ts): the body is the IM message
+// itself.
+// Three things have to be nailed down: (1) it is off by default (turning it on starts spending money
+// automatically); (2) content addressing after normalisation — the same paragraph pasted any which way is
+// the same requirement; (3) the substance floor blocks pleasantries, and **not silently** (you can see that
+// we judged it too short).
 process.env.FORGE_DB = ':memory:';
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 
 let plaintextEnabled = false;
-// 只替 loadConfig：本文件的模块图里只有 plaintext.ts 用它（docs/index.ts、docs/feishu.ts 都不用），
-// 这样开关能按用例切换——真配置是全进程缓存的，切不动。
-// 「仓内真实 runtime.yaml 里这个开关确实是关的」由 config.test.ts 对着真文件断言。
+// Only loadConfig is replaced: within this file's module graph only plaintext.ts uses it (neither
+// docs/index.ts nor docs/feishu.ts does), so the switch can be flipped per test — the real config is cached
+// process-wide and cannot be moved.
+// That the switch really is off in the repo's own runtime.yaml is asserted against the real file by
+// config.test.ts.
 mock.module('../src/config.ts', {
   namedExports: {
     loadConfig: () => ({ runtime: { doc_sources: { plaintext: { enabled: plaintextEnabled } } } }),
@@ -17,104 +22,134 @@ mock.module('../src/config.ts', {
 const pt = await import('../src/docs/plaintext.ts');
 const docs = await import('../src/docs/index.ts');
 
-const REQ = '把退款按钮挪到订单详情页顶部，并加一次二次确认弹窗';
+// Source is English, input is not. A requirement arrives in whatever language it was written in, and the
+// substance floor has to hold for each of them — so the fixtures come in pairs, and the non-English ones are
+// built from code points rather than written as literal characters (see test/english-only.test.ts).
+const REQ = 'Move the refund button to the top of the order detail page and add a second confirmation dialog';
+const REQ_TERSE = 'Add a CSV export button to the orders list page';
+const REQ_CN = String.fromCodePoint(0x628a, 0x9000, 0x6b3e, 0x6309, 0x94ae, 0x632a, 0x5230, 0x8ba2, 0x5355, 0x8be6, 0x60c5, 0x9875, 0x9876, 0x90e8, 0xff0c, 0x5e76, 0x52a0, 0x4e00, 0x6b21, 0x4e8c, 0x6b21, 0x786e, 0x8ba4, 0x5f39, 0x7a97);
+const REQ_CN_TERSE = String.fromCodePoint(0x8ba2, 0x5355, 0x5217, 0x8868, 0x9875, 0x52a0, 0x4e2a, 0x5bfc, 0x51fa, 0x0020, 0x0043, 0x0053, 0x0056, 0x0020, 0x7684, 0x6309, 0x94ae);
 
-test('normalizePlaintext：剥飞书 @_user_N / Slack <@U…>、<!here>，折叠空白', () => {
-  assert.equal(pt.normalizePlaintext('@_user_1  帮我评审\n\n  这个需求 '), '帮我评审 这个需求');
-  assert.equal(pt.normalizePlaintext('<@U012ABC> 做个东西'), '做个东西');
-  assert.equal(pt.normalizePlaintext('<!here> 大家看下 <@U9> 的需求'), '大家看下 的需求');
+test('normalizePlaintext: strips a Feishu @_user_N, a Slack <@U...> and <!here>, and collapses whitespace', () => {
+  assert.equal(pt.normalizePlaintext('@_user_1  review this\n\n  requirement '), 'review this requirement');
+  assert.equal(pt.normalizePlaintext('<@U012ABC> build a thing'), 'build a thing');
+  assert.equal(pt.normalizePlaintext('<!here> everyone look at <@U9> the requirement'), 'everyone look at the requirement');
 });
 
-test('contentToken：@ 了谁 / 换行方式不同，都算同一份需求（否则去重当场失效）', () => {
+test('contentToken: who was @-ed and how the lines wrap make no difference — it is the same requirement (otherwise deduplication breaks outright)', () => {
   const a = pt.contentToken(pt.normalizePlaintext(`@_user_1 ${REQ}`));
-  const b = pt.contentToken(pt.normalizePlaintext(`@_user_7 ${REQ}`)); // @ 了别人
-  const c = pt.contentToken(pt.normalizePlaintext(`  ${REQ}\n\n `)); // 前后空行/缩进
+  const b = pt.contentToken(pt.normalizePlaintext(`@_user_7 ${REQ}`)); // a different person @-ed
+  const c = pt.contentToken(pt.normalizePlaintext(`  ${REQ}\n\n `)); // blank lines and indentation around it
   assert.equal(a, b);
   assert.equal(a, c);
 });
 
-test('contentToken：改了字就是另一份需求（没有文档身份可追，内容即身份）', () => {
-  assert.notEqual(pt.contentToken(REQ), pt.contentToken(`${REQ}。另外加个埋点`));
+test('contentToken: change a word and it is a different requirement (there is no document identity to follow, so the content is the identity)', () => {
+  assert.notEqual(pt.contentToken(REQ), pt.contentToken(`${REQ}, and add analytics`));
 });
 
-test('hasSubstance：寒暄过不去，一句真需求过得去', () => {
-  for (const ack of ['好的', '收到，谢谢', 'ok thanks', '👍']) {
+// ── The substance floor ──────────────────────────────────────────────────
+// It is weighted rather than counted, because the two bands sit at completely different character counts in
+// different scripts. These two tests are the calibration the floor in plaintext.ts refers to: keep them
+// together, and re-derive the floor from them if it ever moves.
+test('substanceWeight: a word-like character weighs CJK_WEIGHT, everything else weighs 1', () => {
+  assert.equal(pt.substanceWeight('abcd'), 4);
+  assert.equal(pt.substanceWeight(String.fromCodePoint(0x597d, 0x7684)), 2 * pt.CJK_WEIGHT);
+  assert.equal(pt.substanceWeight(' a b '), 2, 'whitespace must not count');
+  // Punctuation is not word-like even when it is fullwidth: it carries no more meaning than a comma does.
+  assert.equal(pt.substanceWeight(String.fromCodePoint(0x6536, 0x5230, 0xff0c, 0x8c22, 0x8c22)), 4 * pt.CJK_WEIGHT + 1);
+});
+
+test('hasSubstance: pleasantries do not get through and a real requirement does — in either script', () => {
+  for (const ack of ['ok thanks', 'Got it, will do.', 'Sounds good, thank you!', 'Thanks a lot, that all sounds right to me!', String.fromCodePoint(0x597d, 0x7684), String.fromCodePoint(0x6536, 0x5230, 0xff0c, 0x8c22, 0x8c22), String.fromCodePoint(0x6536, 0x5230, 0xff0c, 0x8c22, 0x8c22, 0xff0c, 0x8f9b, 0x82e6, 0x4e86), '\u{1f44d}']) {
     assert.equal(pt.hasSubstance(pt.normalizePlaintext(ack)), false, ack);
   }
-  assert.equal(pt.hasSubstance(REQ), true);
-  // 边界就是 MIN_SUBSTANCE_CHARS 个非空白字符
-  assert.equal(pt.hasSubstance('x'.repeat(pt.MIN_SUBSTANCE_CHARS - 1)), false);
-  assert.equal(pt.hasSubstance('x'.repeat(pt.MIN_SUBSTANCE_CHARS)), true);
-  assert.equal(pt.hasSubstance(' x '.repeat(pt.MIN_SUBSTANCE_CHARS)), true, '空白不该算进字数');
+  for (const req of [REQ, REQ_TERSE, REQ_CN, REQ_CN_TERSE]) {
+    assert.equal(pt.hasSubstance(pt.normalizePlaintext(req)), true, req);
+  }
 });
 
-test('默认关：没开就一条都不认领（既有部署行为零变化——没链接的消息照旧被忽略）', () => {
+test('hasSubstance: the boundary is exactly MIN_SUBSTANCE_WEIGHT, and whitespace does not count towards it', () => {
+  assert.equal(pt.hasSubstance('x'.repeat(pt.MIN_SUBSTANCE_WEIGHT - 1)), false);
+  assert.equal(pt.hasSubstance('x'.repeat(pt.MIN_SUBSTANCE_WEIGHT)), true);
+  assert.equal(pt.hasSubstance(' x '.repeat(pt.MIN_SUBSTANCE_WEIGHT)), true, 'whitespace should not count towards the length');
+});
+
+test('off by default: with the switch off it claims nothing (zero change for an existing deployment — a message with no link is ignored as before)', () => {
   plaintextEnabled = false;
   assert.deepEqual(pt.plaintextDocs.claim({ text: REQ }), []);
   assert.equal(pt.plaintextDocs.parseRef(REQ), null);
 });
 
-test('开了之后：一段够分量的话 → 一条 ref，正文经 raw 随行（不落库）', () => {
+test('once on: a paragraph with substance -> one ref, with the body riding along in raw (not persisted)', () => {
   plaintextEnabled = true;
   const refs = pt.plaintextDocs.claim({ text: `@_user_1 ${REQ}` });
   assert.equal(refs.length, 1);
   assert.equal(refs[0].source, 'plaintext');
-  assert.equal(refs[0].raw, REQ, '归一后的正文随 ref 走——它没有可回源的远端');
-  assert.equal(refs[0].url, undefined, '一段话没有可点开的链接');
+  assert.equal(refs[0].raw, REQ, 'the normalised body travels with the ref — there is no remote to go back to');
+  assert.equal(refs[0].url, undefined, 'a paragraph has no link to open');
   assert.equal(refs[0].token, pt.contentToken(REQ));
 });
 
-test('开了之后：寒暄仍不认领', () => {
+test('once on: a requirement written in another language claims exactly the same way (source is English, input is not)', () => {
   plaintextEnabled = true;
-  assert.deepEqual(pt.plaintextDocs.claim({ text: '@_user_1 收到，谢谢' }), []);
+  const refs = pt.plaintextDocs.claim({ text: `@_user_1 ${REQ_CN}` });
+  assert.equal(refs.length, 1);
+  assert.equal(refs[0].raw, REQ_CN, 'the body must be carried through verbatim');
+  assert.equal(refs[0].token, pt.contentToken(REQ_CN));
+});
+
+test('once on: a pleasantry is still not claimed', () => {
+  plaintextEnabled = true;
+  assert.deepEqual(pt.plaintextDocs.claim({ text: `@_user_1 ${String.fromCodePoint(0x6536, 0x5230, 0xff0c, 0x8c22, 0x8c22)}` }), []);
   assert.deepEqual(pt.plaintextDocs.claim({ text: '   ' }), []);
 });
 
-test('只看正文，绝不扫 searchTexts——那是序列化过的整条事件，当需求正文是灾难', () => {
+test('the body only, never searchTexts — that is the whole serialised event, and taking it for a requirement body would be a disaster', () => {
   plaintextEnabled = true;
   const eventJson = JSON.stringify({ message_id: 'om_1', body: { content: `{"text":"${REQ}"}` } });
-  assert.deepEqual(pt.plaintextDocs.claim({ text: '好的', searchTexts: [eventJson] }), []);
+  assert.deepEqual(pt.plaintextDocs.claim({ text: 'ok thanks', searchTexts: [eventJson] }), []);
 });
 
-test('parseRef：链接一律不收——把认不出的 URL 当正文存下来，比直说认不出糟糕得多', () => {
+test('parseRef: a link is never accepted — storing an unrecognised URL as the body is far worse than saying plainly that it is unrecognised', () => {
   plaintextEnabled = true;
   assert.equal(pt.plaintextDocs.parseRef('https://www.notion.so/a-very-long-page-title-123456'), null);
   assert.equal(pt.plaintextDocs.parseRef('http://internal.wiki/some/really/long/path/page'), null);
-  assert.equal(pt.plaintextDocs.parseRef(REQ)?.token, pt.contentToken(REQ)); // 一段话才收
+  assert.equal(pt.plaintextDocs.parseRef(REQ)?.token, pt.contentToken(REQ)); // only a paragraph is accepted
 });
 
-test('read：raw 在就是正文；不在就如实说读不了（绝不返回空正文装作读到了）', async () => {
+test('read: with raw present that is the body; without it, it says truthfully that it cannot be read (never an empty body pretending it read something)', async () => {
   assert.deepEqual(await pt.plaintextDocs.read({ source: 'plaintext', token: 't', raw: REQ }), { ok: true, text: REQ });
-  const stale = await pt.plaintextDocs.read({ source: 'plaintext', token: 't' }); // 存量 ref，没有 raw
+  const stale = await pt.plaintextDocs.read({ source: 'plaintext', token: 't' }); // a stored ref, with no raw
   assert.equal(stale.ok, false);
-  assert.match(stale.error ?? '', /不可回源/);
+  assert.match(stale.error ?? '', /cannot be re-read/);
 });
 
-test('没有 comment 能力：一段 IM 文本无处回写批注（核心据此静默跳过）', () => {
+test('no comment capability: there is nowhere to write an annotation back to on a piece of IM text (the core skips it silently)', () => {
   assert.equal(pt.plaintextDocs.comment, undefined);
 });
 
-// ── 接进注册表之后的名次 ─────────────────────────────────────────────
-test('注册表：plaintext 是兜底源，飞书是主源', () => {
+// ── Its standing once wired into the registry ─────────────────────────────────────────────
+test('the registry: plaintext is the fallback source, Feishu is a primary one', () => {
   assert.deepEqual(docs.registeredIds(), ['feishu', 'plaintext']);
   assert.equal(docs.sources().find((s) => s.id === 'plaintext')?.fallback, true);
   assert.equal(docs.sources().find((s) => s.id === 'feishu')?.fallback, undefined);
 });
 
-test('注册表：消息里有飞书链接时，plaintext 绝不上场（否则同一条消息登记两遍）', () => {
+test('the registry: when the message has a Feishu link, plaintext never takes the stage (or the same message would be registered twice)', () => {
   plaintextEnabled = true;
   const got = docs.claimDocs({ text: `${REQ} https://x.feishu.cn/docx/TOKA` });
   assert.deepEqual(got.map(docs.formatRef), ['feishu:TOKA']);
 });
 
-test('注册表：没有任何链接时才轮到 plaintext，且只取一条', () => {
+test('the registry: plaintext only gets its turn when there is no link at all, and it takes just one', () => {
   plaintextEnabled = true;
   const got = docs.claimDocs({ text: REQ });
   assert.equal(got.length, 1);
   assert.equal(got[0].source, 'plaintext');
 });
 
-test('注册表：关着的时候，没链接的消息谁都不认领（回到 Phase 1 的行为）', () => {
+test('the registry: with the switch off nobody claims a message that has no link (back to the phase 1 behaviour)', () => {
   plaintextEnabled = false;
   assert.deepEqual(docs.claimDocs({ text: REQ }), []);
   assert.equal(docs.parseAnyRef(REQ), null);

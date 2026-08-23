@@ -82,11 +82,11 @@ process.stdin.on('end', () => {
   assert.equal(Number(readFileSync(state, 'utf8')), 4, '1 个闸B fixture × 2 runs，且每次多 1 发 acceptance judge');
   assert.match(r.stdout, /1 个 fixture（含 1 个带 acceptance-judge，各多一发） × 2 次 = 4 发 claude/);
   assert.match(r.stdout, /✖ recharge-gateb/);
-  assert.match(r.stdout, /\[1\/2 次通过\]/);
-  assert.match(r.stdout, /✖ issue 覆盖仓 \{C,U\}（缺 U（实际 C））/);
-  assert.match(r.stdout, /✔ issue_specs≥2（实际 2）/);
-  assert.match(r.stdout, /✔ multi_repo=true（实际 true）/);
-  assert.match(r.stdout, /总成本 \$1\.20/);
+  assert.match(r.stdout, /\[1\/2 runs passed\]/);
+  assert.match(r.stdout, /✖ the issues cover the repos \{C,U\} \(missing U \(actual C\)\)/);
+  assert.match(r.stdout, /✔ issue_specs >= 2 \(actual 2\)/);
+  assert.match(r.stdout, /✔ multi_repo=true \(actual true\)/);
+  assert.match(r.stdout, /total cost \$1\.20/);
   assert.doesNotMatch(r.stdout, /已落盘：/);
   assert.equal(evalRunCount(), before, '--no-save 不应写 logs/eval');
 });
