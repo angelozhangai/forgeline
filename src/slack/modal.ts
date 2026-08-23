@@ -9,6 +9,8 @@
 // 提交时原样取回。核心那侧 InboundCardAction 的形状**一点没变**（action/slug/value/formValues）。
 import type { DecisionItem } from '../gates/envelopes.ts';
 import { answerableDecisions, DECISION_CAP } from '../gates/envelopes.ts';
+import { BK_LIMIT } from './blockkit.ts';
+import { clip, plainText } from './text.ts';
 
 // 打开模态用的按钮上带的东西（block_actions 的 action value），也是塞进 private_metadata 的东西。
 export interface ModalContext {
@@ -20,27 +22,22 @@ export interface ModalContext {
 
 // ── plain_text 的上限是**按字段分的**，而且超了不是截断是整发失败 ──────
 // view.title / submit / close = 24；option.text / option.value = 75；placeholder = 150；
-// input.label / hint = 2000。一刀切一个数两头都错：
+// input.label / hint = 2000（数字见 slack/blockkit.ts 的上限表——那是唯一真源）。一刀切一个数两头都错：
 //   · 标题/提交文案超 24 → views.open 直接 ok:false → 人看到的是「按钮点了没反应」，
 //     本仓最不能出现的那种形态（没有任何症状指向真正的原因）；
 //   · 待决项 label 砍到 150 → PM 在模态里只看得见半句问题。
 // 这两种都只有在真工作区点一次按钮才会暴露 → 在这里按字段各自封顶，并在本地钉死。
-const LIMIT = { title: 24, option: 75, placeholder: 150, label: 2000 } as const;
-
-// 按**码点**截，不按 UTF-16 单元：直接 slice 会把 emoji 的代理对劈成两半，
-// Slack 收到非法 UTF-16 会把整个 view 拒掉——又是一次「点了没反应」。
-const clip = (text: string, max: number): string => Array.from(text ?? '').slice(0, max).join('');
-const ellipsize = (text: string, max: number): string => (Array.from(text ?? '').length <= max ? (text ?? '') : `${clip(text, max - 1)}…`);
-
-const plain = (text: string, max: number = LIMIT.placeholder): Record<string, unknown> => ({ type: 'plain_text', text: ellipsize(text, max), emoji: true });
+//
+// 截断/空串/代理对这三件事的实现在 slack/text.ts，与消息卡那侧**共用一份**。
+const plain = (text: string, max: number = BK_LIMIT.placeholder): Record<string, unknown> => plainText(text, max);
 // title/submit/close：既不能超 24，也**不能为空**（空 plain_text 同样是 ok:false）→ 空就退到兜底文案。
-const chip = (text: string, fallback: string): Record<string, unknown> => plain((text ?? '').trim() || fallback, LIMIT.title);
+const chip = (text: string, fallback: string): Record<string, unknown> => plainText(text, BK_LIMIT.viewChip, fallback);
 const mrkdwnEl = (text: string): Record<string, unknown> => ({ type: 'mrkdwn', text });
 
 // 下拉选项：text / value 都封顶 75。截断而不是报错——选项文案是人写的，长了就截，
 // 绝不能因此让整张卡发不出去。value 不加省略号：它是要回喂给核心的原值，不是给人看的。
 function option(label: string, value: string): Record<string, unknown> {
-  return { text: plain(label, LIMIT.option), value: clip(value, LIMIT.option) };
+  return { text: plain(label, BK_LIMIT.optionText), value: clip(value, BK_LIMIT.optionValue) };
 }
 
 // 一条待决项 → 一个 input 块（block_id = action_id = ask_<id>，与 composeDecisionAnswer 同序对齐）。
@@ -50,7 +47,7 @@ function askBlock(id: string, item: DecisionItem): Record<string, unknown> {
     type: 'input',
     block_id: `ask_${id}`,
     optional: true,
-    label: plain(`${id}. ${item.prompt}`, LIMIT.label),
+    label: plain(`${id}. ${item.prompt}`, BK_LIMIT.inputLabel),
     element: {
       type: 'static_select',
       action_id: `ask_${id}`,
@@ -60,7 +57,7 @@ function askBlock(id: string, item: DecisionItem): Record<string, unknown> {
         option('其他（在下方补充说明里填）', '__other__'),
       ],
     },
-    ...(item.hint ? { hint: plain(`建议：${item.hint}`, LIMIT.label) } : {}),
+    ...(item.hint ? { hint: plain(`建议：${item.hint}`, BK_LIMIT.inputLabel) } : {}),
   };
 }
 
@@ -81,7 +78,7 @@ export function buildDecisionModal(ctx: ModalContext, o: DecisionModalOpts): Rec
       type: 'input',
       block_id: 'verdict',
       optional: true,
-      label: plain('整体结论', LIMIT.label),
+      label: plain('整体结论', BK_LIMIT.inputLabel),
       element: {
         type: 'static_select',
         action_id: 'verdict',
@@ -94,7 +91,7 @@ export function buildDecisionModal(ctx: ModalContext, o: DecisionModalOpts): Rec
     type: 'input',
     block_id: 'notes',
     optional: true,
-    label: plain(o.notesLabel, LIMIT.label),
+    label: plain(o.notesLabel, BK_LIMIT.inputLabel),
     element: { type: 'plain_text_input', action_id: 'notes', multiline: true, placeholder: plain(o.notesPlaceholder) },
   });
   return view(ctx, o.title ?? '需求评审', o.submitText, blocks);
@@ -114,7 +111,7 @@ export function buildGoModal(ctx: ModalContext, pool: string[], picked: string |
       }
     : { type: 'plain_text_input', action_id: 'assignee', placeholder: plain('填 DRI 短码，如 M') };
   return view(ctx, '立项 · 建需求', '✅ 立项 · 建需求', [
-    { type: 'input', block_id: 'assignee', optional: true, label: plain('指派 DRI', LIMIT.label), element },
+    { type: 'input', block_id: 'assignee', optional: true, label: plain('指派 DRI', BK_LIMIT.inputLabel), element },
   ]);
 }
 
