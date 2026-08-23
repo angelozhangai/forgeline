@@ -23,6 +23,14 @@ const fakePort = {
 let addPrdCalls: { prdUrl: string; chatId?: string; posterId?: string; intakeMsgId?: string }[] = []; // prdUrl 取自 doc.url，断言更好读
 let createdUrls = new Set<string>(); // 模拟 addPrd 的去重：同一 url 第二次 created=false
 
+const warns: string[] = []; // 入口闸的「确认不了」是靠一条 warn 暴露的 → 必须能断言到
+
+mock.module('../src/util/log.ts', {
+  namedExports: {
+    log: { info: () => {}, ok: () => {}, warn: (m: string) => void warns.push(m), err: () => {} },
+    out: () => {},
+  },
+});
 mock.module('../src/messaging/index.ts', { namedExports: { port: fakePort } });
 mock.module('../src/intake.ts', {
   namedExports: {
@@ -51,6 +59,7 @@ function reset(): void {
   historyCalls.length = 0;
   addPrdCalls = [];
   createdUrls = new Set();
+  warns.length = 0;
 }
 
 test('补拉：正文里的文档链接 → 登记，并把水位推到最后一条', async () => {
@@ -87,6 +96,45 @@ test('补拉：历史条目缺发起人/原消息 id 时照常登记（只是回
   const n = await backfillChat('oc_a2');
   assert.equal(n, 1);
   assert.deepEqual(addPrdCalls, [{ prdUrl: DOC, chatId: 'oc_a2', posterId: undefined, intakeMsgId: undefined }]);
+});
+
+// ── 群入口闸（与 live 消息入口共用 messaging/gate.ts 的判据）────────────────────
+// 上面那些用例的消息都没设 isGroup → 按非群放行，闸不介入；下面三条专门走群路径。
+
+test('补拉：群历史里没 @ 机器人的消息不登记（同一道防花钱闸），但水位照推', async () => {
+  reset();
+  cursors.advanceCursor('oc_gate1', 0);
+  history.oc_gate1 = [msg({ chatId: 'oc_gate1', text: `随手分享 ${DOC}`, createTime: 100, isGroup: true, mentionedBot: false })];
+  const n = await backfillChat('oc_gate1');
+  assert.equal(n, 0);
+  assert.deepEqual(addPrdCalls, [], '群里随手分享的文档不该白跑一次闸A');
+  assert.equal(cursors.getCursor('oc_gate1'), 100, '挡下的也要推水位，否则每轮重扫同一批');
+});
+
+test('补拉：群历史里 @ 了机器人 → 照常登记', async () => {
+  reset();
+  cursors.advanceCursor('oc_gate2', 0);
+  history.oc_gate2 = [msg({ chatId: 'oc_gate2', text: `@bot 看下 ${DOC}`, createTime: 100, isGroup: true, mentionedBot: true })];
+  assert.equal(await backfillChat('oc_gate2'), 1);
+  assert.deepEqual(addPrdCalls.map((c) => c.prdUrl), [DOC]);
+});
+
+test('补拉：无法确认是否 @（历史信封不带 mentions）→ 仍照常登记，并把这个事实 warn 出来', async () => {
+  reset();
+  cursors.advanceCursor('oc_gate3', 0);
+  history.oc_gate3 = [
+    msg({ chatId: 'oc_gate3', text: DOC, createTime: 100, isGroup: true, mentionedBot: null }),
+    msg({ chatId: 'oc_gate3', text: '闲聊', createTime: 200, isGroup: true, mentionedBot: null }),
+  ];
+  // live 侧对这一态取忽略，补拉侧**故意取反**：消息已经过去了，忽略等于离线期间的需求被静默吞掉，
+  // 而那正是补拉唯一的存在理由。宁可白跑一次闸A，不可漏需求。
+  assert.equal(await backfillChat('oc_gate3'), 1);
+  assert.deepEqual(addPrdCalls.map((c) => c.prdUrl), [DOC]);
+  // 这条 warn 就是「该 provider 的历史信封到底带不带 mentions」的观察口——跑一轮即知，不用手捞 payload。
+  const hit = warns.filter((w) => w.includes('无法确认是否 @ 了机器人'));
+  assert.equal(hit.length, 1, '每轮只报一次汇总，不逐条刷屏');
+  assert.match(hit[0], /2 条/);
+  assert.match(hit[0], /fake/); // 点名是哪个 provider 的信封缺字段
 });
 
 test('补拉：正文无链接时退到 adapter 给的兜底文本块（文档分享卡 / 富文本 post）', async () => {
