@@ -39,6 +39,7 @@ const {
   fireTransition,
 } = await import('../src/ext/index.ts');
 const { withTransitionHook } = await import('../src/store/index.ts');
+const docs = await import('../src/docs/index.ts');
 type Store = import('../src/store/port.ts').SessionStore;
 
 /** 把一个「只实现了装饰器会碰到的方法」的假 store 包上钩子。转型收敛在这里，测试正文不出现 as。 */
@@ -167,6 +168,13 @@ describe('装不起来必须抛错（绝不静默降级）', () => {
     ['commands 是 null', `export default { name: 'x', commands: null };\n`],
     ['hooks 是 null', `export default { name: 'x', hooks: null };\n`],
     ['hooks 不是对象', `export default { name: 'x', hooks: 'onTransition' };\n`],
+    ['docSources 不是数组', `export default { name: 'x', docSources: {} };\n`],
+    ['docSources 是 null', `export default { name: 'x', docSources: null };\n`],
+    ['docSources[0] 缺 id', `export default { name: 'x', docSources: [{ claim: () => [], parseRef: () => null, read: async () => ({}) }] };\n`],
+    ['docSources[0].id 是空串', `export default { name: 'x', docSources: [{ id: '  ', claim: () => [], parseRef: () => null, read: async () => ({}) }] };\n`],
+    ['docSources[0].claim 不是函数', `export default { name: 'x', docSources: [{ id: 'n', claim: [], parseRef: () => null, read: async () => ({}) }] };\n`],
+    ['docSources[0].read 缺失', `export default { name: 'x', docSources: [{ id: 'n', claim: () => [], parseRef: () => null }] };\n`],
+    ['docSources[0].comment 存在但不是函数', `export default { name: 'x', docSources: [{ id: 'n', claim: () => [], parseRef: () => null, read: async () => ({}), comment: 'yes' }] };\n`],
   ];
   for (const [label, source] of cases) {
     test(`${label} → 抛错`, async () => {
@@ -429,5 +437,63 @@ describe('扩展命令与核心命令的优先级', () => {
     assert.notEqual(r.code, 0);
     assert.match(r.stderr, /扩展包装载失败/);
     assert.doesNotMatch(r.stdout, /用法：\.\/forge/, '装载失败时不该假装一切正常地跑下去');
+  });
+});
+
+// ─────────────────── 文档源注册（L2 挂载点）───────────────────
+// 下游接自家文档系统（Notion / Confluence / 内部 wiki）不该需要改 docs/index.ts 那个数组。
+// 这一组钉的是「能加、但加不坏核心」的边界。
+
+describe('扩展注册文档源', () => {
+  const notionPack = `{
+    name: 'acme-docs',
+    docSources: [{
+      id: 'notion',
+      claim: (input) => (String(input.text ?? '').includes('notion.example/') ? [{ source: 'notion', token: 'pg1' }] : []),
+      parseRef: (u) => (u.includes('notion.example/') ? { source: 'notion', token: 'pg1' } : null),
+      read: async () => ({ ok: true, text: 'NOTION 正文' }),
+    }],
+  }`;
+
+  test('未装扩展：注册表就是核心那两个源（纯 OSS 行为逐字节不变）', () => {
+    assert.deepEqual(docs.registeredIds(), ['feishu', 'plaintext']);
+  });
+
+  test('装上之后：认领 → 落库键 → 读正文，整条链都认得这个新源', async () => {
+    await loadExtensions(packOf(notionPack));
+    assert.deepEqual(docs.registeredIds(), ['feishu', 'plaintext', 'notion']);
+    const claimed = docs.claimDocs({ text: '这份需求见 https://notion.example/pg1' });
+    assert.deepEqual(claimed, [{ source: 'notion', token: 'pg1' }]);
+    assert.equal(docs.formatRef(claimed[0]), 'notion:pg1'); // 落库键带源前缀
+    assert.deepEqual(docs.parseAnyRef('https://notion.example/pg1'), { source: 'notion', token: 'pg1' });
+    assert.equal((await docs.readDoc(claimed[0])).text, 'NOTION 正文');
+  });
+
+  test('扩展源认不出的链接照旧交给核心源——加一个源不会挡住原来的路', async () => {
+    await loadExtensions(packOf(notionPack));
+    assert.equal(docs.parseAnyRef('https://notion.example/pg1')?.source, 'notion');
+    assert.equal(docs.parseAnyRef('https://example.feishu.cn/docx/abc123')?.source, 'feishu');
+  });
+
+  test('id 与核心撞车：忽略扩展那份，核心源仍是原来那个（下游换不掉飞书源）', async () => {
+    await loadExtensions(
+      packOf(`{
+        name: 'impostor',
+        docSources: [{ id: 'feishu', claim: () => [{ source: 'feishu', token: 'hijacked' }], parseRef: () => ({ source: 'feishu', token: 'hijacked' }), read: async () => ({ ok: true, text: '冒牌正文' }) }],
+      }`),
+    );
+    assert.deepEqual(docs.registeredIds(), ['feishu', 'plaintext']); // 没多出一个同名源
+    assert.equal(docs.parseAnyRef('随便一个不是链接的字符串'), null); // 冒牌源的 parseRef 没有生效
+  });
+
+  test('落库的 ref 活得比扩展包久：包摘掉之后 readDoc 如实报「未注册的源」，绝不静默当读失败', async () => {
+    await loadExtensions(packOf(notionPack));
+    const ref = { source: 'notion', token: 'pg1' };
+    assert.equal((await docs.readDoc(ref)).ok, true);
+    resetExtensionsForTest(); // = 部署里把扩展包摘掉了，但库里还存着 notion:pg1
+    const after = await docs.readDoc(ref);
+    assert.equal(after.ok, false);
+    assert.match(after.error ?? '', /未注册的文档源「notion」/);
+    assert.match(after.error ?? '', /feishu\/plaintext/); // 告诉人现在认得哪些
   });
 });

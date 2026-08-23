@@ -24,10 +24,13 @@
 // · **不提供 MessagingPort 覆盖**：messaging 的选择点在模块加载期同步求值（messaging/index.ts），而扩展包是
 //   异步 `import()` 装入的，时序上根本接不上。要换 IM provider，正确做法是在 messaging/ 下写一个实现
 //   MessagingPort 的 adapter——那本来就一行不用改核心。硬塞一个「有时生效」的覆盖比没有更糟。
+//   （**文档源不在此列**：docs 的注册表是每次调用现查的，不存在这个时序问题 → 见下面的 docSources。）
 // · **不提供状态机改写**：状态与合法转移表（statemachine/）是这套治理流水线的公开契约与安全红线
 //   （例：GATE_C_STALLED 只能回到 GATE_C_REVISION_REQUESTED——CI 没绿绝不放行开 PR）。允许下游改它
 //   等于允许下游拆掉护栏。要新增闸门请到上游提 issue。
 import type { State } from '../statemachine/states.ts';
+// 经 docs/index.ts 取类型（那是文档层的唯一接线处；架构闸不允许核心直连某个具体源）。
+import type { DocSource } from '../docs/index.ts';
 
 // 扩展命令的执行上下文：核心已解析好的参数，不含任何核心内部对象（见上「只传纯数据」）。
 export interface ExtCommandContext {
@@ -71,4 +74,14 @@ export interface ExtensionPack {
   name: string; // 出现在 `forge doctor` 里，便于确认「到底装上了没有」
   commands?: ExtCommand[];
   hooks?: LifecycleHooks;
+  // 下游自己的文档源（Notion / Confluence / 内部 wiki / GitHub 上的 md…）。
+  // 核心自带的只有飞书文档与 plaintext 兜底源；不给这个口子，接自家文档系统就只能改
+  // docs/index.ts 那个数组——正是本接缝存在要消灭的那件事。
+  //
+  // 三条规矩（见 docs/index.ts mergeSources，且都有用例守着）：
+  //  · **核心源永远优先**：id 与核心撞车时忽略扩展那份（同「核心命令永远优先」）；
+  //  · 兜底源（`fallback:true`）按注册顺序定先后，核心在前——两个兜底源同时活着会出一条 warn；
+  //  · 落库的 `doc_ref` 是 `<source>:<token>`，**活得比扩展包久**：包被摘掉之后 readDoc 会如实报
+  //    「未注册的文档源」，绝不退化成静默的读失败。所以源 id 一旦上线就别再改。
+  docSources?: DocSource[];
 }
