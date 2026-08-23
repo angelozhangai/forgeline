@@ -1,38 +1,44 @@
-// Slack provider 层——**文本封顶**。Block Kit 的每一处文本都有自己的上限，而三种越界的症状是**同一个**：
-// `ok:false / invalid_blocks`，卡片压根不出现，日志里只有一行 warn，没有任何东西指向真正的原因。
+// Slack provider layer — **text capping**. Every piece of text in Block Kit has its own limit, and all
+// three ways of violating them produce the **same** symptom: `ok:false / invalid_blocks`, the card never
+// appears, and the log has a single warning that points at nothing.
 //
-//   ① 超限——上限还按字段分（header 150 / section 3000 / 按钮文案 75 / 模态标题 24…），一刀切两头都错；
-//   ② 空串——`plain_text` 与 `mrkdwn` 都**不接受空文本**，空一个就整条消息被拒；
-//   ③ 非法 UTF-16——按 UTF-16 单元 `slice` 会把 emoji 的代理对劈成两半，整个载荷被拒。
+//   1. Over the limit — and the limits are per field (header 150 / section 3000 / button text 75 /
+//      modal title 24…), so one flat number is wrong at both ends;
+//   2. Empty string — neither `plain_text` nor `mrkdwn` **accepts empty text**, and one empty value gets
+//      the whole message rejected;
+//   3. Invalid UTF-16 — slicing by UTF-16 code unit splits an emoji's surrogate pair in half, and the
+//      entire payload is rejected.
 //
-// 三条规矩收在这一份实现里，模态与消息卡共用。这不是洁癖：这套助手当初只有 slack/modal.ts 有
-// （#18），隔壁 messaging/slack.ts 那侧还在裸 `.slice()` —— 同一类只在真工作区才现形的坑，
-// 修了一半比没修更危险，因为它看起来像修过了。
+// All three rules live in this one implementation, shared by modals and message cards. This is not
+// fastidiousness: these helpers originally existed only in slack/modal.ts (#18) while the neighbouring
+// messaging/slack.ts was still using a bare `.slice()` — the same class of trap that only surfaces in a
+// real workspace, and half-fixed is more dangerous than unfixed, because it looks done.
 import { BK_LIMIT } from './blockkit.ts';
 
-// 按**码点**截断（不按 UTF-16 单元）。
+// Truncate by **code point** (not by UTF-16 code unit).
 export function clip(text: string, max: number): string {
   return Array.from(text ?? '').slice(0, max).join('');
 }
 
-// 给人看的文本超限 → 留一个省略号，让"这里被截过"是看得见的。
+// Human-facing text that goes over the limit keeps an ellipsis, so "this was truncated" stays visible.
 export function ellipsize(text: string, max: number): string {
   const t = text ?? '';
   return Array.from(t).length <= max ? t : `${clip(t, max - 1)}…`;
 }
 
-// plain_text 元素。fallback 兜住"空串同样非法"：调用方给不出内容时退到一个中性文案，
-// 绝不发一条 Slack 会整体拒掉的消息。
+// A plain_text element. The fallback covers "empty is equally invalid": when the caller has no content,
+// fall back to a neutral placeholder rather than sending a message Slack will reject outright.
 export function plainText(text: string, max: number, fallback = '—'): Record<string, unknown> {
   return { type: 'plain_text', text: ellipsize((text ?? '').trim() || fallback, max), emoji: true };
 }
 
-// mrkdwn 元素（section.text / context.elements）。同样不接受空。
+// An mrkdwn element (section.text / context.elements). Equally intolerant of empty.
 export function mrkdwnText(text: string, max: number = BK_LIMIT.sectionText, fallback = '—'): Record<string, unknown> {
   return { type: 'mrkdwn', text: ellipsize((text ?? '').trim() || fallback, max) };
 }
 
-// 一段文本是不是"没内容"——决定要不要干脆**不出这一块**（比发一个占位符干净，也比发个空的合法）。
+// Whether a piece of text has "no content" — which decides whether to **omit the block entirely**
+// (cleaner than a placeholder, and legal where an empty one is not).
 export function blank(text: string | undefined | null): boolean {
   return !(text ?? '').trim();
 }

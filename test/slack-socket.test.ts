@@ -1,17 +1,22 @@
-// Socket Mode 长连接的**状态机**（src/slack/socket.ts）。依赖全注入 → 无网络、无 Slack 工作区也能跑全。
-// 这正是「值得手写一个长连接」的前提：不可测的手写长连接是负债，可测的才是省下一个依赖。
+// The Socket Mode connection's **state machine** (src/slack/socket.ts). Every dependency is injected ->
+// the whole thing runs with no network and no Slack workspace.
+// That is exactly what makes hand-writing a connection defensible: an untestable hand-written connection
+// is a liability, while a testable one saves a dependency.
 //
-// 四条必须对的事（全部来自本地 spike 实测的真实事件序列）：
-//  ① 每条带 envelope_id 的信封立刻 ack —— 迟于 3s 会被 Slack 重投，同一次点击执行两遍；
-//  ② type:'disconnect' 是**计划内**换连接，不是故障；
-//  ③ 硬断时原生 WebSocket 先 error 再 close，两个都触发重连会开出两条连接 → 每条信封收两遍；
-//  ④ 首连失败如实 reject（核心据此降级为仅周期 tick），重连失败则退避重试、不放弃。
+// Four things that must be right (all taken from the real event sequences measured in a local spike):
+//  1. Every envelope carrying an envelope_id is acked immediately — later than 3s and Slack redelivers,
+//     so the same click executes twice;
+//  2. type:'disconnect' is a **planned** connection swap, not a fault;
+//  3. On a hard drop the native WebSocket fires error before close, and reconnecting on both opens two
+//     connections -> every envelope arrives twice;
+//  4. A failed first connect rejects faithfully (the core degrades to periodic ticks only on that), while
+//     a failed reconnect backs off, retries and never gives up.
 process.env.FORGE_DB = ':memory:';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { backoffMs, createSocketChannel, type WsLike } from '../src/slack/socket.ts';
 
-// 假 socket：把 addEventListener 收下来，测试自己触发事件。
+// Fake socket: it captures addEventListener, and the test fires the events itself.
 class FakeWs implements WsLike {
   sent: string[] = [];
   closed = false;
@@ -65,8 +70,10 @@ function harness(o: { openUrl?: () => Promise<{ ok: boolean; url?: string; error
         sockets.push(ws);
         return ws;
       },
-      // 退避 sleep 直接返回（测试里不真等）。但重连失败会立刻再排一次重连——零延迟下那是死循环，
-      // 所以第 5 次之后把 sleep 挂住，让循环停在那儿（真实运行里这里是真的在等秒级退避）。
+      // The backoff sleep returns immediately (tests do not really wait). But a failed reconnect schedules
+      // another one straight away, and with zero delay that is an infinite loop — so after the fifth call
+      // the sleep hangs, parking the loop there (in a real run this is genuinely waiting out a
+      // seconds-long backoff).
       sleep: async (ms) => {
         sleeps.push(ms);
         if (sleeps.length > 5) await new Promise<void>(() => {});
@@ -79,7 +86,7 @@ function harness(o: { openUrl?: () => Promise<{ ok: boolean; url?: string; error
 }
 const tick = (): Promise<void> => new Promise((r) => setImmediate(r));
 
-test('首连：拿到 wss URL → 连上 → connect() resolve', async () => {
+test('first connect: obtain the wss URL -> connect -> connect() resolves', async () => {
   const h = harness();
   const p = h.channel.connect();
   await tick();
@@ -88,12 +95,12 @@ test('首连：拿到 wss URL → 连上 → connect() resolve', async () => {
   assert.equal(h.sockets.length, 1);
 });
 
-test('首连失败如实 reject（核心据此降级为「仅周期 tick」，绝不假装连上了）', async () => {
+test('a failed first connect rejects faithfully (the core degrades to "periodic ticks only" on that, never pretending it connected)', async () => {
   const h = harness({ openUrl: async () => ({ ok: false, error: 'invalid_auth' }) });
-  await assert.rejects(() => h.channel.connect(), /apps\.connections\.open 失败.*invalid_auth/);
+  await assert.rejects(() => h.channel.connect(), /apps\.connections\.open failed.*invalid_auth/);
 });
 
-test('① 带 envelope_id 的信封**先 ack 再分发**（迟 3s 会被重投 → 同一次点击执行两遍）', async () => {
+test('(1) an envelope with an envelope_id is **acked before it is dispatched** (3s late means redelivery -> the same click executes twice)', async () => {
   const h = harness();
   const p = h.channel.connect();
   await tick();
@@ -105,7 +112,7 @@ test('① 带 envelope_id 的信封**先 ack 再分发**（迟 3s 会被重投 �
   assert.deepEqual(h.envelopes, [{ type: 'interactive', payload: { type: 'block_actions' } }]);
 });
 
-test('hello 不当业务事件；坏 JSON 跳过不崩；无 payload 的信封只 ack 不分发', async () => {
+test('hello is not a business event; bad JSON is skipped without crashing; an envelope with no payload is acked but not dispatched', async () => {
   const h = harness();
   const p = h.channel.connect();
   await tick();
@@ -114,14 +121,15 @@ test('hello 不当业务事件；坏 JSON 跳过不崩；无 payload 的信封�
   await p;
   ws.frame({ type: 'hello', num_connections: 1 });
   ws.fire('message', { data: 'not json{' });
-  ws.frame({ envelope_id: 'env-2', type: 'events_api' }); // 缺 payload
+  ws.frame({ envelope_id: 'env-2', type: 'events_api' }); // no payload
   assert.deepEqual(h.envelopes, []);
-  assert.deepEqual(ws.sent, ['{"envelope_id":"env-2"}'], '缺 payload 也要 ack——不 ack 就会被无限重投');
+  assert.deepEqual(ws.sent, ['{"envelope_id":"env-2"}'], 'a missing payload must still be acked — without an ack it is redelivered forever');
 });
 
-// Slack 每半小时左右就来这么一次。做错了不会有任何报错，只会「偶尔一个按钮点了没反应」+
-// 每半小时一条假故障日志——两种最难查的形态。故这条路径的三件事全部钉死。
-test('② type:disconnect 是计划内换连接：先建新连接、连上之后才关旧的（中间不留空窗）', async () => {
+// Slack does this roughly every half hour. Getting it wrong produces no error at all, only "occasionally
+// a button does nothing" plus a bogus fault log every half hour — the two hardest shapes to diagnose. So
+// all three aspects of this path are pinned.
+test('(2) type:disconnect is a planned swap: build the new connection first and close the old one only once it is up (leaving no gap)', async () => {
   const h = harness();
   const p = h.channel.connect();
   await tick();
@@ -130,14 +138,14 @@ test('② type:disconnect 是计划内换连接：先建新连接、连上之后
   await p;
   old.frame({ type: 'disconnect', reason: 'refresh_requested' });
   await tick();
-  assert.equal(h.sockets.length, 2, '收到 disconnect 就立刻建新连接，不等退避');
-  assert.equal(old.closed, false, '新连接还没连上 → 旧的必须还活着：空窗里丢掉的按钮点击是补拉捞不回来的');
+  assert.equal(h.sockets.length, 2, 'a disconnect builds the new connection immediately, without waiting out a backoff');
+  assert.equal(old.closed, false, 'the new connection is not up yet -> the old one must still be alive: a button click lost in the gap cannot be recovered by backfill');
   h.sockets[1].fire('open');
-  assert.equal(old.closed, true, '新连接 open 之后才关旧的');
-  assert.equal(h.sockets.length, 2, '一次换连接只开一条新的');
+  assert.equal(old.closed, true, 'the old one is closed only after the new one is open');
+  assert.equal(h.sockets.length, 2, 'one swap opens exactly one new connection');
 });
 
-test('② 计划内换连接不算故障：不报 onError（否则核心 markWs(false)+log.err，每半小时一次假警报），也不走退避', async () => {
+test('(2) a planned swap is not a fault: no onError (which would make the core call markWs(false) + log.err, a bogus alarm every half hour) and no backoff', async () => {
   const h = harness();
   const p = h.channel.connect();
   await tick();
@@ -147,12 +155,12 @@ test('② 计划内换连接不算故障：不报 onError（否则核心 markWs(
   old.frame({ type: 'disconnect', reason: 'refresh_requested' });
   await tick();
   h.sockets[1].fire('open');
-  assert.deepEqual(h.errors, [], '计划内的换连接不是错误');
-  assert.deepEqual(h.sleeps, [], '不走退避 sleep——那 1s 就是空窗本身');
-  assert.equal(h.reconnects, 1, '仍然通知核心「已重连」→ 顺手补拉一次，空窗即便为零也不吃亏');
+  assert.deepEqual(h.errors, [], 'a planned swap is not an error');
+  assert.deepEqual(h.sleeps, [], 'no backoff sleep — that 1s *is* the gap');
+  assert.equal(h.reconnects, 1, 'the core is still told "reconnected" -> it runs a backfill, so even a zero-length gap costs nothing');
 });
 
-test('② 同一条连接上重复收到 disconnect：不再多开一条（否则一次换连接开出两条，信封收两遍）', async () => {
+test('(2) a repeated disconnect on the same connection does not open another (otherwise one swap opens two and every envelope arrives twice)', async () => {
   const h = harness();
   const p = h.channel.connect();
   await tick();
@@ -165,7 +173,7 @@ test('② 同一条连接上重复收到 disconnect：不再多开一条（否�
   assert.equal(h.sockets.length, 2);
 });
 
-test('② 换连接之后，新连接上的硬断照样报错并重连（「计划内」是每条连接的属性，不是全局开关）', async () => {
+test('(2) after a swap, a hard drop on the new connection still reports and reconnects ("planned" is a per-connection property, not a global flag)', async () => {
   const h = harness();
   const p = h.channel.connect();
   await tick();
@@ -173,37 +181,37 @@ test('② 换连接之后，新连接上的硬断照样报错并重连（「计�
   await p;
   h.sockets[0].frame({ type: 'disconnect' });
   await tick();
-  h.sockets[1].fire('open'); // 换连接完成
-  h.sockets[1].fire('close', { code: 1006 }); // 这次是真断了
+  h.sockets[1].fire('open'); // the swap completes
+  h.sockets[1].fire('close', { code: 1006 }); // this one really did drop
   await tick();
   await tick();
   assert.deepEqual(h.errors, ['WebSocket closed code=1006']);
-  assert.equal(h.sockets.length, 3, '真断开要重连');
+  assert.equal(h.sockets.length, 3, 'a genuine drop must reconnect');
 });
 
-test('③ error 与 close 成对触发时只重连一次（否则每条信封会被收两遍）', async () => {
+test('(3) when error and close fire as a pair, reconnect only once (otherwise every envelope arrives twice)', async () => {
   const h = harness();
   const p = h.channel.connect();
   await tick();
   const ws = h.sockets[0];
   ws.fire('open');
   await p;
-  // 本地 spike 实测的真实序列：error 紧接着 close:1006
+  // The real sequence measured in a local spike: error immediately followed by close:1006
   ws.fire('error');
   ws.fire('close', { code: 1006 });
   await tick();
   await tick();
-  assert.equal(h.errors.length, 1, '一次断开只报一次错');
-  assert.equal(h.sockets.length, 2, '一次断开只开一条新连接');
+  assert.equal(h.errors.length, 1, 'one drop reports one error');
+  assert.equal(h.sockets.length, 2, 'one drop opens one new connection');
 });
 
-test('④ 重连成功才通知核心 onReconnected（首连不算——核心拿它去补拉断连期间的消息）', async () => {
+test('(4) onReconnected is only reported after a successful reconnect (the first connect does not count — the core uses it to backfill messages from the outage)', async () => {
   const h = harness();
   const p = h.channel.connect();
   await tick();
   h.sockets[0].fire('open');
   await p;
-  assert.equal(h.reconnects, 0, '首连不是重连');
+  assert.equal(h.reconnects, 0, 'a first connect is not a reconnect');
   h.sockets[0].fire('close', { code: 1006 });
   await tick();
   await tick();
@@ -211,9 +219,9 @@ test('④ 重连成功才通知核心 onReconnected（首连不算——核心�
   assert.equal(h.reconnects, 1);
 });
 
-test('重连退避：1s→2s→4s…封顶 60s；连上后清零', async () => {
+test('reconnect backoff: 1s -> 2s -> 4s … capped at 60s; reset once connected', async () => {
   assert.deepEqual([0, 1, 2, 3, 4, 5, 6].map(backoffMs), [1000, 2000, 4000, 8000, 16_000, 32_000, 60_000]);
-  assert.equal(backoffMs(99), 60_000, '封顶，绝不指数到天荒地老');
+  assert.equal(backoffMs(99), 60_000, 'capped, never exponentiating forever');
 
   const h = harness();
   const p = h.channel.connect();
@@ -223,14 +231,14 @@ test('重连退避：1s→2s→4s…封顶 60s；连上后清零', async () => {
   h.sockets[0].fire('close', { code: 1006 });
   await tick();
   await tick();
-  h.sockets[1].fire('open'); // 第二条连上了 → 退避清零
+  h.sockets[1].fire('open'); // the second one connected -> the backoff resets
   h.sockets[1].fire('close', { code: 1006 });
   await tick();
   await tick();
-  assert.deepEqual(h.sleeps.slice(0, 2), [1000, 1000], '每次成功连上都把退避清零 → 又从 1s 起');
+  assert.deepEqual(h.sleeps.slice(0, 2), [1000, 1000], 'every successful connect resets the backoff -> it starts from 1s again');
 });
 
-test('重连时 openUrl 失败：报错 + 继续退避重试，绝不放弃（首连才 reject）', async () => {
+test('openUrl failing during a reconnect: report it and keep backing off and retrying, never give up (only the first connect rejects)', async () => {
   let first = true;
   const h = harness({
     openUrl: async () => {
@@ -249,11 +257,11 @@ test('重连时 openUrl 失败：报错 + 继续退避重试，绝不放弃（�
   await tick();
   await tick();
   await tick();
-  assert.ok(h.errors.some((e) => e.includes('ratelimited')), '重连拿不到 URL 要如实报错');
-  assert.ok(h.sleeps.length >= 2, '并且继续退避重试');
+  assert.ok(h.errors.some((e) => e.includes('ratelimited')), 'failing to get a URL on reconnect must be reported faithfully');
+  assert.ok(h.sleeps.length >= 2, 'and it must keep backing off and retrying');
 });
 
-test('close() 之后不再重连（守护退出时不该留个循环在后台刷）', async () => {
+test('no reconnect after close() (a daemon shutting down should not leave a loop spinning in the background)', async () => {
   const h = harness();
   const p = h.channel.connect();
   await tick();
@@ -266,10 +274,11 @@ test('close() 之后不再重连（守护退出时不该留个循环在后台刷
   assert.deepEqual(h.errors, []);
 });
 
-// 换连接的重叠窗口里同时活着两条连接 —— close() 只关「当前那条」的话，另一条就成了没人管的：
-// 它不会再重连（superseded），也永远没人关它，于是进程带着一个活着的句柄退不出去。
-// 这正是本仓最忌讳的形态：没有报错，只是 daemon 停不下来。
-test('close() 落在换连接的重叠窗口里：两条连接都要关掉，一条都不能漏', async () => {
+// The overlap window of a swap holds two live connections — if close() only closes "the current one",
+// the other is left unowned: it will not reconnect (superseded) and nobody will ever close it, so the
+// process cannot exit while holding a live handle.
+// This is exactly the shape this repo most needs to avoid: no error, the daemon just will not stop.
+test('close() landing inside a swap\'s overlap window: both connections must be closed, and not one may be missed', async () => {
   const h = harness();
   const p = h.channel.connect();
   await tick();
@@ -278,14 +287,14 @@ test('close() 落在换连接的重叠窗口里：两条连接都要关掉，一
   await p;
   old.frame({ type: 'disconnect' });
   await tick();
-  assert.equal(h.sockets.length, 2, '前置条件：新连接已在建、旧连接还活着');
+  assert.equal(h.sockets.length, 2, 'precondition: the new connection is being built and the old one is still alive');
   assert.equal(old.closed, false);
   h.channel.close();
-  assert.equal(old.closed, true, '旧连接不能被漏下（它已经 superseded，没人会再管它）');
+  assert.equal(old.closed, true, 'the old connection must not be left behind (it is already superseded, so nobody else will touch it)');
   assert.equal(h.sockets[1].closed, true);
 });
 
-test('close() 撞上首连的 openUrl：connect() 必须落地，且不再建连接（否则启动路径被挂住）', async () => {
+test('close() racing the first connect\'s openUrl: connect() must settle, and no connection is built (otherwise the startup path hangs)', async () => {
   let release: () => void = () => {};
   const gate = new Promise<void>((r) => {
     release = r;
@@ -297,19 +306,19 @@ test('close() 撞上首连的 openUrl：connect() 必须落地，且不再建连
     },
   });
   const p = h.channel.connect();
-  h.channel.close(); // 还卡在 openUrl 里就被关了
+  h.channel.close(); // closed while still inside openUrl
   release();
-  await p; // 挂住的话这条用例会超时——那正是生产里 daemon 起不来的样子
-  assert.equal(h.sockets.length, 0, '关了就别再建一条没人管的连接');
+  await p; // if it hangs, this test times out — which is exactly what "the daemon will not start" looks like in production
+  assert.equal(h.sockets.length, 0, 'once closed, do not build another unowned connection');
 });
 
-test('close() 之后迟到的 open：连接被关掉，connect() 也照样落地', async () => {
+test('a late open after close(): the connection is closed, and connect() still settles', async () => {
   const h = harness();
   const p = h.channel.connect();
   await tick();
-  h.channel.close(); // socket 已建好，但还没 open
-  h.sockets[0].fire('open'); // 迟到的 open
+  h.channel.close(); // the socket exists but has not opened yet
+  h.sockets[0].fire('open'); // the late open
   await p;
   assert.equal(h.sockets[0].closed, true);
-  assert.deepEqual(h.errors, [], '自己关的，不算故障');
+  assert.deepEqual(h.errors, [], 'we closed it ourselves, so it is not a fault');
 });
