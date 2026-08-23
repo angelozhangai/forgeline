@@ -1,14 +1,17 @@
-// 集成：Web 面板写网关（action-gateway + server POST /api/action）。起真 http server、mock actions 捕获派发。
-// 验：状态→动作映射；合法动作派到真 action（as web_actor=lead）+ panel_action 审计；未知动作/找不到需求 → !ok；
-// 安全闸——跨源 Origin → 403、非 application/json → 415；GET /api/session 详情带该态可用 actions。
+// Integration: the web panel's write gateway (action-gateway plus the server's POST /api/action). It starts a
+// real http server and mocks actions to capture what is dispatched.
+// It verifies: the state-to-action mapping; a legal action dispatching to the real action (as
+// web_actor=lead) with a panel_action audit event; an unknown action or a requirement that cannot be found
+// -> !ok; the security gates — a cross-origin Origin -> 403, anything other than application/json -> 415;
+// and that GET /api/session's detail carries the actions available in that state.
 process.env.FORGE_DB = ':memory:';
 import { test, mock, before, after, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-const { loadConfig } = await import('../src/config.ts'); // 动态导入（绝不静态！静态会 hoist 到 FORGE_DB=:memory: 之前 → root.ts 落真库 → 并发串库）。桩回退真配置。
+const { loadConfig } = await import('../src/config.ts'); // a dynamic import (never a static one! a static import hoists above FORGE_DB=':memory:', so root.ts would resolve the real database and concurrent tests would share it). The stub falls back to the real config.
 
 const calls: { name: string; id: string; by?: string }[] = [];
-const sync = (name: string) => (id: string, by: string) => { calls.push({ name, id, by }); return { ok: true, msg: `ok·${name}` }; };
-const asyncFn = (name: string) => async (id: string, by: string) => { calls.push({ name, id, by }); return { ok: true, msg: `ok·${name}` }; };
+const sync = (name: string) => (id: string, by: string) => { calls.push({ name, id, by }); return { ok: true, msg: `ok: ${name}` }; };
+const asyncFn = (name: string) => async (id: string, by: string) => { calls.push({ name, id, by }); return { ok: true, msg: `ok: ${name}` }; };
 mock.module('../src/actions.ts', {
   namedExports: {
     confirm: sync('confirm'),
@@ -19,7 +22,7 @@ mock.module('../src/actions.ts', {
     requestGateC: sync('requestGateC'),
     requestReviewPr: sync('requestReviewPr'),
     ackMerged: asyncFn('ackMerged'),
-    retry: (id: string, by: string) => { calls.push({ name: 'retry', id, by }); return { ok: true, msg: 'ok·retry' }; },
+    retry: (id: string, by: string) => { calls.push({ name: 'retry', id, by }); return { ok: true, msg: 'ok: retry' }; },
   },
 });
 mock.module('../src/projects.ts', { namedExports: { projectForSession: () => ({ autonomy: { level: 0, actor: 'M' } }), configForProject: () => loadConfig(), configForSession: () => loadConfig() } });
@@ -42,32 +45,32 @@ async function mk(id: string, state: string): Promise<void> {
 const post = (body: unknown, headers: Record<string, string> = {}) =>
   fetch(`http://127.0.0.1:${PORT}/api/action`, { method: 'POST', headers: { 'Content-Type': 'application/json', ...headers }, body: typeof body === 'string' ? body : JSON.stringify(body) });
 
-test('panelActionsFor：关键态映射；确定性闸/运行态不给按钮（红线：面板不提供跳过）', () => {
+test('panelActionsFor: the mapping for the key states; a deterministic gate or a running state offers no button (the red line: the panel never offers a way to skip)', () => {
   assert.deepEqual(panelActionsFor('AWAITING_GO' as never), ['go', 'deny']);
   assert.deepEqual(panelActionsFor('CONFIRMED' as never), ['gateb']);
   assert.deepEqual(panelActionsFor('AWAITING_HUMAN_MERGE' as never), ['merged']);
-  assert.deepEqual(panelActionsFor('WRITE_FAILED' as never), ['go']); // planRetry 对 WRITE_FAILED 返 null → 须重跑 go，不是 retry
-  assert.deepEqual(panelActionsFor('GATE_C_STALLED' as never), []); // CI 没绿，面板也不给「跳过」
-  assert.deepEqual(panelActionsFor('GATE_C_LOOP' as never), []); // 运行态无按钮
+  assert.deepEqual(panelActionsFor('WRITE_FAILED' as never), ['go']); // planRetry returns null for WRITE_FAILED, so it has to re-run go rather than retry
+  assert.deepEqual(panelActionsFor('GATE_C_STALLED' as never), []); // CI is not green, and the panel offers no way to skip that either
+  assert.deepEqual(panelActionsFor('GATE_C_LOOP' as never), []); // a running state has no buttons
 });
 
-test('POST /api/action：合法动作 → 派到真 action（as web_actor=routing.lead=M）+ panel_action 审计 + 200', async () => {
+test('POST /api/action: a legal action dispatches to the real action (as web_actor=routing.lead=M), records a panel_action audit event, and returns 200', async () => {
   await mk('s1', 'CONFIRMED');
   const r = await post({ action: 'gateb', slug: 's1' });
   assert.equal(r.status, 200);
-  assert.deepEqual(calls, [{ name: 'requestGateB', id: 's1', by: 'M' }]); // 真 action 被调、署名 lead
+  assert.deepEqual(calls, [{ name: 'requestGateB', id: 's1', by: 'M' }]); // the real action was called, signed as the lead
   assert.ok((await sessions.events('s1')).some((e) => e.kind === 'panel_action'));
 });
 
-test('POST /api/action：动作不属当前态 BY_STATE → !ok 400，绝不派发（SF1：服务端兜底，不只前端展示）', async () => {
-  await mk('s1', 'CONFIRMED'); // CONFIRMED 的面板按钮只有 gateb；go 虽在 DISPATCH 且真 go 可能放行，但面板策略不提供 → 服务端拦
+test('POST /api/action: an action outside the current state\'s BY_STATE -> !ok 400, never dispatched (SF1: the server backs it up, not just the front end)', async () => {
+  await mk('s1', 'CONFIRMED'); // CONFIRMED's only panel button is gateb; go is in DISPATCH and the real go might well allow it, but the panel policy does not offer it -> the server blocks it
   const r = await post({ action: 'go', slug: 's1' });
   assert.equal(r.status, 400);
   assert.equal((await r.json()).ok, false);
-  assert.equal(calls.length, 0); // 绝不派到真 action
+  assert.equal(calls.length, 0); // it is never dispatched to the real action
 });
 
-test('POST /api/action：未知动作 → !ok 400，绝不派发', async () => {
+test('POST /api/action: an unknown action -> !ok 400, never dispatched', async () => {
   await mk('s1', 'CONFIRMED');
   const r = await post({ action: 'nuke', slug: 's1' });
   assert.equal(r.status, 400);
@@ -75,27 +78,27 @@ test('POST /api/action：未知动作 → !ok 400，绝不派发', async () => {
   assert.equal(calls.length, 0);
 });
 
-test('POST /api/action：找不到需求 → !ok 400', async () => {
+test('POST /api/action: the requirement cannot be found -> !ok 400', async () => {
   const r = await post({ action: 'gateb', slug: 'ghost' });
   assert.equal(r.status, 400);
   assert.equal(calls.length, 0);
 });
 
-test('POST /api/action：跨源 Origin → 403（CSRF 闸：防恶意网页 drive-by POST 到 localhost）', async () => {
+test('POST /api/action: a cross-origin Origin -> 403 (the CSRF gate: it stops a malicious web page drive-by POSTing to localhost)', async () => {
   await mk('s1', 'CONFIRMED');
   const r = await post({ action: 'gateb', slug: 's1' }, { Origin: 'http://evil.example.com' });
   assert.equal(r.status, 403);
   assert.equal(calls.length, 0);
 });
 
-test('POST /api/action：非 application/json → 415（表单 POST 设不了该 content-type，挡 CSRF）', async () => {
+test('POST /api/action: anything other than application/json -> 415 (a form POST cannot set that content type, which blocks CSRF)', async () => {
   await mk('s1', 'CONFIRMED');
   const r = await fetch(`http://127.0.0.1:${PORT}/api/action`, { method: 'POST', headers: { 'Content-Type': 'text/plain' }, body: '{}' });
   assert.equal(r.status, 415);
   assert.equal(calls.length, 0);
 });
 
-test('GET /api/session：详情带该状态可用 actions（喂前端画按钮）', async () => {
+test('GET /api/session: the detail carries the actions available in that state (which the front end draws its buttons from)', async () => {
   await mk('s1', 'AWAITING_GO');
   const j = await (await fetch(`http://127.0.0.1:${PORT}/api/session?id=s1`)).json();
   assert.deepEqual(j.actions, ['go', 'deny']);

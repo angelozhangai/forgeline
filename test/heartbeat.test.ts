@@ -1,14 +1,16 @@
-// 心跳：原子写/读往返 + 字段推进 + 缺失→null。须在导入前设 FORGE_HEARTBEAT 隔离到临时文件。
+// The heartbeat: the atomic write/read round-trip, the fields advancing, and missing -> null.
+// FORGE_HEARTBEAT has to be set before the imports so it is isolated to a temporary file.
 process.env.FORGE_HEARTBEAT = '/tmp/forge-test-hb.json';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { rmSync, writeFileSync } from 'node:fs';
-// 动态 import：ESM 的静态 import 会在顶部 env 赋值【之前】求值，须等设好 FORGE_HEARTBEAT 再载入 root.ts。
+// A dynamic import: an ESM static import evaluates **before** the env assignment at the top, so root.ts must
+// not load until FORGE_HEARTBEAT is set.
 const { initHeartbeat, pingLiveness, markCycle, markWs, readHeartbeat, _resetForTest } = await import('../src/health/heartbeat.ts');
 
 const PATH = '/tmp/forge-test-hb.json';
 
-test('heartbeat 原子写/读往返 + 字段推进', () => {
+test('the heartbeat: the atomic write/read round-trip, and the fields advancing', () => {
   rmSync(PATH, { force: true });
   _resetForTest();
   const t0 = 1_000_000;
@@ -36,13 +38,13 @@ test('heartbeat 原子写/读往返 + 字段推进', () => {
   assert.equal(hb!.wsLastEventAt, t0 + 7000);
 });
 
-test('readHeartbeat：文件缺失 → null（不崩）', () => {
+test('readHeartbeat: the file is missing -> null (it does not crash)', () => {
   rmSync(PATH, { force: true });
   _resetForTest();
   assert.equal(readHeartbeat(), null);
 });
 
-test('readHeartbeat：内容损坏 → null', () => {
+test('readHeartbeat: the contents are corrupt -> null', () => {
   _resetForTest();
   writeFileSync(PATH, '{not json', 'utf8');
   assert.equal(readHeartbeat(), null);
