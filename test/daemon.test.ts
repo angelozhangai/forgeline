@@ -1,22 +1,24 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
-import { formValue } from '../src/messaging/feishu.ts'; // 表单解析随入站迁到 adapter
+import { formValue } from '../src/messaging/feishu.ts'; // parsing the form moved into the adapter along with the inbound side
 
-// 注：「从一句话里捞文档链接」在 Phase 1 随文档源迁走了——listen 现在只调 claimDocs，
-// 认链接是 docs/feishu.ts 的事，用例见 docs-feishu.test.ts / docs-registry.test.ts。
+// Note: pulling a document link out of a sentence moved away with the document sources in Phase 1. listen now
+// only calls claimDocs, recognising the link is docs/feishu.ts's job, and the tests for it live in
+// docs-feishu.test.ts and docs-registry.test.ts.
 
-// 卡片表单回调：从原始事件挖 verdict/notes（兼容 raw.event.action 与 raw.action）。
-test('formValue：raw.event.action.form_value', () => {
+// The card's form callback: digging verdict and notes out of the raw event, handling both raw.event.action
+// and raw.action.
+test('formValue: raw.event.action.form_value', () => {
   const evt = { raw: { event: { action: { form_value: { verdict: 'accept', notes: 'ok' } } } } };
   assert.deepEqual(formValue(evt), { verdict: 'accept', notes: 'ok' });
 });
 
-test('formValue：raw.action.form_value（无 event 包裹）', () => {
+test('formValue: raw.action.form_value, with no event wrapper', () => {
   const evt = { raw: { action: { form_value: { verdict: 'deny' } } } };
   assert.deepEqual(formValue(evt), { verdict: 'deny' });
 });
 
-test('formValue：无表单值 → 空对象（不崩）', () => {
+test('formValue: no form value gives an empty object rather than crashing', () => {
   assert.deepEqual(formValue({}), {});
   assert.deepEqual(formValue({ raw: {} }), {});
 });

@@ -1,21 +1,24 @@
-// 文档源**注册表**的解析规则（src/docs/index.ts）。这是「加一个源=加一行」这句话的兑现处，
-// 也是几条不能错的规则：非兜底源取并集、兜底源只在无人认领时上场且最多一条、
-// 未注册的源如实报错而非静默、落库键带源前缀（跨源 token 撞车 = PRD 去重红线被击穿）。
+// The resolution rules of the document-source **registry** (src/docs/index.ts). This is where "adding a
+// source is adding one line" is actually made good, and it holds a few rules that must not be got wrong:
+// non-fallback sources take the union, a fallback source only steps in when nobody claimed and contributes
+// at most one ref, an unregistered source reports the fact rather than failing silently, and the stored key
+// carries a source prefix -- a token collision across sources would breach the PRD-deduplication red line.
 process.env.FORGE_DB = ':memory:';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import type { DocRef, DocSource } from '../src/docs/port.ts';
 
-// 用假源替掉真飞书源：本用例测的是**注册表的规则**，不是某个源的正则。
+// Fake sources stand in for the real Feishu one: what these tests cover is the **registry's rules**, not any
+// individual source's regular expressions.
 function src(id: string, opts: { fallback?: boolean; claims?: string[]; parses?: string[]; canComment?: boolean; readText?: string } = {}): DocSource {
   const s: DocSource = {
     id,
     fallback: opts.fallback,
     claim: (input) => (opts.claims ?? []).filter((t) => `${input.text} ${(input.searchTexts ?? []).join(' ')}`.includes(t)).map((token) => ({ source: id, token })),
     parseRef: (u) => ((opts.parses ?? []).some((p) => u.includes(p)) ? { source: id, token: u } : null),
-    read: async () => ({ ok: true, text: opts.readText ?? `${id} 正文` }),
+    read: async () => ({ ok: true, text: opts.readText ?? `${id} body` }),
   };
-  if (opts.canComment) s.comment = async (_ref, text) => (text === 'boom' ? { ok: false, error: '写不进去' } : { ok: true });
+  if (opts.canComment) s.comment = async (_ref, text) => (text === 'boom' ? { ok: false, error: 'could not write it' } : { ok: true });
   return s;
 }
 
@@ -24,122 +27,125 @@ const B = src('beta', { claims: ['B1'], parses: ['beta.example'] });
 const F = src('fallback-src', { fallback: true, claims: ['A1', 'B1', 'anything'], parses: [''] });
 const docs = await import('../src/docs/index.ts');
 
-test('真实注册表：飞书是主源，plaintext 是兜底源', () => {
+test('the real registry: Feishu is a primary source and plaintext is the fallback', () => {
   assert.deepEqual(docs.registeredIds(), ['feishu', 'plaintext']);
-  assert.equal(docs.sources().find((s) => s.id === 'feishu')?.fallback, undefined, '飞书绝不能被标成兜底源——否则它会吞掉别人的链接');
+  assert.equal(docs.sources().find((s) => s.id === 'feishu')?.fallback, undefined, 'Feishu must never be marked as a fallback -- it would swallow other sources\' links');
   assert.equal(docs.sources().find((s) => s.id === 'plaintext')?.fallback, true);
 });
 
-test('formatRef / parseStoredRef：落库键带源前缀，且按第一个冒号切（token 里可以再有冒号）', () => {
+test('formatRef / parseStoredRef: the stored key carries the source prefix and splits on the first colon, so a token may contain more of them', () => {
   assert.equal(docs.formatRef({ source: 'feishu', token: 'ABC' }), 'feishu:ABC');
   assert.deepEqual(docs.parseStoredRef('feishu:ABC'), { source: 'feishu', token: 'ABC' });
   assert.deepEqual(docs.parseStoredRef('slack:C123:1712.45'), { source: 'slack', token: 'C123:1712.45' });
 });
 
-test('parseStoredRef：无前缀 / 空 source / 空 token → null（绝不猜一个源出来）', () => {
-  assert.equal(docs.parseStoredRef('ABC'), null); // 迁移前的裸 token 形态
+test('parseStoredRef: no prefix, an empty source or an empty token all give null (never guess a source)', () => {
+  assert.equal(docs.parseStoredRef('ABC'), null); // the bare-token shape from before the migration
   assert.equal(docs.parseStoredRef(':ABC'), null);
   assert.equal(docs.parseStoredRef('feishu:'), null);
   assert.equal(docs.parseStoredRef(null), null);
   assert.equal(docs.parseStoredRef(''), null);
 });
 
-test('readDoc：未注册的源 → 如实报错并列出已注册源（不静默当读失败）', async () => {
+test('readDoc: an unregistered source says so plainly and lists the registered ones (never a silent read failure)', async () => {
   const r = await docs.readDoc({ source: 'notion', token: 'p1' });
   assert.equal(r.ok, false);
   assert.match(r.error ?? '', /Unregistered document source/);
   assert.match(r.error ?? '', /feishu/);
 });
 
-test('commentDoc：没有文档来源 / 未注册的源 → 不抛（best-effort，绝不阻断闸）', async () => {
-  await docs.commentDoc(null, '批注'); // 手动 add / standalone issue：本就无处可写
-  await docs.commentDoc('notion:p1', '批注'); // 源没注册：记日志，不抛
-  await docs.commentDoc('feishu:', '批注'); // 解析不出：不抛
+test('commentDoc: no document source, or an unregistered one, never throws (best effort -- it must not block a gate)', async () => {
+  await docs.commentDoc(null, 'a comment'); // added by hand, or a standalone issue: there was never anywhere to write
+  await docs.commentDoc('notion:p1', 'a comment'); // the source is not registered: log it, do not throw
+  await docs.commentDoc('feishu:', 'a comment'); // unparseable: do not throw
 });
 
-// ── 注册表规则本身（多源）──────────────────────────────────────────────
-// resolveClaims / resolveRef 是**规则**，claimDocs / parseAnyRef 只是把它接到真实注册表上。
-// 分开正是为了这里：喂任意源列表，直接测规则本身，而不是对着唯一一个已注册源自说自话。
+// -- The registry's rules themselves, across several sources ------------------------------------------
+// resolveClaims / resolveRef are the **rules**; claimDocs / parseAnyRef merely wire them to the real
+// registry. They are separate exactly for this: feed in any list of sources and test the rules directly,
+// rather than talking to yourself about the single source that happens to be registered.
 const registry = [A, B, F];
 const claimWith = (list: DocSource[], input: { text: string; searchTexts?: string[] }): DocRef[] => docs.resolveClaims(list, input);
 
-test('规则：一条消息里贴了两个源的链接 → 两个都认领（并集，不是先到先得）', () => {
-  const got = claimWith(registry, { text: '这里有 A1 也有 B1' });
+test('rule: one message carrying links from two sources claims both (the union, not first past the post)', () => {
+  const got = claimWith(registry, { text: 'there is an A1 here and a B1 too' });
   assert.deepEqual(got.map(docs.formatRef), ['alpha:A1', 'beta:B1']);
 });
 
-test('规则：有主源认领时兜底源绝不上场（否则同一段话会被登记两遍）', () => {
+test('rule: when a primary source claims, the fallback never steps in (otherwise the same passage is registered twice)', () => {
   const got = claimWith(registry, { text: 'A1 anything' });
   assert.deepEqual(got.map(docs.formatRef), ['alpha:A1']);
 });
 
-test('规则：无人认领才轮到兜底源，且最多一条（不把一段话拆成好几个需求）', () => {
-  const got = claimWith(registry, { text: 'anything 但没有主源链接' });
+test('rule: only when nobody claims does the fallback get its turn, and it contributes at most one (never splitting a passage into several requirements)', () => {
+  const got = claimWith(registry, { text: 'anything, but no primary-source link' });
   assert.deepEqual(got.map(docs.formatRef), ['fallback-src:anything']);
 });
 
-test('规则：兜底是**标志位**不是数组位置——把兜底源排到最前，它依然不抢主源', () => {
+test('rule: fallback is a **flag**, not a position in the array -- put the fallback first and it still does not outrank a primary source', () => {
   const reordered = [F, A, B];
   assert.deepEqual(claimWith(reordered, { text: 'A1 anything' }).map(docs.formatRef), ['alpha:A1']);
 });
 
-test('规则：同一源在正文与兜底块里认领同一份文档 → 只留一条', () => {
+test('rule: one source claiming the same document from both the body and a fallback block leaves a single ref', () => {
   const dup = src('dup', { claims: ['X'] });
   const got = claimWith([dup], { text: 'X', searchTexts: ['X again X'] });
   assert.deepEqual(got.map(docs.formatRef), ['dup:X']);
 });
 
-test('规则：谁都不认领 → 空（调用方据此明说「无法识别」，绝不猜）', () => {
-  assert.deepEqual(claimWith([A, B], { text: '今天天气不错' }), []);
+test('rule: nobody claims -> empty, which is how the caller says plainly that it could not identify one rather than guessing', () => {
+  assert.deepEqual(claimWith([A, B], { text: 'nice weather today' }), []);
 });
 
-test('resolveRef：主源先问，都不认才问兜底源', () => {
+test('resolveRef: the primary sources are asked first, and only if none of them claim is the fallback asked', () => {
   assert.deepEqual(docs.resolveRef(registry, 'https://beta.example/p1'), { source: 'beta', token: 'https://beta.example/p1' });
-  // 主源都不认 → 兜底源接住（它的 parseRef 认一切）
-  assert.equal(docs.resolveRef(registry, '随便一段话')?.source, 'fallback-src');
-  // 没有兜底源时：谁都不认 → null
-  assert.equal(docs.resolveRef([A, B], '随便一段话'), null);
+  // No primary source claims -> the fallback catches it (its parseRef accepts anything).
+  assert.equal(docs.resolveRef(registry, 'just some passage of text')?.source, 'fallback-src');
+  // With no fallback present, nobody claims -> null.
+  assert.equal(docs.resolveRef([A, B], 'just some passage of text'), null);
 });
 
-test('resolveRef：兜底源排在最前也抢不到主源认得的链接', () => {
+test('resolveRef: even placed first, the fallback cannot take a link a primary source recognises', () => {
   assert.equal(docs.resolveRef([F, A, B], 'https://alpha.example/p1')?.source, 'alpha');
 });
 
-test('接线：claimDocs / parseAnyRef 就是规则跑在真实注册表上（飞书链接进得来）', () => {
+test('the wiring: claimDocs / parseAnyRef are those same rules running against the real registry, and a Feishu link gets through', () => {
   const url = 'https://x.feishu.cn/docx/REALTOK';
-  assert.deepEqual(docs.claimDocs({ text: `看下 ${url}` }).map(docs.formatRef), ['feishu:REALTOK']);
+  assert.deepEqual(docs.claimDocs({ text: `have a look at ${url}` }).map(docs.formatRef), ['feishu:REALTOK']);
   assert.deepEqual(docs.parseAnyRef(url), { source: 'feishu', token: 'REALTOK', url });
-  assert.equal(docs.parseAnyRef('https://www.notion.so/page-1'), null, '主源不认、兜底源不收链接 → 认不出就是认不出');
+  assert.equal(docs.parseAnyRef('https://www.notion.so/page-1'), null, 'no primary source claims it and the fallback does not take links -- unrecognised means unrecognised');
 });
 
-// ── 合并规则：核心源 + 扩展包注册的源（src/ext/port.ts 的 docSources）──────────
-// 这几条是「下游能加源、但加不坏核心」的全部保证，所以每一条都单独钉住。
+// -- The merge rules: core sources plus the ones an extension pack registers (docSources in
+// src/ext/port.ts) --
+// These are the whole of the guarantee that downstream can add a source without breaking the core, so each
+// one is pinned separately.
 
-test('合并：扩展源接在核心源后面（核心在前，兜底顺位由此确定）', () => {
+test('merge: extension sources follow the core ones (the core comes first, which is what settles the fallback order)', () => {
   const merged = docs.mergeSources([A, F], [B]);
   assert.deepEqual(merged.map((s) => s.id), ['alpha', 'fallback-src', 'beta']);
 });
 
-test('合并：id 与核心撞车 → 忽略扩展那份（核心永远优先，下游换不掉飞书源）', () => {
-  const impostor = src('alpha', { claims: ['A1'], readText: '冒牌正文' });
+test('merge: an id colliding with a core source drops the extension\'s copy (the core always wins, and downstream cannot replace the Feishu source)', () => {
+  const impostor = src('alpha', { claims: ['A1'], readText: 'impostor body' });
   const merged = docs.mergeSources([A, F], [impostor, B]);
   assert.deepEqual(merged.map((s) => s.id), ['alpha', 'fallback-src', 'beta']);
-  assert.equal(merged[0], A, '留下的必须是核心那个对象本身，不是同名的扩展源');
+  assert.equal(merged[0], A, 'what survives must be the core object itself, not the extension source of the same name');
 });
 
-test('合并：扩展源之间也去重（同一个 id 出现两次只留先来的）', () => {
+test('merge: extension sources are deduplicated against each other too (the same id twice keeps the first)', () => {
   const merged = docs.mergeSources([A], [src('beta', { claims: ['B1'] }), src('beta', { claims: ['B2'] })]);
   assert.deepEqual(merged.map((s) => s.id), ['alpha', 'beta']);
 });
 
-test('合并：核心兜底源排在扩展兜底源前面 → 两个都活着时核心那个先认领', () => {
+test('merge: the core fallback comes before an extension fallback, so with both alive the core one claims first', () => {
   const extraFallback = src('ext-fallback', { fallback: true, claims: ['anything'] });
   const merged = docs.mergeSources([A, F], [extraFallback]);
-  const claimed = docs.resolveClaims(merged, { text: 'anything 别的源都不认' });
+  const claimed = docs.resolveClaims(merged, { text: 'anything no other source claims' });
   assert.deepEqual(claimed, [{ source: 'fallback-src', token: 'anything' }]);
-  assert.equal(claimed.length, 1, '兜底源最多一条——两个兜底源不该把一段话登记两遍');
+  assert.equal(claimed.length, 1, 'a fallback contributes at most one -- two of them must not register the same passage twice');
 });
 
-test('合并：空扩展列表 → 结果与核心逐项相同（没装扩展时行为逐字节不变）', () => {
+test('merge: an empty extension list gives back the core list item for item (with no pack installed the behaviour is unchanged, byte for byte)', () => {
   assert.deepEqual(docs.mergeSources([A, F], []), [A, F]);
 });

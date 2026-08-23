@@ -8,22 +8,24 @@ import { renderFeishuCard } from '../src/messaging/feishu.ts';
 import type { CardModel } from '../src/messaging/model.ts';
 import type { Session } from '../src/types.ts';
 
-// 写一个临时 gate-a.json，供「群卡读 open_questions」的渲染测试用。
+// Write a temporary gate-a.json for the rendering tests that read open_questions off the channel card.
 function gateAFile(openQuestions: unknown[]): string {
   const p = join(mkdtempSync(join(tmpdir(), 'forge-notify-')), 'gate-a.json');
   writeFileSync(p, JSON.stringify({ summary: 's', open_questions: openQuestions, risks: [] }));
   return p;
 }
 
-// 卡片即「按钮回调契约」：daemon 靠 button.behaviors[].value.{action,slug} 派发，必须正确带上。
+// A card is a button-callback contract: the daemon dispatches on button.behaviors[].value.{action,slug},
+// so those have to be carried correctly.
 function sess(p: Partial<Session>): Session {
   return { id: 'id1', slug: 'finance-report', title: 't', state: 'AWAITING_GO', branch: 'dev', gate_a_output_path: null, routing: null, adversarial_residual: null, gate_a_cost_usd: 1, gate_b_cost_usd: 2, confirmed_by: null, confirmed_notes: null, error: null, prd_url: null, ...p } as unknown as Session;
 }
-// buildCard/buildStatusCard 现产 provider 无关 CardModel；断言走渲染管线 → 守飞书 JSON 不变。
+// buildCard/buildStatusCard now produce a provider-neutral CardModel, so the assertions go through the
+// rendering pipeline and pin the Feishu JSON.
 const json = (c: CardModel) => JSON.stringify(renderFeishuCard(c));
 
-test('needs_confirm：含 verdict/notes 表单 + confirm_submit 回调 + slug', () => {
-  const s = sess({ routing: JSON.stringify({ reviewer: 'M', toLead: true, reasons: ['敏感域'], confidence: 0.78 }) });
+test('needs_confirm: carries the verdict/notes form, the confirm_submit callback and the slug', () => {
+  const s = sess({ routing: JSON.stringify({ reviewer: 'M', toLead: true, reasons: ['a sensitive area'], confidence: 0.78 }) });
   const c = json(buildCard('needs_confirm', s));
   assert.match(c, /"schema":"2\.0"/);
   assert.match(c, /"name":"verdict"/);
@@ -32,14 +34,14 @@ test('needs_confirm：含 verdict/notes 表单 + confirm_submit 回调 + slug', 
   assert.match(c, /finance-report/);
 });
 
-test('needs_go：放行=go、驳回=deny 两个回调按钮，均带 slug', () => {
+test('needs_go: two callback buttons -- go to release and deny to refuse -- both carrying the slug', () => {
   const c = json(buildCard('needs_go', sess({})));
   assert.match(c, /"action":"go"/);
   assert.match(c, /"action":"deny"/);
   assert.match(c, /"slug":"finance-report"/);
 });
 
-test('needs_go：含 DRI 指派下拉（go_form），有推荐时默认选推荐人并展示负载理由', () => {
+test('needs_go: carries the DRI assignment dropdown (go_form); with a recommendation it preselects that person and shows the load reasoning', () => {
   const snapshot = JSON.stringify({
     pick: 'EO',
     allOverWip: false,
@@ -51,13 +53,13 @@ test('needs_go：含 DRI 指派下拉（go_form），有推荐时默认选推荐
     ],
   });
   const c = json(buildCard('needs_go', sess({ assignee: 'EO', assign_snapshot: snapshot } as Partial<Session>)));
-  assert.match(c, /"name":"assignee"/); // DRI 下拉
-  assert.match(c, /"initial_option":"EO"/); // 默认采纳推荐人
-  assert.match(c, /Suggested DRI: EO/); // 推荐理由块
-  assert.match(c, /"action":"go"/); // 提交仍回调 go
+  assert.match(c, /"name":"assignee"/); // the DRI dropdown
+  assert.match(c, /"initial_option":"EO"/); // the recommendation is preselected
+  assert.match(c, /Suggested DRI: EO/); // the reasoning block
+  assert.match(c, /"action":"go"/); // submitting still calls back with go
 });
 
-test('needs_go：自动推荐失败时不默认旧人，提示 M 必须手动选择 DRI', () => {
+test('needs_go: when the recommendation cannot be computed it does not fall back to whoever was there, and tells the maintainer to pick a DRI by hand', () => {
   const snapshot = JSON.stringify({
     pick: null,
     allOverWip: false,
@@ -72,182 +74,183 @@ test('needs_go：自动推荐失败时不默认旧人，提示 M 必须手动选
   assert.match(c, /no recommendation could be computed/);
   assert.match(c, /please pick someone/);
   assert.match(c, /load unknown/);
-  assert.doesNotMatch(c, /"initial_option"/); // 没有可靠推荐时，不能让旧默认人蒙混过关
+  assert.doesNotMatch(c, /"initial_option"/); // with no trustworthy recommendation, a stale default must not slip through
 });
 
-test('needs_gateb：出技术方案=gateb 回调按钮', () => {
+test('needs_gateb: the produce-the-technical-plan button calls back with gateb', () => {
   const c = json(buildCard('needs_gateb', sess({ confirmed_by: 'M' })));
   assert.match(c, /"action":"gateb"/);
 });
 
-test('needs_arbitration：M 强制通过=force_confirm 回调 + 列残留开放问题 + slug', () => {
-  const c = json(buildCard('needs_arbitration', sess({ state: 'GATE_A_STALLED', gate_a_round: 6, gate_a_residual: JSON.stringify({ round: 6, open_questions: [{ q: '计费口径未定', severity: 'high' }] }) } as never)));
+test('needs_arbitration: the maintainer\'s force-through button calls back with force_confirm, and the card lists the questions left open plus the slug', () => {
+  const c = json(buildCard('needs_arbitration', sess({ state: 'GATE_A_STALLED', gate_a_round: 6, gate_a_residual: JSON.stringify({ round: 6, open_questions: [{ q: 'the billing basis is still undecided', severity: 'high' }] }) } as never)));
   assert.match(c, /"action":"force_confirm"/);
   assert.match(c, /finance-report/);
-  assert.match(c, /计费口径未定/);
+  assert.match(c, /the billing basis is still undecided/);
 });
 
-test('needs_gateb_input：每问题=交互下拉(select_static, name=ask_<id>) + 选项含「其他」兜底 + notes + gateb_answer_submit 回调', () => {
-  const c = json(buildCard('needs_gateb_input', sess({ state: 'AWAITING_GATE_B_INPUT', gate_b_human_asks: JSON.stringify([{ id: 'H1', question: '退款退到余额还是原路？', options: ['原路', '余额'], severity: 'high' }]) } as never)));
+test('needs_gateb_input: one interactive dropdown per question (select_static, name=ask_<id>), an "other" fallback option, a notes box, and the gateb_answer_submit callback', () => {
+  const c = json(buildCard('needs_gateb_input', sess({ state: 'AWAITING_GATE_B_INPUT', gate_b_human_asks: JSON.stringify([{ id: 'H1', question: 'Should a refund go back to the balance or to the original payment method?', options: ['the original method', 'the balance'], severity: 'high' }]) } as never)));
   assert.match(c, /"action":"gateb_answer_submit"/);
-  assert.match(c, /退款退到余额还是原路/);
-  assert.match(c, /"tag":"select_static"/); // 真·交互选择框
-  assert.match(c, /"name":"ask_H1"/); // 按位置 H{n} 命名，回调同序拼回
-  assert.match(c, /Other/); // 「其他·手填」兜底项
-  assert.match(c, /"name":"notes"/); // 补充说明框
+  assert.match(c, /back to the balance or to the original payment method/);
+  assert.match(c, /"tag":"select_static"/); // a genuinely interactive select
+  assert.match(c, /"name":"ask_H1"/); // named H{n} by position, and reassembled in the same order
+  assert.match(c, /Other/); // the "other, type it in" fallback
+  assert.match(c, /"name":"notes"/); // the free-text box
   assert.match(c, /finance-report/);
 });
 
-test('群卡 闸A（AWAITING_PM_CONFIRM）：逐条下拉(ask_H1) + ★推荐 + 整体结论 + 补充 + round 透传', () => {
+test('the channel card at gate A (AWAITING_PM_CONFIRM): a dropdown per question (ask_H1), the star for the recommendation, the overall verdict, the notes box, and round carried through', () => {
   const path = gateAFile([
-    { q: '充值的钱会过期吗？', severity: 'high', options: [{ label: '不过期', recommended: true, impact: '对用户友好' }, { label: '一年后过期', recommended: false, impact: '需到期提醒' }] },
+    { q: 'Does topped-up credit expire?', severity: 'high', options: [{ label: 'it never expires', recommended: true, impact: 'friendlier to users' }, { label: 'it expires after a year', recommended: false, impact: 'needs an expiry reminder' }] },
   ]);
   const c = json(buildStatusCard(sess({ state: 'AWAITING_PM_CONFIRM', gate_a_output_path: path, gate_a_round: 1, poster_id: 'ou_pm', chat_id: 'oc' } as never)));
-  assert.match(c, /"name":"ask_H1"/); // 逐条交互下拉（不是只有全局 verdict）
-  assert.match(c, /★/); // 推荐值标记
-  assert.match(c, /充值的钱会过期吗/);
-  assert.match(c, /"name":"verdict"/); // 整体结论保留
-  assert.match(c, /"name":"notes"/); // 末尾全局补充框
+  assert.match(c, /"name":"ask_H1"/); // an interactive dropdown per question (not just one global verdict)
+  assert.match(c, /★/); // the marker on the recommended option
+  assert.match(c, /Does topped-up credit expire/);
+  assert.match(c, /"name":"verdict"/); // the overall verdict is still there
+  assert.match(c, /"name":"notes"/); // the global notes box at the end
   assert.match(c, /"action":"confirm_submit"/);
-  assert.match(c, /"round":1/); // round 透传（防群卡原地编辑第2轮提交被去重吞掉）
+  assert.match(c, /"round":1/); // round carried through, so a round-2 submission on the edited-in-place card is not deduplicated away
 });
 
-test('群卡 闸A：8 个待拍板问题都能逐条选择，第 9 个不挤进卡片', () => {
+test('the channel card at gate A: all 8 questions awaiting a decision get their own control, and a ninth does not squeeze onto the card', () => {
   const path = gateAFile(
     Array.from({ length: 9 }, (_, i) => ({
-      q: `业务问题${i + 1}`,
+      q: `business question ${i + 1}`,
       severity: 'med',
-      options: [{ label: `选项${i + 1}`, recommended: i === 7, impact: `影响${i + 1}` }],
+      options: [{ label: `option ${i + 1}`, recommended: i === 7, impact: `impact ${i + 1}` }],
     })),
   );
   const c = json(buildStatusCard(sess({ state: 'AWAITING_PM_CONFIRM', gate_a_output_path: path, gate_a_round: 3, poster_id: 'ou_pm', chat_id: 'oc' } as never)));
   assert.match(c, /"name":"ask_H1"/);
   assert.match(c, /"name":"ask_H8"/);
   assert.doesNotMatch(c, /"name":"ask_H9"/);
-  assert.match(c, /业务问题8/);
-  assert.doesNotMatch(c, /业务问题9/);
-  assert.match(c, /★ 选项8/);
+  assert.match(c, /business question 8/);
+  assert.doesNotMatch(c, /business question 9/);
+  assert.match(c, /★ option 8/);
   assert.match(c, /"round":3/);
 });
 
-test('私聊 闸B needs_gateb_input：选项展示 ★推荐 + 影响文案', () => {
+test('the direct message at gate B (needs_gateb_input): options show the recommendation star and the impact note', () => {
   const asks = JSON.stringify([
-    { id: 'H1', question: '退款退原路还是余额？', severity: 'high', options: [{ label: '原路', recommended: true, impact: '合规清晰' }, { label: '余额', recommended: false, impact: '快但有资金沉淀' }] },
+    { id: 'H1', question: 'Refund to the original payment method or to the balance?', severity: 'high', options: [{ label: 'the original method', recommended: true, impact: 'cleaner for compliance' }, { label: 'the balance', recommended: false, impact: 'faster, but the money sits with us' }] },
   ]);
   const c = json(buildCard('needs_gateb_input', sess({ state: 'AWAITING_GATE_B_INPUT', gate_b_human_asks: asks, gate_b_round: 2 } as never)));
   assert.match(c, /★/);
-  assert.match(c, /\(impact: 合规清晰\)/); // 影响副文案的格式由 messaging adapter 决定（已英化）
+  assert.match(c, /\(impact: cleaner for compliance\)/); // the messaging adapter decides how the impact note is formatted
   assert.match(c, /"name":"ask_H1"/);
   assert.match(c, /"round":2/);
 });
 
-test('needs_gateb_input：无 options 的问题 → 不出下拉（靠补充说明作答）', () => {
-  const c = json(buildCard('needs_gateb_input', sess({ state: 'AWAITING_GATE_B_INPUT', gate_b_human_asks: JSON.stringify([{ id: 'H1', question: '请补充背景', options: [], severity: 'med' }]) } as never)));
+test('needs_gateb_input: a question with no options gets no dropdown (it is answered in the notes box)', () => {
+  const c = json(buildCard('needs_gateb_input', sess({ state: 'AWAITING_GATE_B_INPUT', gate_b_human_asks: JSON.stringify([{ id: 'H1', question: 'Please fill in the background', options: [], severity: 'med' }]) } as never)));
   assert.doesNotMatch(c, /"tag":"select_static"/);
   assert.match(c, /"name":"notes"/);
   assert.match(c, /"action":"gateb_answer_submit"/);
 });
 
-test('needs_gateb_arbitration：强制立项=gateb_force_go、再修=gateb_send_back，列残留 + slug', () => {
-  const c = json(buildCard('needs_gateb_arbitration', sess({ state: 'GATE_B_STALLED', adversarial_residual: JSON.stringify({ round: 3, used: 'codex', findings: [{ issue: '幂等键缺失', severity: 'high', where: 'acceptance' }] }) } as never)));
+test('needs_gateb_arbitration: force it through with gateb_force_go or send it back with gateb_send_back, listing what is left plus the slug', () => {
+  const c = json(buildCard('needs_gateb_arbitration', sess({ state: 'GATE_B_STALLED', adversarial_residual: JSON.stringify({ round: 3, used: 'codex', findings: [{ issue: 'the idempotency key is missing', severity: 'high', where: 'acceptance' }] }) } as never)));
   assert.match(c, /"action":"gateb_force_go"/);
   assert.match(c, /"action":"gateb_send_back"/);
-  assert.match(c, /幂等键缺失/);
+  assert.match(c, /the idempotency key is missing/);
   assert.match(c, /"slug":"finance-report"/);
 });
 
-test('群状态卡 闸B 新态：人话进度、不泄漏黑话、无交互按钮', () => {
+test('the channel status card in gate B\'s newer states: plain-language progress, no leaked jargon, no interactive buttons', () => {
   for (const st of ['AWAITING_GATE_B_INPUT', 'GATE_B_REVISION_REQUESTED', 'GATE_B_STALLED'] as const) {
     const c = json(buildStatusCard(sess({ state: st } as never)));
-    assert.doesNotMatch(c, /闸A|闸B|GATE_|ADVERSARIAL/, `${st} 群卡泄漏黑话`);
-    assert.doesNotMatch(c, /"behaviors"/, `${st} 群卡不应带交互按钮（M 决策走私聊）`);
+    assert.doesNotMatch(c, /Gate [ABCD]|GATE_|ADVERSARIAL/, `the channel card for ${st} leaks jargon`);
+    assert.doesNotMatch(c, /"behaviors"/, `the channel card for ${st} should carry no interactive button (the maintainer decides over DM)`);
   }
 });
 
-test('failed：retry 回调按钮 + 错误文案', () => {
-  const c = json(buildCard('failed', sess({ error: '解析失败' }), { stage: '闸B', error: '解析失败' }));
+test('failed: the retry callback button plus the error text', () => {
+  const c = json(buildCard('failed', sess({ error: 'failed to parse' }), { stage: 'Gate B', error: 'failed to parse' }));
   assert.match(c, /"action":"retry"/);
-  assert.match(c, /解析失败/);
+  assert.match(c, /failed to parse/);
 });
 
-test('done：列出 issue 链接，无回调按钮', () => {
+test('done: lists the issue links and carries no callback button', () => {
   const c = json(buildCard('done', sess({}), { issues: [{ repo: 'example-admin', number: 73, url: 'https://x/73' }] }));
   assert.match(c, /example-admin#73/);
-  assert.doesNotMatch(c, /"behaviors"/); // 完成卡无交互按钮
+  assert.doesNotMatch(c, /"behaviors"/); // the completion card has no interactive buttons
 });
 
-test('needs_go：有残留时标注条数', () => {
+test('needs_go: when findings are left over, the count is shown', () => {
   const c = json(buildCard('needs_go', sess({ adversarial_residual: JSON.stringify({ findings: [{ issue: 'a' }, { issue: 'b' }] }) })));
   assert.match(c, /\b2\b/);
 });
 
-// 群状态卡：回复 PM 那条、原地编辑的那张卡
-test('群状态卡 待产品确认：@PM + 确认表单 + 人话状态，不泄漏黑话', () => {
+// The channel status card: the reply to product's message, edited in place
+test('the channel status card awaiting product: @-mentions product, carries the confirmation form and a plain-language state, and leaks no jargon', () => {
   const c = json(buildStatusCard(sess({ state: 'AWAITING_PM_CONFIRM', poster_id: 'ou_pm', gate_a_output_path: null })));
-  assert.match(c, /<at id=ou_pm>/); // 群里 @ 发 PRD 的产品
-  assert.match(c, /"action":"confirm_submit"/); // 确认表单在群卡上
+  assert.match(c, /<at id=ou_pm>/); // @-mentions whoever posted the PRD
+  assert.match(c, /"action":"confirm_submit"/); // the confirmation form lives on the channel card
   assert.match(c, /Waiting on product to confirm/);
-  assert.doesNotMatch(c, /闸A|闸B|GATE_/);
+  assert.doesNotMatch(c, /Gate [ABCD]|GATE_/);
 });
 
-test('群状态卡 待产品确认：PM 多轮时副标题 + 待拍板标题展示「第N轮」', () => {
+test('the channel status card awaiting product: across rounds, the subtitle and the questions heading both show which round it is', () => {
   const c = json(buildStatusCard(sess({ state: 'AWAITING_PM_CONFIRM', gate_a_round: 2, gate_a_output_path: null } as never)));
   assert.match(c, /round 2/);
-  assert.doesNotMatch(c, /闸A|GATE_/); // 仍不泄漏黑话
+  assert.doesNotMatch(c, /Gate [ABCD]|GATE_/); // still no leaked jargon
 });
 
-test('群状态卡 待产品确认：confirm_submit 按轮次带 round（去重键逐轮不同，第2轮起不再被 SDK 吞）', () => {
+test('the channel status card awaiting product: confirm_submit carries the round, so the dedup key differs per round and round 2 onwards is no longer swallowed by the SDK', () => {
   const rv = (c: string) => c.match(/"action":"confirm_submit","round":(\d+)/)?.[1];
   const r1 = json(buildStatusCard(sess({ state: 'AWAITING_PM_CONFIRM', gate_a_round: 1, gate_a_output_path: null } as never)));
   const r2 = json(buildStatusCard(sess({ state: 'AWAITING_PM_CONFIRM', gate_a_round: 2, gate_a_output_path: null } as never)));
   assert.equal(rv(r1), '1');
-  assert.equal(rv(r2), '2'); // 同一原地编辑卡、同一「提交」按钮，value.round 逐轮不同 → cardActionId 不同 → 不被去重
+  assert.equal(rv(r2), '2'); // same card edited in place, same submit button, but value.round differs per round -> a different cardActionId -> not deduplicated
   assert.notEqual(rv(r1), rv(r2));
 });
 
-test('群状态卡 复评轮（第2轮起）：醒目红横幅，跟首轮一眼可辨', () => {
+test('the channel status card on a re-review round (round 2 onwards): a red banner that tells it apart from the first round at a glance', () => {
   const c = json(buildStatusCard(sess({ state: 'AWAITING_PM_CONFIRM', gate_a_round: 2, gate_a_output_path: null } as never)));
   assert.match(c, /Re-review, round 2/);
 });
 
-test('群状态卡 复评中：人话「依答复复评」、无残留表单按钮', () => {
+test('the channel status card while re-reviewing: says it is reviewing again with the answers, and leaves no stale form button behind', () => {
   const c = json(buildStatusCard(sess({ state: 'GATE_A_REVISION_REQUESTED', gate_a_round: 2 } as never)));
   assert.match(c, /Reviewing again with your answers/);
   assert.doesNotMatch(c, /"action":"confirm_submit"/);
 });
 
-test('群状态卡 运行态：人话进度、无交互按钮', () => {
+test('the channel status card while running: plain-language progress, no interactive buttons', () => {
   const c = json(buildStatusCard(sess({ state: 'GATE_A_RUNNING' })));
   assert.match(c, /Reviewing the requirement/);
   assert.doesNotMatch(c, /"behaviors"/);
 });
 
-test('群状态卡 已立项：列出 issue', () => {
+test('the channel status card once the work is filed: lists the issues', () => {
   const c = json(buildStatusCard(sess({ state: 'DONE' }), { issues: [{ repo: 'example-admin', number: 88, url: 'https://x/88' }] }));
   assert.match(c, /example-admin#88/);
 });
 
-// 彩蛋(需求宠物)：群卡藏 $ 换投喂/进化树；私聊(M)卡保留真实 $ 且带宠物。
-test('群状态卡：藏成本($)、显示宠物彩蛋(进化树 + 投喂)', () => {
-  const c = json(buildStatusCard(sess({ state: 'GATE_A_RUNNING' }))); // sess 成本 $3
-  assert.doesNotMatch(c, /\$/); // 群里不露金额
+// The easter egg (the requirement pet): the channel card hides the dollar amount behind feeding and an
+// evolution tree, while the maintainer's direct message keeps the real dollars and the pet.
+test('the channel status card: hides the cost in dollars and shows the pet easter egg (the evolution tree plus feeding)', () => {
+  const c = json(buildStatusCard(sess({ state: 'GATE_A_RUNNING' }))); // the session has cost $3
+  assert.doesNotMatch(c, /\$/); // no amounts in the channel
   assert.match(c, /Evolution/);
   assert.match(c, /Fed \d+ bites/);
 });
 
-test('私聊卡 needs_go：保留真实成本($) + 带宠物彩蛋', () => {
-  const c = json(buildCard('needs_go', sess({}))); // sess 成本 $3
-  assert.match(c, /\$/); // 私聊保留金额（你的预算账本）
-  assert.match(c, /go/); // 动作按钮仍在
+test('the direct-message card for needs_go: keeps the real cost in dollars and carries the pet easter egg', () => {
+  const c = json(buildCard('needs_go', sess({}))); // the session has cost $3
+  assert.match(c, /\$/); // the DM keeps the amount (this is your budget ledger)
+  assert.match(c, /go/); // the action button is still there
 });
 
-test('复杂度：群卡副标题 + 小字脚注都展示档位', () => {
+test('complexity: both the channel card subtitle and the small footnote show the size', () => {
   const c = json(buildStatusCard(sess({ state: 'GATE_A_RUNNING', size: 'L', size_source: 'ai' } as never)));
-  assert.match(c, /Complexity L/); // 副标题可见
-  assert.match(c, /8pt/); // 脚注带分值（L=8，对齐主仓）
+  assert.match(c, /Complexity L/); // visible in the subtitle
+  assert.match(c, /8pt/); // the footnote carries the points (L = 8, matching the main repo)
 });
 
-test('私聊卡 needs_confirm：复杂度作为统计字段', () => {
+test('the direct-message card for needs_confirm: complexity appears as a stat field', () => {
   const c = json(buildCard('needs_confirm', sess({ size: 'XL' } as never)));
   assert.match(c, /Complexity/);
   assert.match(c, /XL/);

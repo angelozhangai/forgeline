@@ -1,5 +1,7 @@
-// 集成：从真实动作入口(forge go)验证多仓写入的生产后果。
-// 只 mock GitHub/主仓脚本边界；状态机、actions.go、writes.doWrites、session 落库走真实代码。
+// Integration: the production consequences of a multi-repo write, driven from the real action entry point
+// (forge go).
+// Only the GitHub and main-repo script boundaries are mocked; the state machine, actions.go, writes.doWrites
+// and persisting the session all run for real.
 process.env.FORGE_DB = ':memory:';
 
 import { test, mock, beforeEach } from 'node:test';
@@ -17,12 +19,12 @@ const notifications: { kind: string; state: string; issues?: unknown }[] = [];
 
 function epicStdout(): string {
   const lines = [
-    '═══ 建【多仓需求 Epic】epic:refund-flow：退款方案 ═══',
-    '  ✓ Epic P#10  状态=status:1-待讨论',
-    '  ── 子 issue ──',
-    '    ✓ C#11  feat(api): 退款接口',
+    '=== creating the multi-repo requirement Epic epic:refund-flow: the refund plan ===',
+    '  ✓ Epic P#10  status=status:1-under-discussion',
+    '  -- child issues --',
+    '    ✓ C#11  feat(api): the refund endpoint',
   ];
-  if (!epicMissExampleChild) lines.push('    ✓ U#12  feat(web): 退款入口');
+  if (!epicMissExampleChild) lines.push('    ✓ U#12  feat(web): the refund entry point');
   lines.push('  → Epic: https://github.com/your-org/example-project/issues/10');
   return lines.join('\n');
 }
@@ -74,18 +76,18 @@ const tmp = mkdtempSync(resolve(tmpdir(), 'forge-go-flow-'));
 let seq = 0;
 
 const multiRepoDraft = {
-  summary: '退款方案',
+  summary: 'the refund plan',
   key_decisions: { rollout: 'backend first' },
-  tech_design_markdown: '后端先行，前端随后接入。',
+  tech_design_markdown: 'the back end goes first, and the front end wires in afterwards.',
   multi_repo: true,
-  epic_title: '[Epic] 退款能力',
+  epic_title: '[Epic] refund support',
   issue_specs: [
-    { repo: 'C', title: 'feat(api): 退款接口', type: 'feat', prio: 'P1' },
-    { repo: 'U', title: 'feat(web): 退款入口', type: 'feat', prio: 'P1' },
+    { repo: 'C', title: 'feat(api): the refund endpoint', type: 'feat', prio: 'P1' },
+    { repo: 'U', title: 'feat(web): the refund entry point', type: 'feat', prio: 'P1' },
   ],
   acceptance: {
     contracts: [{ repo: '', surface: 'POST /api/v1/refunds {order_id, idem_key} -> 200 {refund_id}' }],
-    scenarios: [{ id: 'AC1', repo: '', gherkin: 'Given 已支付订单\nWhen 以幂等键发起退款\nThen 返回退款编号且订单进入退款中' }],
+    scenarios: [{ id: 'AC1', repo: '', gherkin: 'Given a paid order\nWhen a refund is requested with an idempotency key\nThen a refund number comes back and the order enters the refunding state' }],
   },
   confidence: 0.88,
 };
@@ -97,11 +99,11 @@ function draftPath(env = multiRepoDraft): string {
 }
 
 async function sessionAwaitingGo(slug: string): Promise<string> {
-  await sessions.create({ id: slug, slug, title: '退款方案', branch: 'dev' });
+  await sessions.create({ id: slug, slug, title: 'the refund plan', branch: 'dev' });
   for (const st of ['GATE_A_RUNNING', 'AWAITING_PM_CONFIRM', 'CONFIRMED', 'GATE_B_REQUESTED', 'GATE_B_RUNNING', 'ADVERSARIAL_LOOP', 'AWAITING_GO']) {
     await sessions.transition(slug, st as never);
   }
-  await sessions.patch(slug, { gate_b_draft_path: draftPath(), size: 'M', assignee: 'M' }); // 立项需 DRI（指派层闸）
+  await sessions.patch(slug, { gate_b_draft_path: draftPath(), size: 'M', assignee: 'M' }); // filing the work needs a DRI (the assignment gate)
   return slug;
 }
 
@@ -118,7 +120,7 @@ beforeEach(() => {
   notifications.length = 0;
 });
 
-test('go 生产流：多仓部分创建失败停在 WRITE_FAILED，人工补 child 后 retry 才 DONE 且不重复建 Epic', async () => {
+test('the go production flow: a partly failed multi-repo creation parks at WRITE_FAILED, and only once a child is added by hand does a retry reach DONE -- without creating the Epic a second time', async () => {
   const slug = await sessionAwaitingGo('refund-flow');
   epicMissExampleChild = true;
 
@@ -143,7 +145,7 @@ test('go 生产流：多仓部分创建失败停在 WRITE_FAILED，人工补 chi
   };
   const repaired = await actions.go(slug, 'M');
   assert.equal(repaired.ok, true);
-  assert.match(repaired.msg, /DONE|已建/);
+  assert.match(repaired.msg, /DONE|created/);
   assert.equal((await sessions.get(slug))!.state, 'DONE');
   assert.deepEqual(await issueRepos(slug), ['demo', 'example-project', 'example-web']);
   assert.equal(epicCreates, 1, 'manual add-child repair must be discovered, not recreated');

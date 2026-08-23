@@ -1,30 +1,37 @@
-// 集成（不花钱）：下游**编排 wiring 组合回归**——DONE →(implement)→ 闸C 绿 →(review-pr)→ 开 PR → 闸D LGTM →
-// 补强 → AWAITING_HUMAN_MERGE →(merged)→ SHIPPED。真实跑 actions + worker.step + 状态机 + sessions + notify，
-// **各 gate 的 driver（建树/实现⇄CI/开PR/审diff/补强）整体 mock** → 验的是「这些环节如何被串起来」：状态闸、
-// afterGateC/afterGateD/runGateDHardenStep 转移、green_sha pin、worktree 清理 wiring、通知、事件留痕、红线流转。
-// ⚠️ 它**不验**真实 CI/真实 PR 委托/真实 diff 审/「CI 绿才推」/报告生成——那些是各 driver 自身的不变量，由
-// gateDLoop.test / gateDHarden.test / gateC-setup.test 单点覆盖，真链路由手动冒烟（花钱）兜。这里是 wiring smoke，不是它们的替代。
+// Integration, at no cost: a **regression over how the downstream orchestration is wired together** --
+// DONE -> (implement) -> gate C green -> (review-pr) -> open the PR -> gate D LGTM -> hardening ->
+// AWAITING_HUMAN_MERGE -> (merged) -> SHIPPED. actions, worker.step, the state machine, sessions and notify
+// all run for real, while **every gate's driver is mocked wholesale** (setting up the tree, the
+// implement/CI loop, opening the PR, reviewing the diff, hardening). What is under test is how those pieces
+// are strung together: the state gates, the afterGateC / afterGateD / runGateDHardenStep transitions, the
+// green_sha pin, the worktree-cleanup wiring, the notifications, the event trail, and the red lines.
+// It deliberately does **not** cover real CI, delegating a real PR, a real diff review, "only push when CI is
+// green", or report generation -- those are each driver's own invariants, covered pointwise by
+// gateDLoop.test / gateDHarden.test / gateC-setup.test, with the real chain backed by a manual smoke test
+// that costs money. This is a wiring smoke test, not a replacement for those.
 process.env.FORGE_DB = ':memory:';
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
-const { loadConfig } = await import('../src/config.ts'); // 动态导入（绝不静态！静态会 hoist 到 FORGE_DB=:memory: 之前 → root.ts 落真库 → 并发串库）。桩回退真配置。
+const { loadConfig } = await import('../src/config.ts'); // imported dynamically -- never statically! A static import hoists above FORGE_DB=':memory:', so root.ts lands on the real database and concurrent tests collide. The stub falls back to the real config.
 
 const notifyCalls: string[] = [];
 const sessionsRef: { mod?: typeof import('../src/store/sessions.ts') } = {};
 mock.module('../src/notify.ts', { namedExports: { notify: async (k: string) => { notifyCalls.push(k); }, syncGroupCard: async () => {} } });
 
-// 上游 gate（本流程不走，但 worker.ts 模块级 import 它们）→ no-op mock。
+// The upstream gates are not exercised by this flow, but worker.ts imports them at module level -> no-op mocks.
 mock.module('../src/gates/gateA.ts', { namedExports: { runGateA: async () => ({ round: 1, openQuestions: 0, resolved: true, stalled: false }), runGateARevision: async () => ({ round: 1, openQuestions: 0, resolved: true, stalled: false }) } });
 mock.module('../src/gates/gateB.ts', { namedExports: { runGateB: async () => ({}), finalizeGateBDoc: () => {} } });
 mock.module('../src/gates/gateBLoop.ts', { namedExports: { runGateBLoop: async () => ({ round: 1, verdict: 'clean', resolved: true, needsHuman: null, stalled: false, paused: false, unresolvedFindings: [] }) } });
 mock.module('../src/gates/gateALoop.ts', { namedExports: { runGateALoop: async () => ({ round: 1, verdict: 'LGTM', resolved: true, needsHuman: null, stalled: false, paused: false, unresolvedFindings: [] }), readGateAEnvelope: () => ({ summary: 's', open_questions: [], risks: [] }) } });
 mock.module('../src/util/load.ts', { namedExports: { probeLoad: async () => [] } });
 
-// ── 下游 driver mock（设真实闸会落的副作用：worktree/PR/绿态/报告）──
+// -- Mocks for the downstream drivers, reproducing the side effects the real gates leave behind: the
+// worktree, the PR, the green sha, and the report --
 mock.module('../src/gates/gateC.ts', {
   namedExports: {
     runGateCSetup: async (s: { id: string }) => { sessionsRef.mod!.patch(s.id, { worktree_path: '/wt/x', impl_branch: 'forge/x', base_shas: JSON.stringify({ '.': 'BASESHA' }) }); },
-    // 本流走旧单仓路径（setup 不落 legs → afterGateC 直接 AWAITING_GATE_D）；leg 切换由 worker/gateC 集成单测覆盖。
+    // This flow takes the older single-repo path (setup records no legs, so afterGateC goes straight to
+    // AWAITING_GATE_D); switching between legs is covered by the worker/gateC integration tests.
     activateLeg: () => {},
     activeLeg: () => null,
   },
@@ -34,7 +41,8 @@ mock.module('../src/gates/gateCLoop.ts', { namedExports: { runGateCLoop: async (
 mock.module('../src/gates/gateD.ts', { namedExports: { openReviewPr: async (s: { id: string }) => { sessionsRef.mod!.patch(s.id, { pr_url: 'https://x/pull/7', pr_number: 7 }); } } });
 mock.module('../src/gates/gateDLoop.ts', { namedExports: { runGateDLoop: async () => RESOLVED, MAX_CI_FIX_ATTEMPTS: 2 } });
 mock.module('../src/gates/gateDHarden.ts', { namedExports: { runGateDHarden: async (s: { id: string }) => { sessionsRef.mod!.patch(s.id, { gate_d_harden_round: 1, merge_readiness_path: '/wt/delivery/x/merge-readiness.md' }); } } });
-// worktree 清理用计数 + 入参捕获 mock（断言 ackMerged 真把对的 path/branch/repoDir 传给清理，而非只看事件）。
+// Worktree cleanup is mocked with a counter and captured arguments, so the test can assert that ackMerged
+// really passes the right path, branch and repoDir to the cleanup -- not merely that an event was recorded.
 let rmArg: { repoDir?: string; path?: string; removeScript?: string } | null = null;
 let delArg: { repoDir: string; branch: string } | null = null;
 mock.module('../src/util/worktree.ts', {
@@ -42,14 +50,16 @@ mock.module('../src/util/worktree.ts', {
     worktreeHeadSha: () => 'GREENSHA',
     removeWorktree: async (o: { repoDir: string; path: string; removeScript?: string }) => { rmArg = o; return { ok: true, output: '' }; },
     deleteBranch: (repoDir: string, branch: string) => { delArg = { repoDir, branch }; },
-    listWorktrees: () => [], // 孤儿清扫：列空 → sweep no-op（本测试不验清扫）
+    listWorktrees: () => [], // the orphan sweep lists nothing, so it is a no-op (this test does not cover sweeping)
     planWorktreeSweep: () => [],
   },
 });
 const projStub = { id: 'p', root: '/proj', repos: ['.'], repoPath: () => '/proj/repo', deliveryDir: '/tmp', scripts: {} };
 mock.module('../src/projects.ts', { namedExports: { projectForSession: () => projStub, project: () => projStub, defaultProjectId: () => 'p', configForProject: () => loadConfig(), configForSession: () => loadConfig() } });
-// ackMerged 合并前经 workspace.prMergeState→gh pr view 核验。mock 整个 proc（仅 3 个导出，比偏 mock workspace
-// 稳——偏 mock workspace 会让 issueStates 等静态导入在加载期报缺）。可切 prMerged 测「未合并→拒绝 / --force 越过」。
+// Before it does anything, ackMerged verifies the merge through workspace.prMergeState -> gh pr view. All of
+// proc is mocked (only three exports, which is sturdier than partially mocking workspace -- a partial mock
+// there makes static imports like issueStates fail at load time). Flipping prMerged covers "not merged ->
+// refuse" and "--force overrides".
 let prMerged = true;
 mock.module('../src/util/proc.ts', {
   namedExports: {
@@ -76,49 +86,53 @@ async function mkDone(id: string): Promise<void> {
   }
 }
 
-test('下游生产流：DONE→闸C绿→开PR→闸D LGTM→补强→AWAITING_HUMAN_MERGE→merged→SHIPPED（永不自动合并）', async () => {
+test('the downstream production flow: DONE -> gate C green -> open the PR -> gate D LGTM -> hardening -> AWAITING_HUMAN_MERGE -> merged -> SHIPPED (never merging automatically)', async () => {
   notifyCalls.length = 0;
   const id = 'dpf';
   await mkDone(id);
 
-  // 1) implement（链式）→ GATE_C_REQUESTED
+  // 1) implement, chained -> GATE_C_REQUESTED
   assert.ok((await actions.requestGateC(id, 'M')).ok);
   assert.equal((await sessions.get(id))!.state, 'GATE_C_REQUESTED');
 
-  // 2) tick：建 worktree + 实现⇄CI 绿 → AWAITING_GATE_D（待开 PR）
+  // 2) a tick: build the worktree, run the implement/CI loop to green -> AWAITING_GATE_D, waiting to open the PR
   await worker.step((await sessions.get(id))!);
   let s = (await sessions.get(id))!;
   assert.equal(s.state, 'AWAITING_GATE_D');
-  assert.equal(s.worktree_path, '/wt/x'); // 闸C 建了隔离树
+  assert.equal(s.worktree_path, '/wt/x'); // gate C built the isolated tree
   assert.ok(notifyCalls.includes('needs_review_pr'));
 
-  // 3) review-pr → GATE_D_REQUESTED
+  // 3) review-pr -> GATE_D_REQUESTED
   assert.ok((await actions.requestReviewPr(id, 'M')).ok);
   assert.equal((await sessions.get(id))!.state, 'GATE_D_REQUESTED');
 
-  // 4) tick：开 PR → 闸D codex 审 diff⇄claude 修 LGTM → 进补强（pin 绿态 sha）
+  // 4) a tick: open the PR -> gate D's codex-reviews-the-diff / claude-revises loop reaches LGTM -> on to
+  //    hardening, pinning the green sha
   await worker.step((await sessions.get(id))!);
   s = (await sessions.get(id))!;
   assert.equal(s.state, 'GATE_D_HARDENING');
-  assert.equal(s.pr_url, 'https://x/pull/7'); // 开了 PR
-  assert.equal(s.gate_d_green_sha, 'GREENSHA'); // pin 了被 codex LGTM 的绿态（补强基线）
+  assert.equal(s.pr_url, 'https://x/pull/7'); // the PR was opened
+  assert.equal(s.gate_d_green_sha, 'GREENSHA'); // the green state codex signed off on is pinned, as the hardening baseline
 
-  // 5) tick：补强（补内环测试 + CI 绿 + 出 merge-readiness）→ 合并就绪（**停在人工合并**）
+  // 5) a tick: hardening (add the inner-loop tests, get CI green, produce merge-readiness) -> ready to merge,
+  //    and **stopping there for a human**
   await worker.step((await sessions.get(id))!);
   s = (await sessions.get(id))!;
-  assert.equal(s.state, 'AWAITING_HUMAN_MERGE'); // 红线：永不自动 merge
+  assert.equal(s.state, 'AWAITING_HUMAN_MERGE'); // the red line: never merge automatically
   assert.equal(s.merge_readiness_path, '/wt/delivery/x/merge-readiness.md');
   assert.ok(notifyCalls.includes('needs_merge'));
 
-  // 6a) 核验红线：PR 实际未合并 → 拒绝，绝不清理、绝不 SHIPPED（取不到/未合并绝不当已合并）。
+  // 6a) The verification red line: the PR is not actually merged -> refuse, clean up nothing, and never
+  //     reach SHIPPED. Unreadable or unmerged is never treated as merged.
   prMerged = false;
   const refuse = await actions.ackMerged(id, 'M');
-  assert.equal(refuse.ok, false, 'PR 未合并 → ackMerged 拒绝');
-  assert.equal((await sessions.get(id))!.state, 'AWAITING_HUMAN_MERGE', '拒绝后状态不动');
-  assert.equal(rmArg, null, '拒绝后绝不清理 worktree（不可逆动作未发生）');
+  assert.equal(refuse.ok, false, 'the PR is not merged -> ackMerged refuses');
+  assert.equal((await sessions.get(id))!.state, 'AWAITING_HUMAN_MERGE', 'the state does not move after a refusal');
+  assert.equal(rmArg, null, 'a refusal never cleans up the worktree -- the irreversible action did not happen');
   assert.ok((await sessions.events(id)).map((e) => e.kind).includes('merge_ack_refused'));
 
-  // 6b) merged（人工确认已合并，gh 核验通过）→ SHIPPED（清隔离 worktree）。红线：SHIPPED 仅经 ackMerged 可达（永不自动）。
+  // 6b) merged: a human confirms it landed and gh agrees -> SHIPPED, and the isolated worktree is cleaned up.
+  //     The red line: SHIPPED is reachable only through ackMerged, never automatically.
   prMerged = true;
   const r = await actions.ackMerged(id, 'M');
   assert.ok(r.ok);
@@ -126,36 +140,37 @@ test('下游生产流：DONE→闸C绿→开PR→闸D LGTM→补强→AWAITING_H
   assert.equal(s.state, 'SHIPPED');
   assert.equal(s.merged_by, 'M');
   assert.ok(s.merged_at);
-  // 清理 wiring：ackMerged 把对的 path/branch/repoDir 传给委托清理（不止看 worktree_cleaned 事件）。
+  // The cleanup wiring: ackMerged passes the right path, branch and repoDir to the delegated cleanup -- this
+  // checks more than the worktree_cleaned event.
   assert.deepEqual(rmArg, { repoDir: '/proj/repo', path: '/wt/x', removeScript: undefined });
   assert.deepEqual(delArg, { repoDir: '/proj/repo', branch: 'forge/x' });
 
-  // 全程事件留痕齐全 + 终态正确
+  // The event trail is complete end to end, and the final state is right.
   const kinds = (await sessions.events(id)).map((e) => e.kind);
   for (const k of ['gate_c_done', 'gate_d_done', 'gate_d_hardened', 'merged', 'worktree_cleaned']) {
-    assert.ok(kinds.includes(k), `缺事件 ${k}`);
+    assert.ok(kinds.includes(k), `the ${k} event is missing`);
   }
 });
 
-test('下游红线：权限闸——非 merge_ack_allowed 不能确认合并；非 AWAITING_HUMAN_MERGE 不能 merged', async () => {
+test('a downstream red line -- the permission gate: someone not in merge_ack_allowed cannot confirm the merge, and merged is refused from any state but AWAITING_HUMAN_MERGE', async () => {
   const id = 'dpf2';
   await mkDone(id);
-  // 还没到合并就绪 → merged 拒绝
+  // Not yet ready to merge -> merged is refused.
   assert.equal((await actions.ackMerged(id, 'M')).ok, false);
-  // 推到 AWAITING_HUMAN_MERGE
+  // Drive it to AWAITING_HUMAN_MERGE.
   await actions.requestGateC(id, 'M');
   await worker.step((await sessions.get(id))!);
   await actions.requestReviewPr(id, 'M');
   await worker.step((await sessions.get(id))!);
   await worker.step((await sessions.get(id))!);
   assert.equal((await sessions.get(id))!.state, 'AWAITING_HUMAN_MERGE');
-  // 无权限者确认 → 拒绝、状态不变
+  // Someone without the permission confirms -> refused, and the state does not move.
   assert.equal((await actions.ackMerged(id, 'ZZ')).ok, false);
   assert.equal((await sessions.get(id))!.state, 'AWAITING_HUMAN_MERGE');
   assert.ok((await sessions.events(id)).some((e) => e.kind === 'permission_denied'));
 });
 
-test('ackMerged --force：gh 核验未合并也可人工越过 → SHIPPED + 留 forced 审计', async () => {
+test('ackMerged --force: a human can override even when gh says it is not merged -> SHIPPED, with a forced audit record', async () => {
   const id = 'dpf3';
   await mkDone(id);
   await actions.requestGateC(id, 'M');
@@ -164,19 +179,19 @@ test('ackMerged --force：gh 核验未合并也可人工越过 → SHIPPED + 留
   await worker.step((await sessions.get(id))!);
   await worker.step((await sessions.get(id))!);
   assert.equal((await sessions.get(id))!.state, 'AWAITING_HUMAN_MERGE');
-  prMerged = false; // gh 说未合并
-  assert.equal((await actions.ackMerged(id, 'M')).ok, false, '不 force → 拒绝');
+  prMerged = false; // gh says it is not merged
+  assert.equal((await actions.ackMerged(id, 'M')).ok, false, 'without force -> refused');
   const r = await actions.ackMerged(id, 'M', { force: true });
-  assert.ok(r.ok, '--force 越过核验');
+  assert.ok(r.ok, '--force overrides the verification');
   assert.equal((await sessions.get(id))!.state, 'SHIPPED');
   assert.ok((await sessions.events(id)).some((e) => e.kind === 'merge_ack_forced'));
-  prMerged = true; // 还原共享态
+  prMerged = true; // restore the shared state
 });
 
-test('mergeAckDecision：已核验合并→放行；未合并/查不到→拒绝；--force 一律越过并标 forced', () => {
+test('mergeAckDecision: verified as merged -> proceed; not merged or unreadable -> refuse; --force always overrides and is marked forced', () => {
   assert.equal(actions.mergeAckDecision({ ok: true, merged: true, state: 'MERGED' }, false).proceed, true);
   assert.equal(actions.mergeAckDecision({ ok: true, merged: false, state: 'OPEN' }, false).proceed, false);
-  assert.equal(actions.mergeAckDecision({ ok: false, merged: false, state: 'UNKNOWN', error: 'gh 失败' }, false).proceed, false);
+  assert.equal(actions.mergeAckDecision({ ok: false, merged: false, state: 'UNKNOWN', error: 'gh failed' }, false).proceed, false);
   const forced = actions.mergeAckDecision({ ok: true, merged: false, state: 'OPEN' }, true);
   assert.equal(forced.proceed, true);
   assert.equal(forced.forced, true);
