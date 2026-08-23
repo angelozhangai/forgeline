@@ -1,88 +1,115 @@
-// 传输层薄缝——**MessagingPort**：核心与具体 IM provider（飞书/未来 Slack）之间的唯一接口。
-// 出站：核心交一份 provider 无关的 CardModel（或简单 title+lines），adapter 负责渲染成自家卡片 + 发送。
-// 入站：adapter 把自家原始事件解析成 provider 无关的 InboundEvent，交回核心做业务分发。
+// Thin transport seam — **MessagingPort**: the one interface between the core and a concrete IM
+// provider (Feishu / Slack).
+// Outbound: the core hands over a provider-neutral CardModel (or a simple title + lines) and the
+// adapter renders it into its own card format and sends it.
+// Inbound: the adapter parses its own raw events into a provider-neutral InboundEvent and hands that
+// back to the core for dispatch.
 //
-// 当前唯一实现是飞书（messaging/feishu.ts）。要接 Slack 只需再写一个实现本接口的 adapter，
-// 核心（notify/listen/worker/actions）一行不用动——这正是本薄缝的目的。
+// Adding another IM means writing one more adapter implementing this interface; the core
+// (notify/listen/worker/actions) does not change by a line — which is the entire point of the seam.
 import type { CardModel, CardColor, InboundCardAction, InboundMessage } from './model.ts';
 
-// 入站长连接回调（core 提供，adapter 收到自家原始事件时回调）。raw 是 provider 无关的不透明 Record——
-// core 再交 parseCardAction/parseMessage 规整成 InboundCardAction/InboundMessage（沿用既有 parse-in-core 分发，
-// adapter 只负责「建连 + 把原始事件搬过来」，不把 provider SDK/channel 生命周期泄进 core）。
+// Callbacks for the inbound long-lived connection (supplied by the core, invoked by the adapter when
+// it receives one of its own raw events). `raw` is a provider-neutral opaque Record — the core then
+// hands it to parseCardAction/parseMessage to be normalised into InboundCardAction/InboundMessage
+// (keeping the existing parse-in-core dispatch: the adapter only establishes the connection and
+// carries raw events across, and never leaks the provider SDK or the channel lifecycle into the core).
 export interface InboundHandlers {
   onCardAction(raw: Record<string, unknown>): void;
   onMessage(raw: Record<string, unknown>): void;
-  onError(reason: string): void; // 长连接错误（标记离线）
-  onReconnected(): void; // 断线重连成功（标记在线 + 补拉断连期间消息）
+  onError(reason: string): void; // connection error (marks offline)
+  onReconnected(): void; // reconnected (marks online + backfills messages from the outage)
 }
 
-// 入站长连接句柄。connect() 建连（首连失败 reject，交 core 决定降级为仅周期 tick）。
-// close() 可选：把这条长连接**关干净**（provider 内部可能同时活着不止一条——计划内换连接会短暂重叠）。
-// 守护进程今天是被信号杀掉的，不走这条路；但 adapter 内部的关闭逻辑必须**有人能够到**，
-// 否则它就是一段永远不会被执行、也永远不会被验证的代码。本地验收回路正是靠它把连接收干净。
+// Handle on the inbound connection. connect() establishes it (a failed first connect rejects, leaving
+// the core to decide whether to degrade to periodic ticks only).
+// close() is optional: it shuts this connection down **cleanly** (a provider may have more than one
+// alive at once — a planned reconnect overlaps them briefly).
+// The daemon is killed by a signal today and does not take this path, but the adapter's shutdown logic
+// must be **reachable by someone**, or it is code that will never run and never be verified. The local
+// acceptance loop is what closes the connections through it.
 export interface InboundChannel {
   connect(): Promise<void>;
   close?(): void;
 }
 
-// 入站传输的契约探针结果（provider 无关）：对自家 IM API 跑一发最便宜的只读往返，断言我们依赖的
-// 信封字段还在。available=凭据齐能探；ok=信封完好。adapter 内部实现（飞书的 im/v1/messages、
-// Slack 的 conversations.history 等细节不泄进 llm/health 层）；llm/probes 的 probeIm 只做薄壳映射。
+// Result of the inbound transport's contract probe (provider-neutral): run the cheapest possible
+// read-only round trip against the provider's own IM API and assert the envelope fields we depend on
+// are still there. available = credentials present and a probe is possible; ok = the envelope is
+// intact. Implemented inside the adapter (Feishu's im/v1/messages, Slack's conversations.history and
+// similar details do not leak into the llm/health layers); probeIm in llm/probes is a thin mapping.
 export interface InboundProbe {
   available: boolean;
   ok: boolean;
   detail: string;
   raw?: string;
-  // !ok 归因（同 ProbeResult.kind，由 probeIm 透传到 health/contract 告警分流）：
-  // auth=凭据/权限/网络（重新登录·查权限·加群，非改 contract.ts）；drift=信封字段缺失（改 contract.ts）。
+  // Attribution when !ok (same as ProbeResult.kind, passed through by probeIm to the health/contract
+  // alert routing): auth = credentials/permissions/network (log in again, check scopes, join the
+  // channel — not a contract.ts edit); drift = an envelope field is missing (a contract.ts edit).
   kind?: 'auth' | 'drift';
-  // kind='auth' 时的**处置指引**（"去哪儿改什么"）。由 adapter 提供而非核心硬编码：
-  // 「飞书 token 怎么续」和「Slack 要哪个 scope」是 provider 知识，核心写死一份就等于替所有 provider 说话，
-  // 而且加一个 provider 就得回来改核心。缺省时 health/contract 会退到一句通用文案。
+  // **Remediation guidance** for kind='auth' ("go here, change this"). Supplied by the adapter rather
+  // than hardcoded in the core: "how do I renew a Feishu token" and "which scope does Slack need" are
+  // provider knowledge, and one hardcoded copy in the core means speaking for every provider — plus
+  // an edit to the core every time a provider is added. When absent, health/contract falls back to a
+  // generic sentence.
   authFix?: string;
 }
 
 export interface MessagingPort {
-  // provider 标识（'feishu' / 'slack' / …）。核心只拿它做**展示与日志**（健康检查项名、启动日志），
-  // 绝不据此分支业务逻辑——一旦出现 `if (port.id === 'feishu')`，这条缝就白开了。
+  // Provider identifier ('feishu' / 'slack' / …). The core uses it for **display and logging only**
+  // (health check row names, startup logs) and must never branch business logic on it — the moment
+  // `if (port.id === 'feishu')` appears, this seam has been opened for nothing.
   readonly id: string;
 
-  // ── 出站：决策/通知卡 ──
-  // M 私聊卡（裁决/出方案/立项/失败重试…）。返回是否送达（失败由调用方决定降级）。
+  // -- Outbound: decision / notification cards --
+  // Direct-message card to the maintainer (arbitration, request a design, file a requirement, retry a
+  // failure…). Returns whether it was delivered (the caller decides how to degrade on failure).
   sendDmCard(card: CardModel): Promise<boolean>;
-  // 简单文本卡（title + markdown 行 + 色）——漂移/健康告警、处理中回执等无表单场景。
+  // Simple text card (title + markdown lines + colour) — drift/health alerts, in-progress receipts and
+  // other cases with no form.
   sendDmText(title: string, lines: string[], color: CardColor): Promise<boolean>;
 
-  // ── 出站：群状态卡（回复 PM 那条，全程原地编辑）──
-  // 回复某条消息建群卡，返回新卡 messageId（落 status_msg_id 用）。
+  // -- Outbound: channel status card (a reply to the PM's message, edited in place throughout) --
+  // Reply to a message with a new channel card; returns the new card's messageId (persisted as
+  // status_msg_id).
   replyGroupCard(replyToMessageId: string, card: CardModel): Promise<string | null>;
-  // 直接发到群（无可回复的 intake 消息时），返回 messageId。
+  // Post straight to the channel (when there is no intake message to reply to); returns the messageId.
   sendGroupCard(chatId: string, card: CardModel): Promise<string | null>;
-  // 原地编辑已存在的群卡（同 messageId）。
+  // Edit an existing channel card in place (same messageId).
   editGroupCard(messageId: string, card: CardModel): Promise<boolean>;
 
-  // ── 出站：群 webhook 兜底（bot 私聊未送达时的群侧降级，非错误类才用）──
+  // -- Outbound: channel webhook fallback (channel-side degradation when a bot DM was not delivered;
+  //    used for non-error notifications only) --
   postWebhook(title: string, lines: string[], color: CardColor): Promise<boolean>;
 
-  // ── 入站：把自家原始事件解析成 provider 无关事件（无法识别 → null）──
+  // -- Inbound: parse the provider's own raw events into provider-neutral ones (unrecognised -> null) --
   parseCardAction(raw: Record<string, unknown>): InboundCardAction | null;
   parseMessage(raw: Record<string, unknown>): InboundMessage | null;
 
-  // ── 入站：长连接（adapter 内部建 channel + 收发，core 不碰任何 provider SDK / channel 生命周期）──
-  // 入站传输是否已配置（凭据齐全）。未配置 → core 退化为仅周期 tick（无卡片按钮/群消息入口）。
+  // -- Inbound: the long-lived connection (the adapter builds the channel and sends/receives; the core
+  //    touches no provider SDK and no channel lifecycle) --
+  // Whether inbound transport is configured (credentials present). Not configured -> the core degrades
+  // to periodic ticks only (no card buttons, no channel message intake).
   inboundConfigured(): boolean;
-  // 起入站长连接：adapter 建 channel、把自家原始事件转发给 handlers，返回可 connect 的句柄。
+  // Start the inbound connection: the adapter builds the channel, forwards its own raw events to
+  // `handlers`, and returns a connectable handle.
   startInbound(handlers: InboundHandlers): InboundChannel;
 
-  // ── 入站：历史补拉（长连接断开期间的群消息，provider 不会重连补推）──
-  // 「读哪些群/频道」是 provider 专属配置（飞书 FEISHU_WATCH_CHATS / Slack SLACK_WATCH_CHANNELS…），
-  // adapter 各自读自家 env；核心只拿这份 id 列表去种子化游标。
+  // -- Inbound: history backfill (channel messages sent while the connection was down; providers do
+  //    not re-deliver them on reconnect) --
+  // "Which channels to read" is provider-specific configuration (Feishu's FEISHU_WATCH_CHATS, Slack's
+  // SLACK_WATCH_CHANNELS…), and each adapter reads its own env; the core only takes this list of ids
+  // to seed the cursors.
   watchedChats(): string[];
-  // 拉某群自 sinceMs（毫秒水位）**之后**的历史，按时间升序返回。分页、鉴权、错误兜底全在 adapter 内部：
-  // 这是 best-effort 通道（拉不动就返回已拿到的部分 + 记日志），绝不抛——补拉失败不该拖垮周期循环。
-  // 边界语义由核心复核：adapter 可因秒级 start_time 精度多返回边界那条，核心按 createTime 再过滤一次。
+  // Fetch a channel's history **after** sinceMs (a millisecond watermark), returned in ascending time
+  // order. Pagination, authentication and error handling all live inside the adapter: this is a
+  // best-effort channel (on failure, return what was retrieved and log) and must never throw — a
+  // failed backfill should not take the periodic loop down with it.
+  // Boundary semantics are re-checked by the core: the adapter may return the boundary entry itself
+  // because start_time has only second precision, and the core filters again by createTime.
   listHistorySince(chatId: string, sinceMs: number): Promise<InboundMessage[]>;
 
-  // 入站传输契约探针：只读往返验自家 IM API 信封（feishu im/v1/messages 分页字段等）。
+  // Inbound transport contract probe: a read-only round trip verifying the provider's IM API envelope
+  // (Feishu im/v1/messages pagination fields and the like).
   probe(): Promise<InboundProbe>;
 }
