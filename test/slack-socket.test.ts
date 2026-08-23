@@ -265,3 +265,51 @@ test('close() 之后不再重连（守护退出时不该留个循环在后台刷
   assert.equal(h.sockets.length, 1);
   assert.deepEqual(h.errors, []);
 });
+
+// 换连接的重叠窗口里同时活着两条连接 —— close() 只关「当前那条」的话，另一条就成了没人管的：
+// 它不会再重连（superseded），也永远没人关它，于是进程带着一个活着的句柄退不出去。
+// 这正是本仓最忌讳的形态：没有报错，只是 daemon 停不下来。
+test('close() 落在换连接的重叠窗口里：两条连接都要关掉，一条都不能漏', async () => {
+  const h = harness();
+  const p = h.channel.connect();
+  await tick();
+  const old = h.sockets[0];
+  old.fire('open');
+  await p;
+  old.frame({ type: 'disconnect' });
+  await tick();
+  assert.equal(h.sockets.length, 2, '前置条件：新连接已在建、旧连接还活着');
+  assert.equal(old.closed, false);
+  h.channel.close();
+  assert.equal(old.closed, true, '旧连接不能被漏下（它已经 superseded，没人会再管它）');
+  assert.equal(h.sockets[1].closed, true);
+});
+
+test('close() 撞上首连的 openUrl：connect() 必须落地，且不再建连接（否则启动路径被挂住）', async () => {
+  let release: () => void = () => {};
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const h = harness({
+    openUrl: async () => {
+      await gate;
+      return { ok: true, url: 'wss://fake' };
+    },
+  });
+  const p = h.channel.connect();
+  h.channel.close(); // 还卡在 openUrl 里就被关了
+  release();
+  await p; // 挂住的话这条用例会超时——那正是生产里 daemon 起不来的样子
+  assert.equal(h.sockets.length, 0, '关了就别再建一条没人管的连接');
+});
+
+test('close() 之后迟到的 open：连接被关掉，connect() 也照样落地', async () => {
+  const h = harness();
+  const p = h.channel.connect();
+  await tick();
+  h.channel.close(); // socket 已建好，但还没 open
+  h.sockets[0].fire('open'); // 迟到的 open
+  await p;
+  assert.equal(h.sockets[0].closed, true);
+  assert.deepEqual(h.errors, [], '自己关的，不算故障');
+});

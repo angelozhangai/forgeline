@@ -1,7 +1,7 @@
 // Slack provider 层——**Socket Mode 长连接**。零新依赖：apps.connections.open 换 wss URL，
 // 再用 Node 原生 WebSocket（≥22 内置，本仓要求 ≥24）连上去。跟飞书那边用 lark SDK 是对等的一层。
 //
-// 手搓要正确处理的就四件事，全在下面：
+// 手搓要正确处理的就五件事，全在下面：
 //   ① 每条带 envelope_id 的信封**必须立刻 ack**，否则 Slack 3 秒后重投，业务动作会被执行两次；
 //   ② Slack 会定期主动发 type:'disconnect'（refresh_requested）并随后断开——这是常态，不是故障。
 //      两条推论：**不报错**（报了核心就 markWs(false)+log.err，每半小时一次假警报），
@@ -9,7 +9,10 @@
 //      群消息还能靠重连后的补拉捞回来，interactive 载荷捞不回来；
 //   ③ 硬断时原生 WebSocket 会**先 error 再 close**（本地 spike 实测：open→…→error→close:1006），
 //      两个事件都触发重连的话会开出两条连接，于是每条信封收两遍。故一次连接只允许结算一次。
-//   ④ 首连失败要如实 reject（交核心决定降级为仅周期 tick），重连失败则退避重试、绝不放弃。
+//   ④ 首连失败要如实 reject（交核心决定降级为仅周期 tick），重连失败则退避重试、绝不放弃；
+//   ⑤ close() 要关掉**所有**还活着的连接、且任何一条路径都不能留下不结算的 promise。
+//      ②带来的重叠窗口里有两条连接，漏掉一条 daemon 就退不出去；漏掉一次 resolve，启动就挂在 await 上。
+//      两种都不报错，只是「停不下来」或「起不来」。
 //
 // 依赖全部可注入（openUrl / connect / sleep），所以上面这套状态机能在**没有网络、没有 Slack 工作区**
 // 的情况下被单测钉死。这正是它值得手写的前提：不可测的手写长连接才是负债。
@@ -70,12 +73,16 @@ interface Conn {
 
 export function createSocketChannel(handlers: SocketHandlers, overrides: Partial<SocketDeps> = {}): SocketChannel {
   const deps: SocketDeps = { ...defaultDeps, ...overrides };
-  let ws: WsLike | null = null;
+  // 同时活着的连接**不止一条**：计划内换连接会短暂两条并存（先建新的、连上再关旧的）。
+  // 所以不能只记「当前那条」——close() 正好落在重叠窗口里的话，另一条就成了没人管的连接：
+  // 它不会再重连（superseded），也永远不会被关掉，于是进程带着一个活着的句柄退不出去。
+  const live = new Set<WsLike>();
   let closed = false; // 调用方显式 close() 之后不再重连
   let attempt = 0;
   let everConnected = false;
 
   function closeQuietly(sock: WsLike): void {
+    live.delete(sock);
     try {
       sock.close();
     } catch {
@@ -89,7 +96,9 @@ export function createSocketChannel(handlers: SocketHandlers, overrides: Partial
     return new Promise<void>((resolve, reject) => {
       void (async () => {
         const got = await deps.openUrl();
-        if (closed) return; // 等 openUrl 期间调用方关了通道 → 不再往下建连接
+        // 等 openUrl 期间调用方关了通道 → 不再往下建连接。但 promise **必须落地**：
+        // 首连时 connect() 是被 await 的，留一个永不结算的 promise 会把启动路径直接挂住。
+        if (closed) return void resolve();
         if (!got.ok || !got.url) {
           const reason = `apps.connections.open 失败：${got.error ?? '无 url'}`;
           if (first) return reject(new Error(reason));
@@ -97,7 +106,7 @@ export function createSocketChannel(handlers: SocketHandlers, overrides: Partial
           return void scheduleReconnect();
         }
         const sock = deps.connect(got.url);
-        ws = sock;
+        live.add(sock);
         const conn: Conn = { sock, superseded: false };
         // ③ 一次连接只结算一次：error 与 close 常常成对出现，各触发一次重连就会开出两条连接。
         let settled = false;
@@ -109,7 +118,10 @@ export function createSocketChannel(handlers: SocketHandlers, overrides: Partial
           void scheduleReconnect();
         };
         sock.addEventListener('open', () => {
-          if (closed) return void closeQuietly(sock); // 建连过程中被 close()：别留一条没人管的连接
+          if (closed) {
+            closeQuietly(sock); // 建连过程中被 close()：别留一条没人管的连接
+            return void resolve(); // 同上：调用方已经不要这条通道了，但 promise 不能吊着
+          }
           attempt = 0; // 连上了就把退避清零，下次断开重新从 1s 起
           if (everConnected) handlers.onReconnected();
           everConnected = true;
@@ -118,7 +130,10 @@ export function createSocketChannel(handlers: SocketHandlers, overrides: Partial
         });
         sock.addEventListener('message', (ev) => onFrame(conn, ev?.data));
         sock.addEventListener('error', () => settle('WebSocket error'));
-        sock.addEventListener('close', (ev) => settle(`WebSocket closed code=${ev?.code ?? '?'}`));
+        sock.addEventListener('close', (ev) => {
+          live.delete(sock); // 已经断了，不必再关它（也别让 live 随重连一路涨下去）
+          settle(`WebSocket closed code=${ev?.code ?? '?'}`);
+        });
       })();
     });
   }
@@ -170,7 +185,7 @@ export function createSocketChannel(handlers: SocketHandlers, overrides: Partial
     connect: () => open(true),
     close() {
       closed = true;
-      if (ws) closeQuietly(ws);
+      for (const s of [...live]) closeQuietly(s); // 重叠窗口里可能有两条，一条都不能漏
     },
   };
 }
