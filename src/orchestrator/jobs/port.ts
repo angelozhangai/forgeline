@@ -1,23 +1,33 @@
-// 控制面 / Runner 边界薄缝——**JobSource**：runner 从「哪里」取一批到期 job 来执行。
-// 照 MessagingPort / SessionStore 范式：接口（本文件）+ 单一选择点（jobs/index.ts `jobSource`）+ adapter（local=DB 枚举）。
-// 核心（worker.tick）只 `import { jobSource }`，永不直接 DB 枚举到期 job；换 remotePull 在选择点一处换。
+// The thin seam at the control-plane / runner boundary - **JobSource**: *where* a runner gets its next batch of
+// due jobs from.
+// It follows the MessagingPort / SessionStore pattern: the interface (this file) + a single selection point
+// (`jobSource` in jobs/index.ts) + an adapter (local = enumerating the DB).
+// The core (worker.tick) only does `import { jobSource }` and never enumerates due jobs from the DB itself;
+// switching to remotePull is a one-line change at the selection point.
 //
-// 一个 **job** = 「一条到期、需推进下一步 gate 的 session」。runner 对每个 job 跑 worker.step(s)，结果经
-// **SessionStore 接缝（store）写回**——故 JobSource(拉 job) + SessionStore(回报) 两个接缝合成完整的 control/runner
-// 数据流（控制面出 job、runner 执行、状态回中心）。
+// A **job** is "one due session that needs its next gate step run". The runner runs worker.step(s) for each
+// job, and the result is **written back through the SessionStore seam (store)** - so JobSource (pulling jobs)
+// and SessionStore (reporting back) together form the complete control/runner data flow: the control plane
+// hands out jobs, the runner executes them, and the state returns to the centre.
 //
-// 实现：`localJobSource`（本地 DB 枚举，与 daemon 同进程）/ `remotePull`（runner 经 HTTP 从控制面拉 job）。
+// Implementations: `localJobSource` (enumerating the local DB, in the same process as the daemon) and
+// `remotePull` (a runner pulling jobs from the control plane over HTTP).
 //
-// **异步契约（Phase 2 深水）**：`claimDueJobs` 返回 Promise——job-pull 是 runner 远端循环的**第一个动作**
-// （GitHub-runner 模式：runner 先向控制面要 job），故率先 async 化（仅 1 个消费方 worker.tick、本就 async，
-// 零行为变更）。本地实现 `await store.listByStates(...)` 同步底层无副作用。SessionStore（回报侧）的 async 化是
-// 更大迁移（277 调用点），随后跟进——见 docs/architecture-control-plane-split.md Phase 2。
+// **The async contract**: `claimDueJobs` returns a Promise - pulling a job is the **first action** in a remote
+// runner's loop (the GitHub-runner model: the runner asks the control plane for work first), so it was made
+// async first (it has a single consumer, worker.tick, which was already async, so behaviour was unchanged).
+// The local implementation wraps a synchronous store call with no side effects. Making SessionStore (the
+// reporting side) async was the larger migration that followed - see
+// docs/architecture-control-plane-split.md.
 import type { Session } from '../../types.ts';
 
 export interface JobSource {
-  // 认领本轮到期 job（POLLER_DRIVEN 态的 session）：**原子 lease 占租**（防多 runner 重领）。本地=直连 DB leaseClaim；
-  // 远端=控制面 HTTP `/jobs?runner=&limit=`（控制面侧 leaseClaim）。
-  // limit = 本 runner 本轮并发容量（worker 传 max_parallel）：只认领这一轮就会开跑的量，绝不一次占租整个 backlog
-  // （否则排队未开跑的 job 也倒 TTL → 被另一 runner 当过期重领 → 同 worktree 双跑；且 backlog 不分摊）。见 store leaseClaim。
+  // Claim this round's due jobs (sessions in a POLLER_DRIVEN state) with an **atomic lease**, so several
+  // runners cannot claim the same one. Locally this is a direct DB leaseClaim; remotely it is the control
+  // plane's HTTP `GET /jobs?runner=&limit=` (which calls leaseClaim on the control-plane side).
+  // limit = this runner's concurrency capacity for the round (the worker passes max_parallel): it claims only
+  // what will actually start running this round, and never leases the whole backlog at once (otherwise queued
+  // jobs would count down their TTL, be treated as expired by another runner and re-claimed -> the same
+  // worktree runs twice; and the backlog would not spread across runners). See store leaseClaim.
   claimDueJobs(limit: number): Promise<Session[]>;
 }
