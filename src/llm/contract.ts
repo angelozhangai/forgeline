@@ -1,23 +1,28 @@
-// 外部 CLI「信封契约」单一真源：claude/codex 的 --json/stream-json 输出里，
-// 哪些**框架字段/事件**是我们解析所依赖的（信封=CLI 自己控制，区别于模型吐的内容）。
-// Layer-1 运行时兜底（runCodex/runClaude）与 Layer-2/3 主动探针（probes.ts）都引这里——
-// CLI 升级若合法改了字段名，只改这一处。
+// The single source of truth for the external CLIs' **envelope contract**: which **framing fields and
+// events** in claude's and codex's --json / stream-json output our parsing depends on (the envelope is what
+// the CLI itself controls, as distinct from the content the model emits).
+// Both the Layer-1 runtime fallback (runCodex/runClaude) and the Layer-2/3 active probes (probes.ts)
+// reference this — so if a CLI upgrade legitimately renames a field, only this one place changes.
 //
-// 判别精度：
-//  · 运行时热路径（Layer 1）只在**信封整体坍塌**（一个已知事件都没见到）时停泊，
-//    避免对「模型没吐 JSON」这类合法情况误判（那个仍走下游 parse-repair）。
-//  · 主动探针（Layer 2/3）用**严格**口径：任一必需信封字段缺失即判漂移，主动告警。
+// Detection precision:
+//  · The runtime hot path (Layer 1) parks only when the **envelope has collapsed entirely** (not one known
+//    event was seen), so it does not misjudge legitimate cases such as "the model emitted no JSON" (those
+//    still go through parse-repair downstream).
+//  · The active probes (Layer 2/3) use the **strict** rule: any missing required envelope field is drift,
+//    and it alerts.
 
 export interface EnvelopeDrift {
   drifted: boolean;
-  missing: string[]; // 我们依赖、但本次没见到的信封事件/字段
-  detail: string; // 给告警/停泊原文的人话一行
+  missing: string[]; // envelope events or fields we depend on that were not seen this time
+  detail: string; // one plain-language line for the alert or the parked session's error text
 }
 
-// ── CODEX：`codex exec --json` 的 JSONL 事件 ──────────────────────────
-// parseCodexJsonl 依赖 thread.started（thread_id，resume 续接）与 turn.completed（usage，token 计量）。
+// -- CODEX: the JSONL events of `codex exec --json` -------------------------
+// parseCodexJsonl depends on thread.started (thread_id, used to resume) and turn.completed (usage, token
+// accounting).
 export const CODEX_ENVELOPE = {
-  // 探针用：trivial prompt 走 stdin，只读沙箱，最便宜地逼出完整一轮信封。
+  // Used by the probe: a trivial prompt through stdin in a read-only sandbox, the cheapest way to force a
+  // complete round of envelope events.
   probeArgs: ['exec', '--json', '--skip-git-repo-check', '-s', 'read-only', '-'] as const,
   requiredEvents: ['thread.started', 'turn.completed'] as const,
 };
@@ -34,43 +39,46 @@ function codexMissing(seen: CodexEnvelopeSeen): string[] {
   return missing;
 }
 
-// Layer 1（热路径）：仅「信封整体坍塌」= 一个已知事件都没见到 → 判漂移并停泊。
-// 见到任一已知事件 → 框架还是我们认识的版本，p.result 即便为 null 也当「模型没吐 JSON」走 parse-repair。
+// Layer 1 (the hot path): only a **fully collapsed envelope** — not one known event seen — counts as drift
+// and parks.
+// If any known event was seen, the framing is still a version we recognise, so even a null p.result is
+// treated as "the model emitted no JSON" and goes through parse-repair.
 export function codexEnvelopeCollapsed(seen: CodexEnvelopeSeen): boolean {
   return codexMissing(seen).length === CODEX_ENVELOPE.requiredEvents.length;
 }
 
-// Layer 2/3（探针，严格）：任一必需事件缺失即判漂移。
+// Layer 2/3 (the probes, strict): any missing required event is drift.
 export function assertCodexEnvelope(seen: CodexEnvelopeSeen): EnvelopeDrift {
   const missing = codexMissing(seen);
   return {
     drifted: missing.length > 0,
     missing,
     detail: missing.length
-      ? `codex 输出缺信封事件：${missing.join('、')}（疑似 codex CLI 升级改了 exec --json 事件 schema）`
-      : 'codex 信封完好',
+      ? `codex output is missing envelope events: ${missing.join(', ')} (a codex CLI upgrade may have changed the exec --json event schema)`
+      : 'codex envelope intact',
   };
 }
 
-// ── CLAUDE：`claude -p --output-format stream-json` 的事件 ─────────────
-// runClaude 依赖 type:'result' 事件（result 文本 + session_id + total_cost_usd + is_error）。
+// -- CLAUDE: the events of `claude -p --output-format stream-json` ----------
+// runClaude depends on the type:'result' event (the result text + session_id + total_cost_usd + is_error).
 export const CLAUDE_ENVELOPE = {
   probeArgs: ['-p', '--output-format', 'stream-json', '--verbose', '--strict-mcp-config'] as const,
   requiredEvents: ['result'] as const,
 };
 
 export interface ClaudeEnvelopeSeen {
-  resultEvent: boolean; // 是否见到 type:'result' 事件（或反扫到 result 形状的对象）
+  resultEvent: boolean; // whether a type:'result' event was seen (or a result-shaped object was found by scanning back)
 }
 
-// Layer 1 与探针同口径：没有任何 result 信封 → 漂移（claude 的 result 事件在每轮必出）。
+// Layer 1 uses the same rule as the probe: no result envelope at all -> drift (claude emits a result event
+// on every turn).
 export function assertClaudeEnvelope(seen: ClaudeEnvelopeSeen): EnvelopeDrift {
-  const missing = seen.resultEvent ? [] : ['result 事件'];
+  const missing = seen.resultEvent ? [] : ['the result event'];
   return {
     drifted: missing.length > 0,
     missing,
     detail: missing.length
-      ? `claude 输出缺信封：${missing.join('、')}（疑似 claude CLI 升级改了 stream-json schema）`
-      : 'claude 信封完好',
+      ? `claude output is missing part of the envelope: ${missing.join(', ')} (a claude CLI upgrade may have changed the stream-json schema)`
+      : 'claude envelope intact',
   };
 }

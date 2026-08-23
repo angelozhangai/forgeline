@@ -1,15 +1,15 @@
-// contract.ts 信封断言纯函数单测：完好→不漂移；改名/缺失→漂移。
+// Unit tests for contract.ts's pure envelope assertions: intact -> no drift; renamed or missing -> drift.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { assertCodexEnvelope, codexEnvelopeCollapsed, assertClaudeEnvelope } from '../src/llm/contract.ts';
 
-test('assertCodexEnvelope：两信封事件都在 → 不漂移', () => {
+test('assertCodexEnvelope: both envelope events present -> no drift', () => {
   const d = assertCodexEnvelope({ threadStarted: true, turnCompleted: true });
   assert.equal(d.drifted, false);
   assert.deepEqual(d.missing, []);
 });
 
-test('assertCodexEnvelope：缺任一信封事件 → 漂移且列出缺失', () => {
+test('assertCodexEnvelope: either envelope event missing -> drift, listing what is missing', () => {
   assert.deepEqual(assertCodexEnvelope({ threadStarted: false, turnCompleted: true }).missing, ['thread.started']);
   assert.deepEqual(assertCodexEnvelope({ threadStarted: true, turnCompleted: false }).missing, ['turn.completed']);
   const both = assertCodexEnvelope({ threadStarted: false, turnCompleted: false });
@@ -17,15 +17,15 @@ test('assertCodexEnvelope：缺任一信封事件 → 漂移且列出缺失', ()
   assert.deepEqual(both.missing, ['thread.started', 'turn.completed']);
 });
 
-test('codexEnvelopeCollapsed：仅全部信封事件缺失才算坍塌（热路径阈值）', () => {
+test('codexEnvelopeCollapsed: only losing every envelope event counts as collapsed (the hot path threshold)', () => {
   assert.equal(codexEnvelopeCollapsed({ threadStarted: false, turnCompleted: false }), true);
   assert.equal(codexEnvelopeCollapsed({ threadStarted: true, turnCompleted: false }), false);
   assert.equal(codexEnvelopeCollapsed({ threadStarted: false, turnCompleted: true }), false);
 });
 
-test('assertClaudeEnvelope：有 result 信封→不漂移；无→漂移', () => {
+test('assertClaudeEnvelope: a result envelope present -> no drift; absent -> drift', () => {
   assert.equal(assertClaudeEnvelope({ resultEvent: true }).drifted, false);
   const d = assertClaudeEnvelope({ resultEvent: false });
   assert.equal(d.drifted, true);
-  assert.deepEqual(d.missing, ['result 事件']);
+  assert.deepEqual(d.missing, ['the result event']);
 });

@@ -12,9 +12,9 @@ export interface CodexTokens {
 
 export interface CodexResult {
   ok: boolean;
-  result: string; // 助手最终文本（含我们要的 fenced JSON 块）
-  threadId: string | null; // codex thread_id（resume 续接用）
-  tokens: CodexTokens | null; // codex 用量是 token，无美元口径（另存，不混入 USD 成本）
+  result: string; // the assistant's final text (containing the fenced JSON block we want)
+  threadId: string | null; // codex thread_id (used to resume)
+  tokens: CodexTokens | null; // codex usage is measured in tokens with no dollar figure (stored separately, never mixed into the USD cost)
   raw: string;
   available: boolean;
   error?: string;
@@ -22,16 +22,18 @@ export interface CodexResult {
 
 export interface CodexParsed {
   threadId: string | null;
-  result: string | null; // 最后一条 agent_message 文本
+  result: string | null; // the text of the last agent_message
   tokens: CodexTokens | null;
   isError: boolean;
-  sawThreadStarted: boolean; // 见过 thread.started 事件（信封标记，契约漂移判别用）
-  sawTurnCompleted: boolean; // 见过 turn.completed 事件（同上）
+  sawThreadStarted: boolean; // a thread.started event was seen (an envelope marker, used to detect contract drift)
+  sawTurnCompleted: boolean; // a turn.completed event was seen (likewise)
 }
 
-// 解析 `codex exec --json` 的 JSONL：thread.started→thread_id；最后一条 agent_message→最终答复；
-// turn.completed.usage→token；turn.failed/error→标错。纯函数，便于单测喂 canned JSONL。
-// sawThreadStarted/sawTurnCompleted：记是否见过这两个信封事件——供 contract.ts 判 codex CLI 升级是否改了 schema。
+// Parse the JSONL of `codex exec --json`: thread.started -> thread_id; the last agent_message -> the final
+// answer; turn.completed.usage -> tokens; turn.failed/error -> mark it errored. A pure function, so unit
+// tests can feed it canned JSONL.
+// sawThreadStarted/sawTurnCompleted record whether those two envelope events were seen, which lets
+// contract.ts decide whether a codex CLI upgrade changed the schema.
 export function parseCodexJsonl(stdout: string): CodexParsed {
   const acc: CodexParsed = { threadId: null, result: null, tokens: null, isError: false, sawThreadStarted: false, sawTurnCompleted: false };
   for (const line of stdout.split('\n')) {
@@ -41,7 +43,7 @@ export function parseCodexJsonl(stdout: string): CodexParsed {
     try {
       ev = JSON.parse(t) as Record<string, unknown>;
     } catch {
-      continue; // 非 JSON 行忽略
+      continue; // ignore non-JSON lines
     }
     const type = ev.type as string | undefined;
     if (type === 'thread.started') {
@@ -49,7 +51,7 @@ export function parseCodexJsonl(stdout: string): CodexParsed {
       acc.threadId = (ev.thread_id as string) ?? acc.threadId;
     } else if (type === 'item.completed') {
       const item = ev.item as { type?: string; text?: string } | undefined;
-      if (item?.type === 'agent_message' && typeof item.text === 'string') acc.result = item.text; // 保留最后一条
+      if (item?.type === 'agent_message' && typeof item.text === 'string') acc.result = item.text; // keep the last one
     } else if (type === 'turn.completed') {
       acc.sawTurnCompleted = true;
       const u = ev.usage as Record<string, number> | undefined;
@@ -68,20 +70,22 @@ export function parseCodexJsonl(stdout: string): CodexParsed {
 }
 
 export interface CodexOpts {
-  threadId?: string; // 给定则 `codex exec resume <id>` 续接既有会话（省 token，记忆保留）
-  readOnly?: boolean; // 仅首轮生效；默认 true（只读评审，不改仓库）。resume 不接受 -s（沙箱继承）。
+  threadId?: string; // when given, `codex exec resume <id>` continues an existing session (saving tokens, preserving memory)
+  readOnly?: boolean; // applies to the first round only; defaults to true (a read-only review that does not modify the repo). resume does not accept -s (the sandbox is inherited).
   label?: string;
-  cwd?: string; // 目标项目根（多项目：调用方传 project(s.project_id).root）
+  cwd?: string; // the target project root (multi-project: the caller passes project(s.project_id).root)
 }
 
-// 本机 codex CLI 非交互执行（对抗复审 reviewer）。用 `--json` 捕获 thread_id 以便后续 resume 续接。
-// codex 未安装 → available=false，由调用方降级（claude 自审 / skip / error）。
-// 首轮：`codex exec --json --skip-git-repo-check [-s read-only] -`（prompt 走 stdin）。
-// 续接：`codex exec resume <threadId> --json --skip-git-repo-check -`（不传 -s——resume 拒绝该参数，沙箱继承首轮）。
+// Non-interactive execution of the local codex CLI (the adversarial reviewer). `--json` is used to capture
+// the thread_id so a later round can resume it.
+// codex not installed -> available=false, and the caller degrades (claude self-review / skip / error).
+// First round: `codex exec --json --skip-git-repo-check [-s read-only] -` (the prompt goes through stdin).
+// Resume: `codex exec resume <threadId> --json --skip-git-repo-check -` (no -s — resume rejects that
+// argument, and the sandbox is inherited from the first round).
 export async function runCodex(prompt: string, opts: CodexOpts = {}): Promise<CodexResult> {
   const cfg = loadConfig();
   if (!commandExists(cfg.runtime.codex_bin)) {
-    return { ok: false, result: '', threadId: null, tokens: null, raw: '', available: false, error: 'codex CLI 未安装' };
+    return { ok: false, result: '', threadId: null, tokens: null, raw: '', available: false, error: 'the codex CLI is not installed' };
   }
   const tag = opts.label ? `${opts.label} ` : '';
   const args = opts.threadId
@@ -93,21 +97,22 @@ export async function runCodex(prompt: string, opts: CodexOpts = {}): Promise<Co
       const ev = JSON.parse(line) as Record<string, unknown>;
       if (ev.type === 'item.completed') {
         const item = ev.item as { type?: string } | undefined;
-        if (item?.type === 'command_execution') log.info(`  ${tag}→ codex 跑命令核对代码真源…`);
+        if (item?.type === 'command_execution') log.info(`  ${tag}→ codex is running commands to check the source of truth…`);
       }
     } catch {
-      /* 非 JSON 行忽略 */
+      /* ignore non-JSON lines */
     }
   };
 
   const r = await run(cfg.runtime.codex_bin, args, {
-    cwd: opts.cwd ?? ROOT, // 目标项目根（多项目：调用方传 project(s.project_id).root）
+    cwd: opts.cwd ?? ROOT, // the target project root (multi-project: the caller passes project(s.project_id).root)
     input: prompt,
     timeoutMs: cfg.runtime.claude_timeout_sec * 1000,
     onStdoutLine,
   });
   if (r.timedOut) {
-    return { ok: false, result: '', threadId: null, tokens: null, raw: r.stdout, available: true, error: 'codex 超时' };
+    // "timed out" is the wording orchestrator/retry.ts classifies as transient — keep it.
+    return { ok: false, result: '', threadId: null, tokens: null, raw: r.stdout, available: true, error: 'codex timed out' };
   }
   if (r.code !== 0) {
     return {
@@ -117,13 +122,15 @@ export async function runCodex(prompt: string, opts: CodexOpts = {}): Promise<Co
       tokens: null,
       raw: r.stdout + r.stderr,
       available: true,
-      error: `codex 退出码 ${r.code}: ${(r.stderr || '').slice(0, 400)}`,
+      error: `codex exited ${r.code}: ${(r.stderr || '').slice(0, 400)}`,
     };
   }
   const p = parseCodexJsonl(r.stdout);
-  // 契约漂移守卫（失败不静默）：退出 0 但一个已知信封事件都没见到 → codex CLI 升级疑似改了
-  // exec --json 的事件 schema。绝不把整坨 JSONL 当「结果文本」静默传下去（那会被当成「模型没吐 JSON」
-  // 白烧 parse-repair，最后还误判成业务问题）。停泊待人核对 → 改 contract.ts 信封定义（单点）。
+  // Contract drift guard (the failure is never silent): exit 0 but not one known envelope event was seen ->
+  // a codex CLI upgrade probably changed the event schema of exec --json. Never pass the whole blob of JSONL
+  // downstream as "the result text" (that would be taken as "the model emitted no JSON", burning
+  // parse-repair for nothing and ending up misdiagnosed as a business problem). Park it for a human to
+  // check -> then edit the envelope definition in contract.ts (one place).
   if (codexEnvelopeCollapsed({ threadStarted: p.sawThreadStarted, turnCompleted: p.sawTurnCompleted })) {
     return {
       ok: false,
@@ -136,10 +143,11 @@ export async function runCodex(prompt: string, opts: CodexOpts = {}): Promise<Co
     };
   }
   if (p.result && p.tokens) {
-    log.info(`  ${tag}✓ codex 复审完成（in ${p.tokens.input}/out ${p.tokens.output} tok）`);
+    log.info(`  ${tag}✓ codex review complete (in ${p.tokens.input} / out ${p.tokens.output} tok)`);
   }
-  // 信封完好。拿到 agent_message → 用它（含 fenced JSON）；p.result 为 null（模型没吐 agent_message）
-  // → 降级把整段 stdout 当文本走下游 parse-repair（合法「无 JSON」路径，非契约漂移）。
+  // The envelope is intact. If an agent_message came back, use it (it holds the fenced JSON); if p.result is
+  // null (the model emitted no agent_message), degrade by passing the whole stdout downstream as text for
+  // parse-repair — a legitimate "no JSON" path, not contract drift.
   return {
     ok: !p.isError,
     result: p.result ?? r.stdout,

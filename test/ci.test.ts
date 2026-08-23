@@ -1,5 +1,6 @@
-// 单测：ci.ts 的确定性 CI 闸 + worktree git 助手。mock proc 断言：CI ran/ok 语义、未配脚本即 park、
-// 无改动不空提交、降级路径不抛。不起真 CI/git 进程。
+// Unit tests for ci.ts's deterministic CI gate and the worktree git helpers. proc is mocked to assert the
+// ran/ok semantics of CI, that a missing script parks, that nothing is committed when nothing changed, and
+// that the degraded paths do not throw. No real CI or git process is started.
 import { test, mock, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -25,15 +26,15 @@ beforeEach(() => {
   syncBy = () => '';
 });
 
-test('runCi：未配 scripts.ci → ran:false（绝不裸 nx，交人工 park）', async () => {
+test('runCi: no scripts.ci configured -> ran:false (never a bare nx; park for a human)', async () => {
   const r = await runCi('/wt', undefined);
   assert.equal(r.ran, false);
   assert.equal(r.ok, false);
-  assert.match(r.summary, /未配置 scripts.ci/);
+  assert.match(r.summary, /no scripts\.ci configured/);
   assert.equal(runCalls.length, 0);
 });
 
-test('runCi：脚本退 0 → ok:true ran:true，cwd=worktree，bash <script> affected --base', async () => {
+test('runCi: the script exits 0 -> ok:true ran:true, with cwd=worktree and bash <script> affected --base', async () => {
   const r = await runCi('/wt', '/wt/tools/scripts/forge-ci.sh', { base: 'origin/main' });
   assert.equal(r.ok, true);
   assert.equal(r.ran, true);
@@ -41,7 +42,7 @@ test('runCi：脚本退 0 → ok:true ran:true，cwd=worktree，bash <script> af
   assert.deepEqual(runCalls[0].args, ['/wt/tools/scripts/forge-ci.sh', 'affected', '--base', 'origin/main']);
 });
 
-test('runCi：脚本退非 0（测试失败）→ ran:true ok:false（红，喂 claude 续修，不 park）', async () => {
+test('runCi: the script exits non-zero (tests failed) -> ran:true ok:false (red, fed to claude for the fix, not parked)', async () => {
   runResult = { code: 1, stdout: 'FAIL libs/x', stderr: '', timedOut: false };
   const r = await runCi('/wt', '/wt/forge-ci.sh');
   assert.equal(r.ran, true);
@@ -49,21 +50,21 @@ test('runCi：脚本退非 0（测试失败）→ ran:true ok:false（红，喂 
   assert.match(r.summary, /FAIL libs\/x/);
 });
 
-test('runCi：spawn 失败（code=null）/ 超时 → ran:false（基础设施错，park）', async () => {
+test('runCi: a spawn failure (code=null) or a timeout -> ran:false (an infrastructure error; park)', async () => {
   runResult = { code: null, stdout: '', stderr: 'ENOENT', timedOut: false };
   assert.equal((await runCi('/wt', '/wt/forge-ci.sh')).ran, false);
   runResult = { code: 0, stdout: '', stderr: '', timedOut: true };
   assert.equal((await runCi('/wt', '/wt/forge-ci.sh')).ran, false);
 });
 
-test('hasCommitsSince：rev-list count 非 0 → true；0 → false', () => {
+test('hasCommitsSince: a non-zero rev-list count -> true; 0 -> false', () => {
   syncBy = () => '2\n';
   assert.equal(hasCommitsSince('/wt', 'base'), true);
   syncBy = () => '0\n';
   assert.equal(hasCommitsSince('/wt', 'base'), false);
 });
 
-test('changedFilesSince：解析 name-only 行；出错降级 []', () => {
+test('changedFilesSince: parses the name-only lines; degrades to [] on error', () => {
   syncBy = () => 'libs/a.ts\napps/b.ts\n';
   assert.deepEqual(changedFilesSince('/wt', 'base'), ['libs/a.ts', 'apps/b.ts']);
   syncBy = () => { throw new Error('git boom'); };
@@ -71,14 +72,14 @@ test('changedFilesSince：解析 name-only 行；出错降级 []', () => {
   assert.equal(diffStatSince('/wt', 'base'), '');
 });
 
-test('commitWorktree：有改动 → add -A + commit（forge author + --no-verify）→ ok:true committed:true', () => {
+test('commitWorktree: with changes -> add -A + commit (forge author + --no-verify) -> ok:true committed:true', () => {
   const seen: string[][] = [];
   syncBy = (args) => {
     seen.push(args);
-    if (args.includes('status')) return ' M libs/a.ts\n'; // 有改动
+    if (args.includes('status')) return ' M libs/a.ts\n'; // there are changes
     return 'committed';
   };
-  const r = commitWorktree('/wt', 'forge(闸C x): round 1');
+  const r = commitWorktree('/wt', 'forge(gate C x): round 1');
   assert.equal(r.ok, true);
   assert.equal(r.committed, true);
   const commitArgs = seen.find((a) => a.includes('commit'))!;
@@ -86,17 +87,17 @@ test('commitWorktree：有改动 → add -A + commit（forge author + --no-verif
   assert.ok(commitArgs.includes('user.email=forge@local'));
 });
 
-test('commitWorktree：无改动 → ok:true committed:false（不空提交，但成功——区别于失败）', () => {
-  syncBy = (args) => (args.includes('status') ? '' : 'x'); // 干净工作树
+test('commitWorktree: nothing changed -> ok:true committed:false (no empty commit, but a success — distinct from a failure)', () => {
+  syncBy = (args) => (args.includes('status') ? '' : 'x'); // a clean working tree
   const r = commitWorktree('/wt', 'm');
   assert.equal(r.ok, true);
   assert.equal(r.committed, false);
 });
 
-test('commitWorktree：commit 抛错 → ok:false（提交失败≠无改动；调用方据此停泊，绝不带脏树跑 CI/推）', () => {
+test('commitWorktree: the commit throws -> ok:false (a failed commit is not "nothing changed"; the caller parks on it, and never runs CI or pushes with a dirty tree)', () => {
   syncBy = (args) => {
-    if (args.includes('status')) return ' M libs/a.ts\n'; // 有改动
-    if (args.includes('commit')) throw new Error('commit boom'); // 提交炸了（add -A 已把改动留在 index）
+    if (args.includes('status')) return ' M libs/a.ts\n'; // there are changes
+    if (args.includes('commit')) throw new Error('commit boom'); // the commit blew up (add -A already staged the changes)
     return '';
   };
   const r = commitWorktree('/wt', 'm');
@@ -104,7 +105,7 @@ test('commitWorktree：commit 抛错 → ok:false（提交失败≠无改动；�
   assert.equal(r.committed, false);
 });
 
-test('worktreeClean：porcelain 空 → true；非空 → false；出错 → false（保守判脏逼停泊）', () => {
+test('worktreeClean: empty porcelain -> true; non-empty -> false; an error -> false (conservatively dirty, forcing a park)', () => {
   syncBy = () => '';
   assert.equal(worktreeClean('/wt'), true);
   syncBy = () => ' M a.ts\n';
@@ -113,21 +114,21 @@ test('worktreeClean：porcelain 空 → true；非空 → false；出错 → fal
   assert.equal(worktreeClean('/wt'), false);
 });
 
-test('resetWorktree：reset --hard <sha> + clean -fd + 复位后再验 porcelain；全 0 且干净 → ok:true', () => {
+test('resetWorktree: reset --hard <sha> + clean -fd + a re-check of porcelain afterwards; all zero and clean -> ok:true', () => {
   const seen: string[][] = [];
   syncBy = (args) => { seen.push(args); return ''; };
   const r = resetWorktree('/wt', 'PREHEAD');
   assert.equal(r.ok, true);
   assert.deepEqual(seen[0], ['-C', '/wt', 'reset', '--hard', 'PREHEAD']);
   assert.deepEqual(seen[1], ['-C', '/wt', 'clean', '-fd']);
-  assert.deepEqual(seen[2], ['-C', '/wt', 'status', '--porcelain']); // 复位后再验一次（Codex SF）
+  assert.deepEqual(seen[2], ['-C', '/wt', 'status', '--porcelain']); // checked once more after the reset
   syncBy = () => { throw new Error('reset boom'); };
   assert.equal(resetWorktree('/wt', 'PREHEAD').ok, false);
 });
 
-test('resetWorktree：reset/clean 退 0 但复位后 status 仍非 clean（嵌套 repo/submodule 残留）→ ok:false（不假装复位成功）', () => {
-  syncBy = (args) => (args.includes('status') ? ' M sub/x\n' : ''); // reset/clean 退 0、status 仍脏
+test('resetWorktree: reset/clean exit 0 but the status is still not clean afterwards (nested repo / submodule leftovers) -> ok:false (do not pretend the reset worked)', () => {
+  syncBy = (args) => (args.includes('status') ? ' M sub/x\n' : ''); // reset/clean exit 0 but the status is still dirty
   const r = resetWorktree('/wt', 'PREHEAD');
   assert.equal(r.ok, false);
-  assert.match(r.output, /仍非 clean/);
+  assert.match(r.output, /still not clean/);
 });
