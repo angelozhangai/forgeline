@@ -4,6 +4,7 @@
 // 为什么是注册表而不是「选择点」（对比 messaging/index.ts 的 `port`）：一套部署只能有一个 IM
 // （否则审批轨迹分叉），但同一条消息里完全可能同时贴飞书文档和别的源的链接——文档源天然是**多个并存**，
 // 靠内容寻址（谁认得出就归谁）而不是靠配置选一个。
+import { extDocSources } from '../ext/index.ts';
 import { log } from '../util/log.ts';
 import { feishuDocs } from './feishu.ts';
 import { plaintextDocs } from './plaintext.ts';
@@ -12,16 +13,54 @@ import { formatRef, parseStoredRef, type DocClaimInput, type DocReadResult, type
 export { formatRef, parseStoredRef };
 export type { DocRef, DocReadResult, DocSource, DocClaimInput } from './port.ts';
 
-// 已注册的文档源。加一个源 = 在这里加一行（外加它自己的 docs/<id>.ts），核心其余部分一行不动。
+// **核心自带**的文档源。加一个源 = 在这里加一行（外加它自己的 docs/<id>.ts），核心其余部分一行不动。
 // plaintext 是**兜底源**（fallback:true）且默认关——它排在最后只是可读性，真正决定顺位的是那个标志位。
-const REGISTERED: DocSource[] = [feishuDocs, plaintextDocs];
+const CORE: DocSource[] = [feishuDocs, plaintextDocs];
+
+// 下游扩展包也能注册文档源（ExtensionPack.docSources）。这里能做而 messaging 那侧做不到，
+// 差别在**时序**：messaging 的选择点在模块加载期同步求值，接不上异步装入的扩展包；
+// 而这张表是每次调用现查的（claimDocs / sourceById / readDoc 都在消息到达时才读它），
+// 所以只要扩展包在第一条消息之前装好，追加就是安全的。见 src/ext/port.ts 的「非目标」。
+//
+// 合并规则本身是纯函数，好让下面那几条（核心优先、兜底顺位）能被真正单测。
+export function mergeSources(core: DocSource[], extra: DocSource[]): DocSource[] {
+  const out = [...core];
+  const taken = new Set(core.map((s) => s.id));
+  for (const s of extra) {
+    // **核心源永远优先**——同「核心命令永远优先」那条。下游没法把飞书源换掉，
+    // 否则一个 id 打错的扩展就能悄悄接管所有文档解析，而症状只是「读出来的正文不对」。
+    if (taken.has(s.id)) {
+      log.warn(`扩展文档源「${s.id}」与核心源同名 → 忽略扩展那份（核心永远优先）`);
+      continue;
+    }
+    taken.add(s.id);
+    out.push(s);
+  }
+  // 兜底源按**顺序**定先后，而核心排在前面 → plaintext 开着时它赢。两个兜底源同时活着是配置冲突，
+  // 说出来（一次），别让人对着「为什么我的兜底源没上场」猜。
+  const fallbacks = out.filter((s) => s.fallback).map((s) => s.id);
+  if (fallbacks.length > 1) {
+    log.warn(`注册了多个兜底文档源（${fallbacks.join('、')}）→ 按注册顺序取第一个认领成功的，核心源在前`);
+  }
+  return out;
+}
+
+// 合并结果按「当前装载的扩展包」记忆：扩展包一个进程只装一次，所以这就是一次性开销，
+// 也让上面那两条 warn 每装一次只出一遍，而不是每来一条消息刷一次。
+let memoKey: DocSource[] | null = null;
+let memo: DocSource[] = CORE;
 
 export function sources(): DocSource[] {
-  return [...REGISTERED];
+  const extra = extDocSources();
+  if (memoKey !== extra) {
+    memo = mergeSources(CORE, extra);
+    memoKey = extra;
+  }
+  return [...memo];
 }
 
 export function sourceById(id: string): DocSource | null {
-  return REGISTERED.find((s) => s.id === id) ?? null;
+  return sources().find((s) => s.id === id) ?? null;
 }
 
 // 认领一条消息里的需求文档 —— **规则本身**（纯函数，对任意源列表成立）。
@@ -68,16 +107,16 @@ export function resolveRef(list: DocSource[], urlOrToken: string): DocRef | null
 // 上面两条规则**接到真实注册表上**。规则与接线分开，是为了让「多源怎么解析」能被真正单测——
 // 否则测试只能对着唯一一个已注册源自说自话，或者复制一份规则来测（那测的是副本，不是实现）。
 export function claimDocs(input: DocClaimInput): DocRef[] {
-  return resolveClaims(REGISTERED, input);
+  return resolveClaims(sources(), input);
 }
 
 export function parseAnyRef(urlOrToken: string): DocRef | null {
-  return resolveRef(REGISTERED, urlOrToken);
+  return resolveRef(sources(), urlOrToken);
 }
 
 // 已注册源的 id 列表（报错文案用：告诉人「现在认得哪些源」，而不是干巴巴一句无法识别）。
 export function registeredIds(): string[] {
-  return REGISTERED.map((s) => s.id);
+  return sources().map((s) => s.id);
 }
 
 // 读正文。未注册的源 → **如实报错**，绝不静默当成读失败或空文档（库里存着一个没人认领的 ref，
