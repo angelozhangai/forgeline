@@ -1,11 +1,15 @@
 #!/usr/bin/env bash
-# forge — Forge 入口（通用服务；运行时指向目标项目仓，默认兄弟目录 example-project）。
-# 先载入 forge.env（含 FORGE_PROJECT_ROOT / 飞书 webhook，私有 gitignore），再跑。
+# forge -- the entry point. Forge is a generic service that points at a target project repo at runtime,
+# defaulting to the sibling directory example-project.
+# It loads forge.env first -- which holds FORGE_PROJECT_ROOT and the IM webhook, and is gitignored as
+# private -- and only then runs.
 #
-# forge.env 的位置必须与 TS 侧的 ENV_FILE（src/root.ts 的 configFile）一致，否则
-# 「配置搬到了 FORGE_HOME，但 CLI 还在读检出目录里的旧 env」会静默跑错项目。
-# 注意 FORGE_HOME / FORGE_CONFIG_DIR 本身**不能**写在 forge.env 里 —— 是它们决定
-# 去哪儿找 forge.env，鸡生蛋。它们必须来自真实环境（shell / launchd plist）。
+# Where forge.env lives has to agree with ENV_FILE on the TypeScript side (configFile in src/root.ts), or
+# "the config moved to FORGE_HOME but the CLI is still reading the old env in the checkout" silently runs
+# against the wrong project.
+# Note that FORGE_HOME and FORGE_CONFIG_DIR themselves **cannot** be set inside forge.env: they are what
+# decides where to look for forge.env in the first place, so it is a chicken and egg. They have to come from
+# the real environment -- the shell, or the launchd plist.
 set -euo pipefail
 HERE="$(cd "$(dirname "$0")" && pwd)"
 
@@ -16,14 +20,17 @@ config_dir() {
 }
 
 ENV_FILE="$(config_dir)/forge.env"
-# 逐文件回落，与 configFile 同规则：叠加目录没有 forge.env 就用检出里的那份。
+# It falls back one file at a time, by the same rule as configFile: if the overlay has no forge.env, use the
+# one in the checkout.
 [ -f "$ENV_FILE" ] || ENV_FILE="$HERE/config/forge.env"
 if [ -f "$ENV_FILE" ]; then
-  # 写在 forge.env 里的这两个变量对「去哪儿找 forge.env」已经太晚，但仍会被 TS 侧
-  # 采纳 —— shell 读了 A 份 env、Node 却按 B 份目录找配置。不静默，直接喊。
+  # Setting those two variables inside forge.env is already too late to affect where forge.env is looked for,
+  # yet the TypeScript side would still honour them -- so the shell reads one env while Node looks for its
+  # config somewhere else. Rather than let that happen silently, say so loudly.
   if grep -qE '^[[:space:]]*(FORGE_HOME|FORGE_CONFIG_DIR)=' "$ENV_FILE"; then
-    echo "forge: $ENV_FILE 里定义了 FORGE_HOME/FORGE_CONFIG_DIR —— 它们决定去哪儿找本文件，" >&2
-    echo "       写在这里为时已晚，会让 shell 与 Node 用上不同的配置目录。请改到 shell/launchd 环境里。" >&2
+    echo "forge: $ENV_FILE defines FORGE_HOME or FORGE_CONFIG_DIR -- but those decide where this file is" >&2
+    echo "       looked for, so setting them here comes too late and leaves the shell and Node using" >&2
+    echo "       different config directories. Set them in the shell or launchd environment instead." >&2
   fi
   set -a
   # shellcheck source=/dev/null

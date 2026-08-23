@@ -23,7 +23,7 @@ Run `uname`. Not `Darwin` → STOP: Forge only deploys on macOS (launchd). Do no
 ### Gate 2 — Target project + its code repos
 Forge calls the target project's scripts (the live source of truth); the default target project is `example-project`. Check `$FORGE_PROJECT_ROOT` or sibling `../example-project/.git`.
 - Missing → guide: `git clone git@github.com:your-org/example-project.git <sibling-of-this-repo>` (needs their SSH/gh access). BLOCK until present.
-- Three code repos (demo / example-web / example-admin): `./forge doctor` shows each. Any "未 clone" → have them run the main repo's `./scripts/bootstrap.sh`. BLOCK until all three report a HEAD sha.
+- Three code repos (demo / example-web / example-admin): `./forge doctor` shows each. Any "not cloned" → have them run the main repo's `./scripts/bootstrap.sh`. BLOCK until all three report a HEAD sha.
 
 ### Gate 3 — Dependencies
 `npm install` (or `./deploy/bootstrap.sh`, which does gates 1–3 + scaffolds gate 4). Verify `node_modules/@larksuiteoapi/node-sdk` exists.
@@ -43,35 +43,35 @@ Each must be **installed AND authenticated**. Check and block individually:
 Re-verify with `./forge doctor` (it reports each CLI + gh login). BLOCK until all three are ✓.
 
 ### Gate 6 — Feishu developer backend  ⛔ BLOCKING · manual · only the user can do this
-In the Feishu admin console (full checklist in `deploy/README.md` §三), the user must:
-1. Event & callback → subscription method → **长连接 (long-connection)**.
+In the Feishu admin console (full checklist in `deploy/README.md` §3), the user must:
+1. Event & callback → subscription method → **long connection**.
 2. Subscribe events: `im.message.receive_v1` + card callback (`card.action.trigger`).
 3. Permissions: `im:message.group_at_msg:readonly` + `im:message:send` (+ offline backfill: `im:message.history:readonly`, `im:message.group_msg`), then **publish a new version** (may need admin approval).
 4. **Add the bot to the watch group.**
-You cannot fully auto-verify this, but you CAN smoke-test the bot token: `./forge doctor` should show `飞书 bot 私聊通知 ✓`. BLOCK on the user confirming the 4 backend steps (or explicitly accepting degraded mode).
+You cannot fully auto-verify this, but you CAN smoke-test the bot token: `./forge doctor` should show the bot direct-message check passing. BLOCK on the user confirming the 4 backend steps (or explicitly accepting degraded mode).
 
-### Gate 6b — Downstream (闸C/闸D) prerequisites  ⛔ conditional · only if this host runs implement→PR
-Upstream (PRD→issue) needs none of this — skip if this host is upstream-only. But if this host will run **闸C (implement + local CI)** or **闸D (PR adversarial review)**, two things must hold for the *target project's checkout* before you uncomment its `scripts:` block in `config/projects.yaml` / `runtime.yaml`:
+### Gate 6b — Downstream (gate C / gate D) prerequisites  ⛔ conditional · only if this host runs implement→PR
+Upstream (PRD→issue) needs none of this — skip if this host is upstream-only. But if this host will run **gate C (implement + local CI)** or **gate D (PR adversarial review)**, two things must hold for the *target project's checkout* before you uncomment its `scripts:` block in `config/projects.yaml` / `runtime.yaml`:
 
 1. **The target repo's `origin` must be fetchable non-interactively.** Every tick forge anchors the checkout with `git fetch origin <branch>`; if the host's SSH to the git host is blocked (e.g. a zero-trust proxy), it fails silently each tick and downstream never advances.
    - `git -C <target-repo> remote -v` — if `origin` is `git@…` and SSH is blocked, switch to HTTPS: `git -C <target-repo> remote set-url origin https://github.com/<org>/<repo>.git`.
    - Give unattended fetch credentials via a `gh`-backed helper: `git -C <target-repo> config credential.helper '!f() { echo username=<gh-user>; echo "password=$(gh auth token)"; }; f'`.
    - Verify: `git -C <target-repo> fetch origin <branch>` exits 0 with no prompt.
-2. **The host must be a real build env for that project.** 闸C/闸D build an isolated worktree (via the project's `tools/scripts/wt.sh`) and run the project's CI inside it — needs the project's full toolchain + secrets present (e.g. your-monorepo: `pnpm`, `direnv`/`.envrc`, `.secure-config`, a working `pnpm install`/`node_modules`). Confirm `tools/scripts/wt.sh <sibling-path> -b throwaway origin/<base>` succeeds end-to-end (worktree created, deps resolve, the project's CI script runs), then `git worktree remove` it. Without this, every 闸C tick fails at worktree/CI setup.
+2. **The host must be a real build env for that project.** Gate C and gate D build an isolated worktree (via the project's `tools/scripts/wt.sh`) and run the project's CI inside it — needs the project's full toolchain + secrets present (e.g. your-monorepo: `pnpm`, `direnv`/`.envrc`, `.secure-config`, a working `pnpm install`/`node_modules`). Confirm `tools/scripts/wt.sh <sibling-path> -b throwaway origin/<base>` succeeds end-to-end (worktree created, deps resolve, the project's CI script runs), then `git worktree remove` it. Without this, every gate C tick fails at worktree/CI setup.
 
 BLOCK (for downstream use) until both verify. If either can't be met, leave the `scripts:` block commented — forge stays upstream-only and healthy.
 
 Once both verify, the first real-host end-to-end downstream smoke follows the runbook at `docs/downstream-validation.md`.
 
 ### Gate 7 — Preflight green
-Run `./deploy/bootstrap.sh` (no `--install`). It must reach **「预检全绿——可部署」** (exit 0). Any `forge doctor` ✗ → return to the matching gate above. Do not install until green (unless the user explicitly accepts degraded mode and runs `./deploy/install.sh` directly).
+Run `./deploy/bootstrap.sh` (no `--install`). It must reach **"preflight all green -- ready to deploy"** (exit 0). Any `forge doctor` ✗ → return to the matching gate above. Do not install until green (unless the user explicitly accepts degraded mode and runs `./deploy/install.sh` directly).
 
 ### Gate 8 — Install
 ⚠️ Warn first: a running daemon auto-runs gates and the daily contract probe — **it starts spending money automatically.** On the user's OK, run `./deploy/bootstrap.sh --install` (installs + starts the launchd daemon + watchdog).
 
 ### Gate 9 — Verify & report
 - `./forge health` → total status healthy.
-- `curl -s http://127.0.0.1:4319/health` → daemon up, `外部工具契约` check present.
+- `curl -s http://127.0.0.1:4319/health` → daemon up, with the external-CLI contract check present.
 - Report: deployed; status page `http://127.0.0.1:4319/`; logs `tail -f logs/launchd.log` / `logs/watchdog.log`; uninstall `./deploy/uninstall.sh` (keeps `state/` + `logs/`).
 
 ---

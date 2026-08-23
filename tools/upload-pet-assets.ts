@@ -1,6 +1,8 @@
-// 一次性把 assets/pet/*.gif 传到飞书，把 stage→image_key 缓存到 assets/pet/keys.json。
-//   跑：node tools/upload-pet-assets.ts
-// 卡片渲染时只读 keys.json，绝不每次都传。换美术/换 app 后重跑本脚本即可。
+// A one-off upload of assets/pet/*.gif to the IM provider, caching stage -> image_key into
+// assets/pet/keys.json.
+//   Run: node tools/upload-pet-assets.ts
+// Rendering a card only reads keys.json and never re-uploads. Re-run this script after new artwork or a new
+// app.
 import { readdirSync, writeFileSync, existsSync, readFileSync } from 'node:fs';
 import { resolve, dirname, basename } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -12,7 +14,7 @@ const KEYS = resolve(DIR, 'keys.json');
 
 const gifs = readdirSync(DIR).filter((f) => f.endsWith('.gif'));
 if (gifs.length === 0) {
-  console.error('没有 gif，先跑 node tools/gen-pet-sprites.ts');
+  console.error('no gifs found -- run node tools/gen-pet-sprites.ts first');
   process.exit(1);
 }
 
@@ -26,13 +28,13 @@ for (const f of gifs) {
     ok++;
     console.log(`✓ ${name} → ${key}`);
   } else {
-    console.log(`✗ ${name} 上传失败（见上方告警）`);
+    console.log(`✗ ${name} failed to upload (see the warning above)`);
   }
 }
 if (ok > 0) {
   writeFileSync(KEYS, JSON.stringify(out, null, 2) + '\n');
-  console.log(`\n已写 ${ok}/${gifs.length} 个 image_key → ${KEYS}`);
+  console.log(`\nwrote ${ok}/${gifs.length} image keys to ${KEYS}`);
 } else {
-  console.error('\n全部失败：多半 bot 缺「上传图片」权限(im:resource)。去开发者后台加上、发版后重跑本脚本。');
+  console.error('\nevery upload failed: most likely the bot lacks the image upload permission (im:resource). Grant it in the developer console, publish the change, and run this script again.');
   process.exit(2);
 }

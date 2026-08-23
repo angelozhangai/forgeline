@@ -85,7 +85,7 @@ For the always-on experience — IM long connection (Feishu or Slack), chat-mess
 
 Intake is **content-addressed**: a chat message enters the pipeline only if some registered document
 source claims something in it. Nothing claims it → the message is dropped with a single
-`没有任何文档源认领这条消息，忽略` warning. That is a *warn*, not an error, so the symptom is simply
+`no document source claimed this message, ignoring` warning. That is a *warn*, not an error, so the symptom is simply
 "the bot ignored me" — worth knowing before you point Forge at a new workspace.
 
 | Source | Claims | Reads the requirement from |

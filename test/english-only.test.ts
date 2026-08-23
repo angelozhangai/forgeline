@@ -13,9 +13,9 @@
 // Scanning the working tree instead of the index would conflate the two and start failing on a
 // developer's own runtime data.
 //
-// PENDING is a ratchet, exactly like ALLOW in arch-boundary.test.ts: it may only get shorter, its
-// contents are asserted exactly, and the whole mechanism is deleted once empty. Putting a file
-// back is a visible diff in this file, never a silent regression.
+// The migration ran behind a PENDING ratchet, in the style of ALLOW in arch-boundary.test.ts. It is
+// empty now, so the mechanism is gone: this is a plain zero-tolerance assertion, and there is no
+// list to add a file back to.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync } from 'node:fs';
@@ -43,39 +43,6 @@ const NON_ENGLISH = new RegExp(
 
 // Binary payloads have no language. Everything else is read as UTF-8 and scanned.
 const BINARY = /\.(png|jpe?g|gif|ico|webp|pdf|woff2?|ttf|otf|zip|gz|db|sqlite)$/i;
-
-// Files still carrying non-English text. RATCHET — this list may only get shorter.
-const PENDING: string[] = [
-  '.agents/skills/deploy-forge/SKILL.md',
-  '.claude/skills/deploy-forge/SKILL.md',
-  '.githooks/pre-commit',
-  '.githooks/pre-push',
-  '.github/workflows/ci.yml',
-  '.gitignore',
-  'README.md',
-  'config/assignment.yaml',
-  'config/forge.env.example',
-  'config/permissions.yaml',
-  'config/projects.yaml.example',
-  'config/routing.yaml',
-  'config/runtime.yaml',
-  'deploy/README.md',
-  'deploy/bootstrap.sh',
-  'deploy/com.forge.daemon.plist',
-  'deploy/com.forge.watchdog.plist',
-  'deploy/forge-daemon',
-  'deploy/forge-watchdog',
-  'deploy/install.sh',
-  'deploy/newsyslog/com.forge.conf',
-  'deploy/uninstall.sh',
-  'docs/pluggable-messaging-and-doc-sources.md',
-  'forge',
-  'package.json',
-  'tools/gen-pet-sprites.ts',
-  'tools/test-with-floor.sh',
-  'tools/upload-pet-assets.ts',
-  'tools/weekly-load.sh',
-];
 
 function trackedFiles(): string[] {
   // A check that cannot check is not a check (see the --test-force-exit episode): if git is
@@ -105,27 +72,19 @@ export function offenders(files: string[]): { file: string; line: number; text: 
 }
 
 test('English-only: no tracked file carries non-English text', () => {
-  const pending = new Set(PENDING);
-  const bad = offenders(trackedFiles()).filter((o) => !pending.has(o.file));
+  const bad = offenders(trackedFiles());
   assert.deepEqual(
     bad.map((o) => `${o.file}:${o.line}`),
     [],
-    `These tracked files contain non-English text and are not in PENDING:\n  ${bad
+    `These tracked files contain non-English text:\n  ${bad
       .map((o) => `${o.file}:${o.line}  ${o.text}`)
       .join('\n  ')}`,
   );
 });
 
-// The ratchet only ratchets if a stale entry is a failure rather than dead weight: a file that was
-// converted but left in PENDING would silently re-open the hole it was covering.
-test('English-only: PENDING holds no file that is already clean', () => {
-  const dirty = new Set(offenders(trackedFiles()).map((o) => o.file));
-  const stale = PENDING.filter((f) => !dirty.has(f));
-  assert.deepEqual(stale, [], `Already English — delete these from PENDING:\n  ${stale.join('\n  ')}`);
-});
-
-// Detection itself has to be pinned, or the ratchet could be emptied by a regex that matches
-// nothing. Each case is a script the rule bans; the last two are what must NOT trip it.
+// Detection itself has to be pinned, or the assertion above passes for the wrong reason: a regex
+// that matches nothing finds no offender either. Each case is a script the rule bans; the last
+// three are what must NOT trip it.
 //
 // The fixtures are built from code points rather than written as literal characters on purpose:
 // this file is itself a tracked file, and a guard that has to exempt itself from its own rule is

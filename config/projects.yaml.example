@@ -1,48 +1,61 @@
-# 多项目注册表（可选）。复制为 config/projects.yaml 即启用「一个 Forge 服务多个项目」。
-# 不放此文件 = 单默认项目：root 自动找兄弟 ../example-project，配置全取 runtime.yaml —— 与改造前一致。
-# 换机时必须按新电脑路径重建/复核。
+# The multi-project registry (optional). Copy it to config/projects.yaml to let one Forge serve several
+# projects.
+# Without this file there is a single default project: root finds the sibling ../example-project
+# automatically and every setting comes from runtime.yaml -- exactly as it behaved before this existed.
+# On a new machine it has to be rebuilt or rechecked against that machine's paths.
 #
-# 绑定规则（一条 PRD 进来归哪个项目）：显式 `forge add --project <id>` > 群→项目映射(chats) > default_project。
-# 每个条目省略的字段回退默认：repos/branches/default_branch/tech_design_publish 回退 runtime.yaml。
-# repoMap/umbrella：**仅默认项目**回退 demo 默认（{C:demo,U:example-web,A:example-admin,E:example-engine}/
-#   example-project）；**非默认项目不继承**——repoMap 缺省为空 {}（用字母编码多仓 Epic 的项目须自带），umbrella 缺省取自身 repos[0]。
-# owner（GitHub org）缺省回退 your-org——非默认项目若在别的 org，须显式声明 owner。
-# repos 是**本地 repo key/path**（读代码真源，monorepo 用 '.'），≠ GitHub slug；本地 key 与 GitHub 仓名不一致时
-#   （典型 monorepo '.'）须配 repoSlugs（本地 key → GitHub slug），否则 gh -R owner/. 会指错仓。demo 仓名即 slug，无需配。
-# 提示词按项目私有覆盖：在 Forge 内放 prompts/<id>/<name>.md 覆盖需要改的；缺省走默认 prompts/<name>.md。
+# How an incoming PRD is bound to a project, in order of precedence: an explicit
+# `forge add --project <id>`, then the chat-to-project mapping in `chats`, then default_project.
+# Any field an entry omits falls back: repos, branches, default_branch and tech_design_publish all fall back
+# to runtime.yaml.
+# repoMap and umbrella fall back to the demo defaults ({C:demo, U:example-web, A:example-admin,
+#   E:example-engine} and example-project) for the **default project only**. A **non-default project inherits
+#   neither**: its repoMap defaults to {} (a project using letter codes for a multi-repo Epic has to supply
+#   its own) and its umbrella defaults to its own repos[0].
+# owner (the GitHub org) falls back to your-org, so a non-default project living in another org has to
+# declare its owner explicitly.
+# repos holds **local repo keys or paths** -- where the code is actually read from, with '.' for a monorepo --
+# and is not the GitHub slug. When a local key differs from the GitHub repo name (the classic case being a
+#   monorepo's '.'), repoSlugs has to map local key -> GitHub slug, or `gh -R owner/.` points at the wrong
+#   repo. For demo the repo name is the slug, so nothing is needed.
+# Prompts can be overridden per project: put prompts/<id>/<name>.md inside Forge to override the ones you
+# need, and anything else falls back to the default prompts/<name>.md.
 
 default_project: demo
 
 projects:
-  # 默认项目：root 留空=自动找兄弟 ../example-project；配置全回退 runtime.yaml。只需声明它的群。
+  # The default project: leaving root empty finds the sibling ../example-project automatically, and every
+  # setting falls back to runtime.yaml. All it needs to declare is its chats.
   demo:
     chats:
-      - oc_xxxxxxxxxxxxxxxx        # 这些飞书群里贴的 PRD 归 demo 项目
+      - oc_xxxxxxxxxxxxxxxx        # a PRD posted in these chats belongs to the demo project
 
-  # 第二个项目示例（按需取消注释 + 改成你的）：
+  # A second project, as an example -- uncomment it and change it to your own:
   # acme:
-  #   root: /Users/you/workspace/acme-project      # 项目仓根（非默认项目必填）
-  #   repos: [acme-web, acme-api]                   # 闸A 对照的代码真源子仓
+  #   root: /Users/you/workspace/acme-project      # the project's repo root (required for a non-default project)
+  #   repos: [acme-web, acme-api]                   # the repos gate A reads the real code from
   #   branches: { prod: main, dev: dev }
   #   default_branch: dev
   #   tech_design_publish: { enabled: true, base: main }
-  #   repoMap: { W: acme-web, A: acme-api }          # 闸B 信封仓字母→仓名
-  #   umbrella: acme-project                         # 多仓 Epic 本体所在仓
+  #   repoMap: { W: acme-web, A: acme-api }          # gate B's envelope letters -> repo names
+  #   umbrella: acme-project                         # the repo the multi-repo Epic itself lives in
   #   chats:
   #     - oc_yyyyyyyyyyyyyyyy
 
-  # your-monorepo（下游闸C/闸D 首个目标项目；单一 Nx monorepo / pnpm / Prisma，trunk→main）：
+  # your-monorepo -- the first target project for downstream gates C and D: a single Nx monorepo with pnpm
+  # and Prisma, trunk-based onto main.
   # your-monorepo:
   #   root: /path/to/your-monorepo
-  #   repos: [.]                                     # monorepo：单仓（路径即项目根）
-  #   branches: { prod: main, dev: main }            # trunk-based：合并队列只进 main
+  #   repos: [.]                                     # a monorepo: one repo, whose path is the project root
+  #   branches: { prod: main, dev: main }            # trunk-based: the merge queue only ever lands on main
   #   default_branch: prod
-  #   # 下游机械动作委托脚本（路径相对项目根）。worktree 必走 wt.sh（处理 node_modules/.envrc/密钥）。
-  #   scripts:                                       # 均在 your-monorepo tools/scripts/（C-class 约定）
+  #   # The scripts the downstream mechanical actions delegate to, with paths relative to the project root.
+  #   # A worktree always goes through wt.sh, which handles node_modules, .envrc and the secrets.
+  #   scripts:                                       # all under your-monorepo's tools/scripts/, by convention
   #     worktree_add: ./tools/scripts/wt.sh          # wt.sh <path> [-b <branch>] [<commit-ish>]
-  #     ci: ./tools/scripts/forge-ci.sh              # 内部跑 pnpm ci:local（绝不裸 nx run-many）
+  #     ci: ./tools/scripts/forge-ci.sh              # runs pnpm ci:local internally, never a bare nx run-many
   #     diff: ./tools/scripts/forge-diff.sh
-  #     create_pr: ./tools/scripts/forge-create-pr.sh # gh pr create（绝不自动 merge）
+  #     create_pr: ./tools/scripts/forge-create-pr.sh # gh pr create, and never an automatic merge
   #     checks: ./tools/scripts/forge-checks.sh
   #   chats:
   #     - oc_zzzzzzzzzzzzzzzz

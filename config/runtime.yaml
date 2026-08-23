@@ -1,71 +1,90 @@
-# 运行期可调项（非密钥）。密钥/环境在 config/forge.env（服务仓内，gitignore）。
+# Runtime settings (nothing secret). Secrets and the environment live in config/forge.env, inside the service
+# repo and gitignored.
 
-poll_interval_sec: 180       # V2 轮询/定时间隔
-max_parallel: 2              # 并发 claude/codex 进程上限（贵资源）。起 2-3，旋钮到 ~5
-parse_repair_retries: 2      # LLM 输出坏 JSON/不符契约时，resume 同会话回喂重出的最多次数（耗尽才停泊）
-max_fix_failures: 5          # 断路器：连续 fix(claude) 调用失败（超时/崩/持续故障）到此上限 → gate STALLED 交人，绝不无限空转（对齐 SQS maxReceiveCount/断路器阈值）
+poll_interval_sec: 180       # how often the poller and the periodic tick run
+max_parallel: 2              # cap on concurrent claude/codex processes (an expensive resource). Start at 2-3; the knob goes to about 5
+parse_repair_retries: 2      # when an LLM emits bad JSON or breaks the contract, how many times to resume the same session and ask again before parking
+max_fix_failures: 5          # circuit breaker: this many consecutive failed fix(claude) calls -- timeouts, crashes, a persistent fault -- park the gate as STALLED for a human rather than spinning forever (the same idea as an SQS maxReceiveCount)
 
 branches:
-  prod: main                 # 生产基线
-  dev: dev                   # 开发集成基线
-default_branch: prod         # 闸分析默认读哪条线（prod=main 生产真源；评审一律锚 main 最新）
+  prod: main                 # the production baseline
+  dev: dev                   # the development integration baseline
+default_branch: prod         # which line the gates analyse by default (prod=main is the production truth; a review always anchors on the latest main)
 
 repos: [demo, example-web, example-admin, example-engine]
 
-# GO 立项时自动把技术方案 doc 发布到主仓（提交+PR+merge，见 scripts/publish-tech-design.sh）。
-# 关掉(enabled:false)则回到「文档留工作树、人工提交」。base 暂走 main，可改 dev。
+# On go, publish the tech-design document to the main repo automatically (commit, PR, merge -- see
+# scripts/publish-tech-design.sh).
+# Turning it off (enabled:false) goes back to leaving the document in the working tree for someone to commit
+# by hand. base is main for now, and may be changed to dev.
 tech_design_publish:
   enabled: true
   base: main
 
-# 文档源。飞书文档源始终在；plaintext = 把「@机器人 + 一段话」本身当成需求正文（无需任何文档服务）。
-# ⚠️ 默认关。开了之后，群里 @ 机器人写一段话（归一后 ≥20 字）就会真的建需求、跑闸A = **自动花钱**；
-# 今天这类没有文档链接的消息只会被忽略。接 Slack 这类无文档服务的场景才建议开。
+# Document sources. The Feishu source is always present; plaintext treats "@bot plus a paragraph" as the
+# requirement body itself, needing no document service at all.
+# Off by default. Once it is on, @-mentioning the bot in a channel with a paragraph of text (35 weighted units
+# or more once normalised) really does file a requirement and run gate A -- which **spends money
+# automatically**. Today a message with no document link is simply ignored. Turning it on is worth it mainly
+# for a setup like Slack, where there is no document service.
 doc_sources:
   plaintext:
     enabled: false
 
 adversarial:
   reviewer: codex            # codex | claude
-  on_missing: claude         # codex 不在时：claude(降级同引擎自审,独立性弱) | skip | error
-  max_rounds: 3              # 闸B codex审⇄claude改 对抗循环硬上限：到顶仍未消解 → GATE_B_STALLED 交 M 裁决（单 tick 内最多跑 2 轮，余下下个 tick 续）
+  on_missing: claude         # when codex is absent: claude (degrade to the same engine reviewing itself, so less independent) | skip | error
+  max_rounds: 3              # hard cap on gate B's codex-reviews / claude-revises loop: still unresolved at the cap -> GATE_B_STALLED for the maintainer to rule on (at most 2 rounds per tick, with the rest carried to the next)
 
 gate_a:
-  max_pm_rounds: 5           # PM 多轮评审上限：到顶仍有未决开放问题 → 停泊交 M 人工裁决（防 claude 无限循环烧钱）
+  max_pm_rounds: 5           # cap on the rounds of review with product: still open at the cap -> park for the maintainer to rule on, which is what stops claude looping and burning money
 
-# 下游闸C（实现 + 本地CI）：claude 在隔离 worktree 实现，跑项目 CI + 外环验收至全绿。reviewer=确定性 CI/验收（无 codex）。
+# Downstream gate C (implement plus local CI): claude implements in an isolated worktree and runs the
+# project's CI and the outer-loop acceptance until everything is green. The reviewer here is deterministic CI
+# and acceptance -- there is no codex.
 gate_c:
-  max_rounds: 4              # 实现⇄CI 修复硬上限：到顶仍不绿 → GATE_C_STALLED 交 M 裁决
-  max_rounds_per_tick: 1     # CI 重，每 tick 最多 1 轮，防霸占 tick 锁
-  ci_timeout_sec: 1800       # 单次本地 CI 超时（大 Nx monorepo 偏慢）
-  claude_timeout_sec: 2400   # claude 整写代码单调用超时（缺省回退全局 1200；下游实现远重于上游审文档，给足头寸）
+  max_rounds: 4              # hard cap on the implement/CI repair loop: still not green at the cap -> GATE_C_STALLED for the maintainer
+  max_rounds_per_tick: 1     # CI is heavy, so one round per tick at most, which keeps it from monopolising the tick lock
+  ci_timeout_sec: 1800       # timeout for a single local CI run (a large Nx monorepo is on the slow side)
+  claude_timeout_sec: 2400   # timeout for one claude call that writes whole files (the global default is 1200; downstream implementation is far heavier than reviewing a document upstream, so it gets more room)
 
-# 下游闸D（PR 对抗 review + 测试补强 + merge readiness）：codex 审 diff ⇄ claude 改（CI 夹在 fix 内）。
+# Downstream gate D (adversarial PR review, test hardening and merge readiness): codex reviews the diff and
+# claude revises, with CI running inside the fix.
 gate_d:
   max_rounds: 3
   max_rounds_per_tick: 1
   ci_timeout_sec: 1800
-  claude_timeout_sec: 2400   # claude PR 级改方/补强单调用超时（缺省回退全局 1200；同属下游重调用）
+  claude_timeout_sec: 2400   # timeout for one claude call revising or hardening at the PR level (the global default is 1200; another heavy downstream call)
   harden:
-    forbid_mirror_tests: true   # 杜绝镜像测试
-    require_failure_path: true  # 必覆盖失败路径
-    require_auth_path: true     # 必覆盖权限路径
+    forbid_mirror_tests: true   # no mirror tests
+    require_failure_path: true  # the failure path has to be covered
+    require_auth_path: true     # the permission path has to be covered
 
-# 渐进自治：停泊在「纯授权停泊点」（人点一下就过、不需提供信息）的 session，daemon tick 自动替你点。**默认 0 = 全人工**。
-#   level 0  全手工（当前默认，零行为变更）
-#   level 1  自动出技术方案（CONFIRMED → 闸B；内部可逆、无外向写）
-#   level 2  自动 GO（建 issue + 发方案；外向写 + 付费承诺。auto-go 不带 --force，接受度 lint/指派不过则留人工）
-#   level 3  自动起实现（DONE → 闸C；本地 worktree + CI）
-#   level 4  自动开 PR（闸D；外向但可审）
-# **永不自动**（红线，任何等级都不破）：人工合并（AWAITING_HUMAN_MERGE）、跳确定性闸（CI 没绿）、各 *_STALLED/*_INPUT（需人裁决/答复）。
-# actor：自动动作的署名短码（须在相应权限名单里，否则动作被拒、留人工）；缺省回退 routing.lead。每个自动动作落 autonomy_auto_triggered 审计事件。
-# 可按项目覆盖：config/projects.yaml 各 entry 写 autonomy: { level, actor }（可在低风险项目先开）。
+# Graduated autonomy: for a session parked at a **purely authorising** pause point -- one where a person just
+# presses a button and supplies no information -- the daemon's tick presses it for you. **The default, 0, is
+# fully manual.**
+#   level 0  fully manual (the current default, and no change in behaviour at all)
+#   level 1  produce the technical plan automatically (CONFIRMED -> gate B; internal and reversible, with no outward write)
+#   level 2  give the go-ahead automatically (create the issues and publish the plan; an outward write and a commitment to spend. An automatic go never passes --force, so a failed acceptance lint or assignment leaves it to a human)
+#   level 3  start the implementation automatically (DONE -> gate C; a local worktree plus CI)
+#   level 4  open the PR automatically (gate D; outward, but reviewable)
+# **Never automatic** -- red lines no level breaks: the human merge (AWAITING_HUMAN_MERGE), skipping a
+# deterministic gate (CI that is not green), and any *_STALLED or *_INPUT state, which needs a person to rule
+# or to answer.
+# actor is the short code an automatic action is attributed to. It has to be on the matching allow list, or
+# the action is refused and left to a human; unset, it falls back to routing.lead. Every automatic action
+# records an autonomy_auto_triggered audit event.
+# It can be overridden per project: give an entry in config/projects.yaml its own
+# autonomy: { level, actor } -- which is a way to switch it on for a low-risk project first.
 autonomy:
   level: 0
   # actor: M
 
-# 下游机械动作委托脚本（默认项目兜底；your-monorepo 等在 config/projects.yaml 各自覆盖）。
-# 路径相对目标项目根。绝不写死 pnpm/nx/prisma —— 由目标项目脚本内部决定。默认项目(demo)暂未提供下游脚本，故注释。
+# The scripts the downstream mechanical actions delegate to. This is the default project's fallback; a project
+# such as your-monorepo overrides it in config/projects.yaml.
+# Paths are relative to the target project's root. Never hardcode pnpm, nx or prisma here -- what runs is the
+# target project's own script's business. The default project (demo) ships no downstream scripts yet, so this
+# is commented out.
 # scripts:
 #   worktree_add: ./tools/scripts/wt.sh
 #   ci: ./scripts/forge-ci.sh
@@ -73,39 +92,47 @@ autonomy:
 #   create_pr: ./scripts/forge-create-pr.sh
 #   checks: ./scripts/forge-checks.sh
 
-# 闸A/闸B 评审锚定：claude 读的是活 checkout，若本地 checkout 不在锚定的 origin/main（错分支/落后/脏树），
-# 等于对「非锚定/未上线」代码评审。warn=把偏移披露进 prompt 让模型知情后继续（默认，保可用）；block=停泊（严格）。
+# What gate A and gate B anchor their review on: claude reads the live checkout, so if that checkout is not on
+# the anchored origin/main -- wrong branch, behind, or a dirty tree -- the review is of code that is neither
+# anchored nor shipped. warn discloses the drift in the prompt so the model knows and carries on (the default,
+# which keeps it usable); block parks the session (strict).
 gates:
   checkout_anchor: warn
 
-# 立项后漂移闭环（默认关）：DONE 需求的 issue 全部关闭（实现已合并 main）后，跑一次 claude 对账
-# 「已合并实现 vs 闸B 验收契约」，发现漂移则私聊告警 M。开（enabled:true）后按 tick 节奏轮询：
-# 每条需求审计一次（终态，不复跑）；poll_every_hours 控 gh/claude 频率；max_polls 是退避封顶（issue 久未合/审计反复失败 → 放弃并告警，不无限烧 token）。
-# ⚠️ 开启=自动花钱（每条需求落地后一发 claude 对账）+ 自动私聊 M。默认关，按需开。
+# The post-filing drift loop (off by default): once every issue of a DONE requirement is closed, meaning the
+# implementation has landed on main, run claude once to reconcile the merged implementation against gate B's
+# acceptance contract, and send the maintainer a direct message if it has drifted. Switched on
+# (enabled:true), it polls on the tick's own rhythm: each requirement is audited once and never re-run;
+# poll_every_hours limits how often gh and claude are called; and max_polls caps the backoff, so an issue that
+# stays unmerged, or an audit that keeps failing, is eventually given up on with an alert rather than burning
+# tokens indefinitely.
+# Turning this on **spends money automatically** -- one claude reconciliation per requirement once it lands --
+# and sends the maintainer direct messages. Off by default; turn it on when you want it.
 drift:
   enabled: false
   poll_every_hours: 24
   max_polls: 8
 
 retry:
-  max_auto_retries: 3        # 瞬时错(claude/codex 超时·限流·网络·git fetch 抖)自动退避重试上限(30s/2min/5min)，耗尽 → 死信停泊交人
-  max_reclaims: 3            # 孤儿态(进程跑 gate 中途死)自动复位上限，耗尽 → 死信（防确定性崩溃 session 无限崩溃-重启-烧 token 环）
+  max_auto_retries: 3        # cap on automatic backoff retries for transient errors -- a claude/codex timeout, rate limiting, the network, a flaky git fetch -- at 30s, 2min and 5min. Exhausted, it parks as a dead letter for a human
+  max_reclaims: 3            # cap on automatically recovering an orphaned session, one whose process died mid-gate. Exhausted, it goes to the dead letter, which stops a deterministically crashing session from looping crash-restart-burn-tokens forever
 
-# 本机 CLI（已登录态直接用）
+# The local CLIs, used as they are once logged in.
 claude_bin: claude
 codex_bin: codex
-claude_allowed_tools: "Read,Grep,Glob,Bash"   # 闸分析只读，预批免弹窗
+claude_allowed_tools: "Read,Grep,Glob,Bash"   # gate analysis is read-only, and pre-approving these avoids a prompt
 claude_timeout_sec: 1200
 
-# 保活/健康（本地状态页 + 看门狗）。端口可被 env FORGE_HEALTH_PORT 覆盖。仅绑 127.0.0.1。
+# Liveness and health (the local status page plus the watchdog). The port can be overridden by the
+# FORGE_HEALTH_PORT environment variable. It binds to 127.0.0.1 only.
 health:
-  port: 4319                 # 本地健康服务/状态页端口（http://127.0.0.1:4319/）
-  liveness_ping_sec: 10      # 守护内 liveness ping 间隔——gate 异步不堵 event loop，这是真·判活信号
-  wedged_after_sec: 90       # liveness 超过此久没更新 → 判进程卡死
-  wedged_grace_sec: 300      # 有 gate 在跑时，卡死后再宽限这么久才强杀（避免打断 claude/codex 白烧 token）
-  probe_fail_threshold: 3    # 看门狗 /healthz 连续失败几次才动手（去抖瞬时抖动）
-  sample_interval_sec: 60    # 健康采样落库间隔（滚动历史）
-  history_retain_hours: 72   # 采样保留时长（状态页画近 72h 在线率）
-  log_rotate_mb: 20          # logs/launchd.log 超过此大小则看门狗顺手轮转
-  contract_check: true       # 每日主动探测 claude/codex/gh/飞书 输出契约（=自动花钱：codex+claude 各一发 trivial 调用，gh/飞书免费）
-  contract_interval_hours: 24 # 契约探测间隔（默认每日一次）
+  port: 4319                 # the port for the local health service and status page (http://127.0.0.1:4319/)
+  liveness_ping_sec: 10      # how often the daemon pings its own liveness -- gates run asynchronously and do not block the event loop, which makes this a genuine signal of life
+  wedged_after_sec: 90       # liveness not updated for this long -> the process is judged wedged
+  wedged_grace_sec: 300      # with a gate still running, how much longer to wait after that before killing it, so an in-flight claude or codex call is not interrupted and its tokens wasted
+  probe_fail_threshold: 3    # how many consecutive /healthz failures the watchdog needs before acting (debouncing a momentary blip)
+  sample_interval_sec: 60    # how often a health sample is written to the database, for the rolling history
+  history_retain_hours: 72   # how long samples are kept (the status page draws uptime over the last 72h)
+  log_rotate_mb: 20          # once logs/launchd.log passes this size, the watchdog rotates it in passing
+  contract_check: true       # probe the output contracts of claude, codex, gh and the IM provider once a day. This **spends money**: one trivial call each to codex and claude, while gh and the IM provider are free
+  contract_interval_hours: 24 # how often that contract probe runs (once a day by default)

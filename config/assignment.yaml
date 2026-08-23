@@ -1,15 +1,19 @@
-# 需求立项「指派」：自动指派的人选池 + 负载/WIP 口径。
-# 自动 = least-loaded + WIP limit：按每人「当前在研负载」叠加本需求规模点数，选投影最低且未超 WIP 上限者。
-# 短码与 routing.yaml reviewers 同一套（→ login 由 resolveLogin 解析）。
+# Assignment when a requirement is filed: the pool to pick from, and how load and WIP are counted.
+# Automatic assignment is least-loaded plus a WIP limit: this requirement's size points are added to each
+# person's current in-flight load, and whoever projects lowest without exceeding their WIP limit is chosen.
+# The short codes are the same set as routing.yaml's reviewers, and resolveLogin turns them into logins.
 
-# 可被自动/手动指派的 DRI 池（短码）。
+# The pool of DRIs that may be assigned, automatically or by hand (as short codes).
 pool: [M, EO, CC, DE]
 
-# 每人「在研需求」并发上限（WIP limit）：到顶则自动指派排除该人（除非全员到顶则回退全池）。
+# Each person's cap on concurrent in-flight requirements (the WIP limit). At the cap, automatic assignment
+# skips them -- unless everyone is at their cap, in which case it falls back to the whole pool.
 wip_limit:
   default: 3
-  M: 2          # M 还要带队/评审，容量更小
+  M: 2          # the maintainer also leads and reviews, so their capacity is smaller
 
-# 「当前在研」= 这些 rollup 状态的 issue（对齐 weekly-load 质量轴：4-开发中 / 5-review / 6-测试中）。
-# 7-已上线、其它（含未打 status）不计入「当前负载」——只算手上正推进的活。
+# "In flight" means an issue in one of these rollup states, matching weekly-load's quality axis:
+# 4 in development, 5 in review, 6 in testing.
+# State 7 (shipped) and anything else, including issues with no status at all, do not count towards the
+# current load -- only work actually in hand does.
 in_progress_statuses: [4, 5, 6]
