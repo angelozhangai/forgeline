@@ -9,7 +9,8 @@ function genSign(ts: string, secret: string): string {
   return createHmac('sha256', key).update('').digest('base64');
 }
 
-// 发飞书群卡片（dogfood 群的自定义机器人 webhook）。未配置 webhook 时返回 false（不报错）。
+// Post a card to a Feishu chat (the custom-bot webhook of the dogfooding chat). Returns false when no
+// webhook is configured (this is not an error).
 export async function postCard(
   title: string,
   mdLines: string[],
@@ -18,7 +19,7 @@ export async function postCard(
   const cfg = loadConfig();
   const webhook = cfg.env.FEISHU_REVIEW_WEBHOOK;
   if (!webhook) {
-    log.warn('未配置 FEISHU_REVIEW_WEBHOOK —— 跳过群卡片（结果仍写文档评论 + CLI 可见）');
+    log.warn('FEISHU_REVIEW_WEBHOOK is not configured — skipping the chat card (the result is still written as a document comment and visible in the CLI)');
     return false;
   }
   const body: Record<string, unknown> = {
@@ -43,12 +44,12 @@ export async function postCard(
     });
     const j = (await res.json().catch(() => ({}))) as { code?: number; msg?: string };
     if (j.code && j.code !== 0) {
-      log.warn(`飞书卡片返回非 0：${JSON.stringify(j)}`);
+      log.warn(`Feishu card returned a non-zero code: ${JSON.stringify(j)}`);
       return false;
     }
     return true;
   } catch (e) {
-    log.warn(`发飞书卡片失败：${String(e)}`);
+    log.warn(`Posting the Feishu card failed: ${String(e)}`);
     return false;
   }
 }

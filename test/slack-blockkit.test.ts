@@ -1,13 +1,18 @@
-// Block Kit 的**结构闸**：把「只有真工作区点一次才会现形」的那一类坑搬进 CI。
+// The Block Kit **structural gate**: moving the class of trap that "only surfaces when someone clicks
+// once in a real workspace" into CI.
 //
-// 这类坑的形态是统一的：Slack 回 `ok:false / invalid_blocks`，**不说是哪一块哪个字段**，
-// 于是人看到的只是「卡片没出现」或「按钮点了没反应」，日志里只有一行 warn。issue #14 的验收清单
-// 之所以要一个真工作区，一半就是为了照出这一类——而它们其实全是**结构**问题，本地可判。
+// These traps all have the same shape: Slack replies `ok:false / invalid_blocks` **without saying which
+// block or which field**, so what a person sees is "the card never showed up" or "the button does
+// nothing", with a single warning in the log. Half the reason issue #14's acceptance checklist wanted a
+// real workspace was to catch exactly these — and they are in fact all **structural** problems, decidable
+// locally.
 //
-// 于是这里做两件事：
-//  ① 校验器自身逐条钉死（每条规则都能真的抓到对应的违规——否则它只是一个永远返回空数组的摆设）；
-//  ② 对着「Forge 能发出的每一种卡片 / 每一种模态」跑一遍，包括**恶意内容**（边界上的 emoji、
-//     空串、超长文本）——这才是真正的验收：不是"我们写对了一次"，而是"任何一张卡都出不了这个错"。
+// So this file does two things:
+//  1. Pins the validator itself, rule by rule (each rule must genuinely catch its violation — otherwise
+//     it is just an ornament that always returns an empty array);
+//  2. Runs it against **every card and every modal Forge can emit**, including **adversarial content**
+//     (an emoji sitting on a boundary, empty strings, overlong text). That is the real acceptance: not
+//     "we got it right once" but "no card can ever produce this error".
 process.env.FORGE_DB = ':memory:';
 process.env.FORGE_FUN = '0';
 import { test } from 'node:test';
@@ -21,82 +26,83 @@ import type { CardBlock, CardModel } from '../src/messaging/model.ts';
 import type { DecisionItem } from '../src/gates/envelopes.ts';
 import type { Session } from '../src/types.ts';
 
-// ── ① 校验器自己 ────────────────────────────────────────────────────
-// 每条规则都配一个"确实违规"的载荷。少了这一层，校验器有可能永远返回空数组而没人发现。
+// -- 1. The validator itself -------------------------------------------------
+// Every rule gets a payload that genuinely violates it. Without this layer, the validator could return an
+// empty array forever and nobody would notice.
 
 const okSection = { type: 'section', text: { type: 'mrkdwn', text: 'hi' } };
 
-test('校验器：合法载荷返回空数组（不能是个只会说 OK 的摆设——下面每条都真的抓得到）', () => {
+test('validator: a valid payload returns an empty array (it must not be an ornament that only ever says OK — every case below really catches something)', () => {
   assert.deepEqual(validateBlocks([{ type: 'header', text: { type: 'plain_text', text: 't' } }, okSection, { type: 'divider' }]), []);
 });
 
-test('校验器：空文本 —— Slack 不接受空 plain_text/mrkdwn，整条载荷会被拒', () => {
+test('validator: empty text — Slack does not accept an empty plain_text/mrkdwn, and the whole payload is rejected', () => {
   const p = validateBlocks([{ type: 'section', text: { type: 'mrkdwn', text: '' } }]);
   assert.equal(p.length, 1);
-  assert.match(p[0], /text 为空/);
+  assert.match(p[0], /text is empty/);
 });
 
-test('校验器：超上限 —— 上限按字段分（header 150 / section 3000 / 按钮 75）', () => {
-  assert.match(validateBlocks([{ type: 'header', text: { type: 'plain_text', text: 'x'.repeat(151) } }])[0], /超上限（151 > 150）/);
-  assert.match(validateBlocks([{ type: 'section', text: { type: 'mrkdwn', text: 'x'.repeat(3001) } }])[0], /超上限（3001 > 3000）/);
+test('validator: over the limit — limits are per field (header 150 / section 3000 / button 75)', () => {
+  assert.match(validateBlocks([{ type: 'header', text: { type: 'plain_text', text: 'x'.repeat(151) } }])[0], /exceeds the limit \(151 > 150\)/);
+  assert.match(validateBlocks([{ type: 'section', text: { type: 'mrkdwn', text: 'x'.repeat(3001) } }])[0], /exceeds the limit \(3001 > 3000\)/);
 });
 
-test('校验器：落单的代理对 —— emoji 被从中间截断，Slack 收到非法 UTF-16 直接拒整条', () => {
-  const half = `${'x'.repeat(4)}🚀`.slice(0, 5); // 只留代理对的前一半
-  assert.match(validateBlocks([{ type: 'section', text: { type: 'mrkdwn', text: half } }])[0], /落单的代理对/);
+test('validator: a lone surrogate — an emoji cut in half means Slack receives invalid UTF-16 and rejects the whole payload', () => {
+  const half = `${'x'.repeat(4)}🚀`.slice(0, 5); // keep only the first half of the surrogate pair
+  assert.match(validateBlocks([{ type: 'section', text: { type: 'mrkdwn', text: half } }])[0], /lone surrogate/);
 });
 
-test('校验器：空的 actions.elements —— 这是"少一个按钮"想不到的后果：整条消息被拒', () => {
-  assert.match(validateBlocks([{ type: 'actions', elements: [] }])[0], /至少一个元素/);
+test('validator: an empty actions.elements — the unforeseen consequence of "one button fewer" is that the whole message is rejected', () => {
+  assert.match(validateBlocks([{ type: 'actions', elements: [] }])[0], /at least one element/);
 });
 
-test('校验器：空的 section.fields / 空 context.elements 同样非法', () => {
-  assert.match(validateBlocks([{ type: 'section', fields: [] }])[0], /为空数组/);
-  assert.match(validateBlocks([{ type: 'context', elements: [] }])[0], /elements：为空/);
+test('validator: an empty section.fields / empty context.elements are equally invalid', () => {
+  assert.match(validateBlocks([{ type: 'section', fields: [] }])[0], /empty array/);
+  assert.match(validateBlocks([{ type: 'context', elements: [] }])[0], /elements: empty/);
 });
 
-test('校验器：按钮 value 超 2000、action_id 重复、style 不是 primary/danger —— 三种都会整条被拒', () => {
+test('validator: a button value over 2000, a duplicate action_id, and a style that is not primary/danger — all three get the whole payload rejected', () => {
   const btn = (extra: Record<string, unknown>) => ({ type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: 'b' }, action_id: 'a1', ...extra }] });
-  assert.match(validateBlocks([btn({ value: 'v'.repeat(2001) })])[0], /value：超上限/);
-  assert.match(validateBlocks([btn({ style: 'default' })])[0], /只允许 primary\/danger/);
-  assert.match(validateBlocks([btn({}), btn({})]).join(''), /action_id 重复「a1」/);
+  assert.match(validateBlocks([btn({ value: 'v'.repeat(2001) })])[0], /value: exceeds the limit/);
+  assert.match(validateBlocks([btn({ style: 'default' })])[0], /only primary\/danger/);
+  assert.match(validateBlocks([btn({}), btn({})]).join(''), /duplicate action_id "a1"/);
 });
 
-test('校验器：块数上限 —— 消息 50、模态 100（超了不是"尾巴没了"，是整条被拒）', () => {
+test('validator: block count limits — 50 per message, 100 per modal (going over is not "the tail is gone" but the whole payload rejected)', () => {
   const many = Array.from({ length: 51 }, () => okSection);
-  assert.match(validateBlocks(many)[0], /块数超上限（51 > 50）/);
+  assert.match(validateBlocks(many)[0], /too many blocks \(51 > 50\)/);
   assert.deepEqual(validateBlocks(many, { max: BK_LIMIT.blocksPerView }), []);
 });
 
-test('校验器：空块列表 / 非数组 —— 认不出就如实说，绝不当成合法', () => {
-  assert.match(validateBlocks([])[0], /为空/);
-  assert.match(validateBlocks(null)[0], /不是数组/);
+test('validator: an empty block list / a non-array — say so faithfully, never treat it as valid', () => {
+  assert.match(validateBlocks([])[0], /empty/);
+  assert.match(validateBlocks(null)[0], /not an array/);
 });
 
-test('校验器：模态三件套（title/submit/close）封顶 24；private_metadata 封顶 3000', () => {
+test('validator: the modal trio (title/submit/close) caps at 24; private_metadata caps at 3000', () => {
   const view = (extra: Record<string, unknown>) => ({ type: 'modal', title: { type: 'plain_text', text: 't' }, blocks: [okSection], ...extra });
-  assert.match(validateView(view({ submit: { type: 'plain_text', text: 'x'.repeat(25) } }))[0], /view.submit：text 超上限/);
-  assert.match(validateView(view({ private_metadata: 'x'.repeat(3001) }))[0], /private_metadata：超上限/);
+  assert.match(validateView(view({ submit: { type: 'plain_text', text: 'x'.repeat(25) } }))[0], /view\.submit: text exceeds the limit/);
+  assert.match(validateView(view({ private_metadata: 'x'.repeat(3001) }))[0], /private_metadata: exceeds the limit/);
   assert.deepEqual(validateView(view({})), []);
 });
 
-test('校验器：attachments 的色条必须是 #rrggbb（Slack 不认模板色名）', () => {
-  assert.match(validateAttachments([{ color: 'red', blocks: [okSection] }])[0], /应为 #rrggbb/);
+test('validator: an attachment colour bar must be #rrggbb (Slack does not recognise template colour names)', () => {
+  assert.match(validateAttachments([{ color: 'red', blocks: [okSection] }])[0], /should be #rrggbb/);
   assert.deepEqual(validateAttachments([{ color: '#2eb886', blocks: [okSection] }]), []);
 });
 
-test('explain：结构没问题时明说"多半是权限/频道/凭据"——不要让人对着载荷白找', () => {
-  assert.match(explain([]), /多半是权限\/频道\/凭据/);
-  assert.match(explain(['a', 'b']), /结构自检：a；b/);
+test('explain: when the structure is fine it says so — "most likely permissions, the channel, or credentials" — rather than sending someone hunting through the payload', () => {
+  assert.match(explain([]), /most likely permissions, the channel, or credentials/);
+  assert.match(explain(['a', 'b']), /structural self-check: a; b/);
 });
 
-// ── ② 对着 Forge 真能发出的每一种卡片跑一遍 ──────────────────────────
+// -- 2. Run against every card Forge can really emit --------------------------
 
 function sess(p: Partial<Session> = {}): Session {
   return {
     id: 'id1',
     slug: 'finance-report',
-    title: '月度财务报表自动化',
+    title: 'Automate the monthly finance report',
     state: 'AWAITING_GO',
     branch: 'dev',
     gate_a_output_path: null,
@@ -132,35 +138,36 @@ const KINDS: NotifyKind[] = [
 
 const bad = (card: CardModel): string[] => validateAttachments(renderSlackMessage(card).attachments);
 
-test('全部私聊卡（每一种 NotifyKind）渲染出的 Block Kit 都结构合法', () => {
+test('every DM card (one per NotifyKind) renders structurally valid Block Kit', () => {
   const offenders: string[] = [];
   for (const kind of KINDS) {
-    const problems = bad(buildCard(kind, sess({ error: 'something broke' }), { stage: '闸B', error: 'boom', issues: [{ repo: 'api', number: 7, url: 'https://x/7' }], from: 'A', to: 'B' }));
-    if (problems.length) offenders.push(`${kind}: ${problems.join('；')}`);
+    const problems = bad(buildCard(kind, sess({ error: 'something broke' }), { stage: 'Gate B', error: 'boom', issues: [{ repo: 'api', number: 7, url: 'https://x/7' }], from: 'A', to: 'B' }));
+    if (problems.length) offenders.push(`${kind}: ${problems.join('; ')}`);
   }
   assert.deepEqual(offenders, []);
 });
 
-test('全部群状态卡（每一个 State）渲染出的 Block Kit 都结构合法', () => {
+test('every channel status card (one per State) renders structurally valid Block Kit', () => {
   const offenders: string[] = [];
   for (const state of STATES) {
-    const problems = bad(buildStatusCard(sess({ state }), { stage: '闸C', error: 'boom' }));
-    if (problems.length) offenders.push(`${state}: ${problems.join('；')}`);
+    const problems = bad(buildStatusCard(sess({ state }), { stage: 'Gate C', error: 'boom' }));
+    if (problems.length) offenders.push(`${state}: ${problems.join('; ')}`);
   }
   assert.deepEqual(offenders, []);
 });
 
-// 恶意内容：每一处封顶的边界上都放一个 emoji（截断点正好劈开代理对），外加空串与超长文本。
-const EDGE = (n: number): string => `${'字'.repeat(n - 1)}🚀${'尾'.repeat(50)}`;
+// Adversarial content: an emoji sitting exactly on each cap boundary (so the truncation point splits the
+// surrogate pair), plus empty strings and overlong text.
+const EDGE = (n: number): string => `${'a'.repeat(n - 1)}🚀${'z'.repeat(50)}`;
 const items = (n: number): DecisionItem[] =>
   Array.from({ length: n }, (_, i) => ({
     prompt: EDGE(BK_LIMIT.inputLabel),
     severity: 'high',
     hint: EDGE(BK_LIMIT.inputLabel),
-    options: [{ label: EDGE(BK_LIMIT.optionText), recommended: i === 0, impact: '大' }],
+    options: [{ label: EDGE(BK_LIMIT.optionText), recommended: i === 0, impact: 'large' }],
   })) as unknown as DecisionItem[];
 
-test('恶意内容：截断点正好落在 emoji 上 / 空串 / 超长——一整张卡照样结构合法', () => {
+test('adversarial content: the truncation point lands on an emoji / empty strings / overlong text — the whole card is still structurally valid', () => {
   const blocks: CardBlock[] = [
     { kind: 'text', md: EDGE(BK_LIMIT.sectionText) },
     { kind: 'text', md: '' },
@@ -174,30 +181,30 @@ test('恶意内容：截断点正好落在 emoji 上 / 空串 / 超长——一�
     { kind: 'buttonRow', buttons: [] },
     { kind: 'button', button: { text: EDGE(BK_LIMIT.buttonText), style: 'default', action: 'go', slug: 's', value: { blob: 'x'.repeat(3000) } } },
     { kind: 'decisionList', items: items(3) },
-    { kind: 'findingList', findings: [{ severity: 'high', lead: EDGE(BK_LIMIT.sectionText), notes: [{ label: '位置', text: '' }] }] },
+    { kind: 'findingList', findings: [{ severity: 'high', lead: EDGE(BK_LIMIT.sectionText), notes: [{ label: 'location', text: '' }] }] },
     { kind: 'petRow', asset: 'a', voice: '' },
     { kind: 'goForm', slug: 's', pool: [], picked: null },
   ];
   assert.deepEqual(bad({ color: 'red', title: EDGE(BK_LIMIT.headerText), subtitle: '', blocks }), []);
 });
 
-test('空标题也发得出去：header 与通知栏 text 都不能为空（空 = 整条被拒，卡片就此消失）', () => {
+test('an empty title still sends: neither the header nor the notification text may be empty (empty = the whole payload rejected, and the card simply disappears)', () => {
   const out = renderSlackMessage({ color: 'grey', title: '   ', blocks: [] });
   assert.equal(out.text, 'Forge');
   assert.deepEqual(validateAttachments(out.attachments), []);
   assert.notEqual(((out.attachments[0].blocks as Record<string, unknown>[])[0] as { text: { text: string } }).text.text, '');
 });
 
-test('按钮 value 超 2000 时只保留 {action,slug}——绝不截出一个 parse 不回来的 JSON', () => {
+test('a button value over 2000 keeps only {action,slug} — never truncate into JSON that cannot be parsed back', () => {
   const card: CardModel = { color: 'blue', title: 't', blocks: [{ kind: 'button', button: { text: 'go', style: 'primary', action: 'go', slug: 'finance-report', value: { blob: 'x'.repeat(3000) } } }] };
   const el = ((card && renderSlackMessage(card).attachments[0].blocks) as Record<string, unknown>[])[1] as { elements: { value: string }[] };
   assert.deepEqual(JSON.parse(el.elements[0].value), { action: 'go', slug: 'finance-report' });
   assert.deepEqual(bad(card), []);
 });
 
-// ── 模态 ────────────────────────────────────────────────────────────
+// -- Modals ------------------------------------------------------------------
 
-test('全部模态形态（有/无待决项、有/无整体结论、有/无 DRI 池）都是合法 view', () => {
+test('every modal shape (with/without open questions, with/without an overall verdict, with/without a DRI pool) is a valid view', () => {
   const ctx = { action: 'confirm_submit', slug: 'finance-report', round: 2, kind: 'decision' as const };
   const o = { submitText: EDGE(BK_LIMIT.viewChip), notesLabel: EDGE(BK_LIMIT.inputLabel), notesPlaceholder: EDGE(BK_LIMIT.placeholder), title: '' };
   assert.deepEqual(validateView(buildDecisionModal(ctx, { items: items(12), verdict: true, ...o })), []);

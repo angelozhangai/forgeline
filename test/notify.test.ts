@@ -136,7 +136,7 @@ test('私聊 闸B needs_gateb_input：选项展示 ★推荐 + 影响文案', ()
   ]);
   const c = json(buildCard('needs_gateb_input', sess({ state: 'AWAITING_GATE_B_INPUT', gate_b_human_asks: asks, gate_b_round: 2 } as never)));
   assert.match(c, /★/);
-  assert.match(c, /影响：合规清晰/);
+  assert.match(c, /\(impact: 合规清晰\)/); // 影响副文案的格式由 messaging adapter 决定（已英化）
   assert.match(c, /"name":"ask_H1"/);
   assert.match(c, /"round":2/);
 });
