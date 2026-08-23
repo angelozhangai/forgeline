@@ -109,3 +109,47 @@ test('决策模态：没有待决项也给得出合法 view（Slack 不接受空
   const v = buildDecisionModal(CTX, { items: [], submitText: 's', notesLabel: 'n', notesPlaceholder: 'p' });
   assert.ok((v.blocks as unknown[]).length >= 1);
 });
+
+// ── plain_text 的上限是按字段分的，超了不是截断而是**整发失败** ───────────
+// view.title/submit/close = 24；option.text/value = 75；placeholder = 150；input.label/hint = 2000。
+// 违反哪一条，views.open 都只回一个 ok:false —— 用户侧的症状是「按钮点了没反应」，
+// 日志里也只有一行 invalid_arguments。这类错只有真工作区点一次才会出现，所以在这里钉死。
+const lenOf = (t: string): number => Array.from(t).length;
+const textOf = (o: unknown): string => (o as { text: string }).text;
+
+test('模态标题/提交/取消封顶 24 字符——超了 views.open 直接 ok:false，人看到的是「按钮点了没反应」', () => {
+  const v = buildDecisionModal(CTX, { items: ITEMS, submitText: '提交决议'.repeat(10), notesLabel: 'n', notesPlaceholder: 'p', title: '这是一个非常非常非常长的模态标题'.repeat(3) });
+  assert.ok(lenOf(textOf(v.title)) <= 24, `title 超限：${textOf(v.title)}`);
+  assert.ok(lenOf(textOf(v.submit)) <= 24, `submit 超限：${textOf(v.submit)}`);
+  assert.ok(lenOf(textOf(v.close)) <= 24);
+  assert.match(textOf(v.submit), /…$/, '截断要看得出来是截断');
+});
+
+test('提交文案为空同样是 ok:false（空 plain_text 不合法）→ 退到兜底文案，绝不发一个开不出来的模态', () => {
+  const v = buildDecisionModal(CTX, { items: ITEMS, submitText: '   ', notesLabel: 'n', notesPlaceholder: 'p', title: '' });
+  assert.equal(textOf(v.submit), '提交');
+  assert.equal(textOf(v.title), '需求评审');
+});
+
+test('截断按码点走：绝不把 emoji 的代理对劈成两半（非法 UTF-16 会让整个 view 被拒）', () => {
+  const v = buildDecisionModal(CTX, { items: [], submitText: '🔴'.repeat(40), notesLabel: 'n', notesPlaceholder: 'p' });
+  const t = textOf(v.submit);
+  assert.ok(lenOf(t) <= 24);
+  assert.doesNotMatch(t, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/, '不该出现落单的代理项');
+});
+
+test('待决项 label 按 2000 封顶而不是 150——PM 不该在模态里只看见半句问题', () => {
+  const long = '为'.repeat(600);
+  const v = buildDecisionModal(CTX, { items: [{ id: 'H1', prompt: long, options: [{ label: 'a' }] }], submitText: 's', notesLabel: 'n', notesPlaceholder: 'p' });
+  const label = textOf((v.blocks as { label: unknown }[])[0].label);
+  assert.ok(lenOf(label) > 150, '150 是 placeholder 的上限，不是 label 的');
+  assert.ok(lenOf(label) <= 2000);
+});
+
+test('下拉选项 text/value 封顶 75；value 不带省略号（它要原样回喂给核心，不是给人看的）', () => {
+  const long = 'x'.repeat(200);
+  const v = buildDecisionModal(CTX, { items: [{ id: 'H1', prompt: 'p', options: [{ label: long }] }], submitText: 's', notesLabel: 'n', notesPlaceholder: 'p' });
+  const opt = (v.blocks as { element: { options: { text: unknown; value: string }[] } }[])[0].element.options[0];
+  assert.ok(lenOf(textOf(opt.text)) <= 75);
+  assert.equal(opt.value, 'x'.repeat(75));
+});
