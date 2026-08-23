@@ -65,7 +65,7 @@ test('remotePull：坏 payload（非数组）→ 抛（绝不信任外部输入�
   const a = bad.address();
   const p = typeof a === 'object' && a ? a.port : 0;
   try {
-    await assert.rejects(() => makeRemoteJobSource(`http://127.0.0.1:${p}`).claimDueJobs(100), /非数组/);
+    await assert.rejects(() => makeRemoteJobSource(`http://127.0.0.1:${p}`).claimDueJobs(100), /did not return an array/);
   } finally {
     bad.close();
   }
