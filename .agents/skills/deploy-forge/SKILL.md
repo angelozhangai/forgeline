@@ -1,6 +1,6 @@
 ---
 name: deploy-forge
-description: The canonical, source-of-truth installer for Forge on macOS. A strict step-by-step BLOCKING checklist — it halts at each prerequisite gate (Node, main repo, secrets in forge.env, Codex/codex/gh logins, Feishu developer backend) and guides the user through filling/installing it before advancing, then installs the launchd daemon + watchdog and verifies. Use whenever installing, deploying, redeploying, updating, or moving Forge to a Mac. macOS only.
+description: The canonical, source-of-truth installer for Forge on macOS. A strict step-by-step BLOCKING checklist — it halts at each prerequisite gate (Node, main repo, secrets in forge.env, claude/codex/gh logins, Feishu developer backend) and guides the user through filling/installing it before advancing, then installs the launchd daemon + watchdog and verifies. Use whenever installing, deploying, redeploying, updating, or moving Forge to a Mac. macOS only.
 ---
 
 # Deploy Forge — canonical step-by-step installer (macOS)
@@ -42,7 +42,7 @@ Tell them where each comes from (Feishu admin → the app's credentials; the gro
 ### Gate 5 — CLI logins  ⛔ BLOCKING · manual
 Each must be **installed AND authenticated**. Check and block individually:
 - **gh**: `gh auth status` → not logged in → `gh auth login` (needs your-org org access — the write scripts create issues).
-- **Codex**: the service runs `Codex -p`; confirm it's logged in. Unattended Mac mini → `Codex setup-token` and put the token in `CLAUDE_CODE_OAUTH_TOKEN` in `forge.env`.
+- **claude**: the service runs `claude -p`; confirm it's logged in. Unattended Mac mini → `claude setup-token` and put the token in `CLAUDE_CODE_OAUTH_TOKEN` in `forge.env`.
 - **codex**: confirm `codex` is authenticated (it's the adversarial reviewer).
 Re-verify with `./forge doctor` (it reports each CLI + gh login). BLOCK until all three are ✓.
 

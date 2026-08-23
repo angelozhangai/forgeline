@@ -7,10 +7,14 @@ description: The canonical, source-of-truth installer for Forge on macOS. A stri
 
 This skill is the **single source of truth** for installing Forge. Drive it as a **strict, ordered, BLOCKING checklist**: at each gate, run the check and report ✓/✗. On ✗, STOP — print the exact remediation, wait for the user to do it, then re-run the check. **Never skip a failing gate or advance past it.** **Never fill the user's secrets or run their OAuth/logins for them** — you guide, verify, and wait; they act.
 
-macOS only (launchd). Push only when the user explicitly requests it; ignored runtime assets and secrets are never pushed. These instructions are provider-agnostic: Claude Code or Codex can drive them.
+macOS only (launchd). Push only when the user explicitly requests it and only under the repository rules in `CLAUDE.md`; ignored runtime assets and secrets are never pushed. These instructions are provider-agnostic: Claude Code or Codex can drive them.
 
 ## How to drive
 Announce each gate → run its check → report ✓/✗. On ✗: give the precise command/edit, then **stop and wait** for the user to confirm done, then re-check. Only advance on ✓. The mechanical prep (gates 1–3, plus scaffolding for 4) is bundled in `./deploy/bootstrap.sh`; `./forge doctor` re-checks gates 1–6 at once and is your fastest re-verify after the user fixes something.
+
+## Moving from an existing Mac
+
+Before Gate 0, choose either development-only setup or full service takeover. For a full takeover, BLOCK until the old host's daemon and watchdog are stopped, required secrets/config are transferred outside Git, and any SQLite state comes from a verified backup. Never start the new production daemon while the old production daemon is still active.
 
 ---
 
@@ -81,5 +85,6 @@ Code changed → restart to load it: `launchctl kickstart -k gui/$(id -u)/com.fo
 
 ## Rules
 - Strict gate order; never skip a failing gate.
-- Never `git push`; never fill secrets or run the user's OAuth/logins.
+- Push only when explicitly requested; never push ignored runtime assets or secrets.
+- Never fill secrets or run the user's OAuth/logins.
 - Idempotent — safe to re-run at any gate.

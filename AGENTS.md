@@ -3,6 +3,13 @@
 > What the service is, the state machine, and usage live in [README.md](README.md). This file is the
 > single source of truth for **commit/quality discipline** (Claude Code / Codex and humans all read it;
 > `CLAUDE.md` points here — never fork a second copy that can drift).
+>
+> **One set of rules, not one per agent.** Claude Code reads `CLAUDE.md`, Codex reads this file, and each
+> reads the skills directory named for it — so anything written for one agent alone is invisible to the
+> other, and anything written for both drifts. Machine-guarded by
+> [test/agent-rules-parity.test.ts](test/agent-rules-parity.test.ts): `CLAUDE.md` must stay the one-line
+> pointer, and `.claude/skills/` and `.agents/skills/` must hold byte-identical files. Edit a skill on one
+> side and copy it to the other **in the same commit**.
 
 ## 🏠 Top rule: Forge is a generic service; mechanical actions are delegated to the "target project"
 
