@@ -21,17 +21,25 @@ interface HistItem {
   message_id?: string;
   create_time?: string;
   chat_id?: string;
+  chat_type?: string;
   sender?: { id?: string };
   body?: { content?: string };
   mentions?: { id?: { open_id?: string } }[];
 }
 let items: HistItem[] = [];
 const calls: { chatId: string; startSec: number }[] = [];
+// 会话类型查询：默认「问不出来」（null），用例各自设。记下被问了几次，好断言"一个会话只问一次"。
+let chatKind: boolean | null = null;
+const kindCalls: string[] = [];
 mock.module('../src/feishu/history.ts', {
   namedExports: {
     listMessages: async (chatId: string, startSec: number) => {
       calls.push({ chatId, startSec });
       return items;
+    },
+    chatIsGroup: async (chatId: string) => {
+      kindCalls.push(chatId);
+      return chatKind;
     },
   },
 });
@@ -112,4 +120,50 @@ test('listHistorySince：bot 身份未就绪 → null（不敢报 false）', asy
   const [m] = await feishuPort.listHistorySince('oc_x', 0);
   assert.equal(m.mentionedBot, null);
   __setBotOpenIdCacheForTest('ou_bot');
+});
+
+// ── 会话是群还是私聊：判错的后果是**离线期间的私聊需求静默消失** ────────────
+// 补拉遍历的是游标表，而游标每条入站消息都会推进，私聊自然在里面。把私聊历史当成群消息，
+// 就会撞上「群里没 @ 我」的入口闸被丢掉——而那正是补拉存在的唯一理由。
+
+test('会话类型：条目自带 chat_type=p2p → isGroup=false（私聊天然定向，不要求 @）', async () => {
+  kindCalls.length = 0;
+  chatKind = null;
+  items = [{ create_time: '1712345678', chat_type: 'p2p', body: { content: '{"text":"这份你看下"}' } }];
+  const got = await feishuPort.listHistorySince('oc_dm', 0);
+  assert.equal(got[0].isGroup, false);
+  assert.deepEqual(kindCalls, [], '条目自带就够了，不该再多一次 API 往返');
+});
+
+test('会话类型：条目自带 chat_type=group → isGroup=true', async () => {
+  kindCalls.length = 0;
+  items = [{ create_time: '1712345678', chat_type: 'group', body: { content: '{"text":"看下这个"}' } }];
+  assert.equal((await feishuPort.listHistorySince('oc_g', 0))[0].isGroup, true);
+  assert.deepEqual(kindCalls, []);
+});
+
+test('会话类型：条目不带 chat_type → 问一次会话类型；说是私聊就按私聊', async () => {
+  kindCalls.length = 0;
+  chatKind = false;
+  items = [{ create_time: '1712345678', body: { content: '{"text":"这份你看下"}' } }, { create_time: '1712345679', body: { content: '{"text":"还有这份"}' } }];
+  const got = await feishuPort.listHistorySince('oc_dm', 0);
+  assert.deepEqual(got.map((m) => m.isGroup), [false, false]);
+  assert.deepEqual(kindCalls, ['oc_dm'], '一次 listHistorySince 只问一次，不是每条消息问一次');
+});
+
+test('会话类型：问不出来（没权限/网络挂了）→ 兜底当群，维持今天的行为，不反向多花钱', async () => {
+  kindCalls.length = 0;
+  chatKind = null; // chatIsGroup 内部已经出过一条 warn，这里不是静默
+  items = [{ create_time: '1712345678', body: { content: '{"text":"看下这个"}' } }];
+  assert.equal((await feishuPort.listHistorySince('oc_unknown', 0))[0].isGroup, true);
+  assert.deepEqual(kindCalls, ['oc_unknown']);
+});
+
+test('会话类型：只要有一条带 chat_type 就按它算（历史条目里混着带与不带的）', async () => {
+  kindCalls.length = 0;
+  chatKind = true; // 若真去问会答"群"，用来证明确实没问
+  items = [{ create_time: '1712345678', body: { content: '{"text":"a"}' } }, { create_time: '1712345679', chat_type: 'p2p', body: { content: '{"text":"b"}' } }];
+  const got = await feishuPort.listHistorySince('oc_dm', 0);
+  assert.deepEqual(got.map((m) => m.isGroup), [false, false]);
+  assert.deepEqual(kindCalls, []);
 });
