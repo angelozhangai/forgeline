@@ -129,6 +129,33 @@ Red never gets committed.**
   reason. If the runner ever hangs instead, that's the leak this flag was hiding — find the open handle;
   a loud hang beats a silent green.
 
+## 🔤 Top rule: English is the only language in this repository
+
+**Everything tracked here is written in English — and so is everything written *about* it.** Code,
+comments, identifiers, commit messages, PR titles and bodies, issues and issue comments, docs, config
+comments, and every string the service emits.
+
+This is not a style preference. Forgeline is an **open core** whose entire premise is that downstream
+integrators build against [src/ext/port.ts](src/ext/port.ts) and
+[src/messaging/port.ts](src/messaging/port.ts) without ever patching a core file. A contract a reader
+cannot read is not a contract — and a repo that is half one language reads as an internal tool someone
+dumped in public, which is worse than either language chosen consistently.
+
+**The line that matters: source is English, input is not.** Requirement documents arriving over Feishu
+or Slack are *data*. Forge must keep handling a PRD written in any language exactly as well as it does
+today — nothing in this rule may push language assumptions into parsing, sizing, or the gates.
+`logs/` and `state/` are full of non-English requirement text and are untracked, which is why the guard
+scopes itself to `git ls-files` rather than the working tree.
+
+- Machine-guarded by [test/english-only.test.ts](test/english-only.test.ts): any tracked file carrying
+  CJK, kana or hangul turns CI red, naming the exact `file:line`. Emoji are deliberately allowed —
+  the status labels in [src/util/display.ts](src/util/display.ts) rely on them.
+- The guard's own fixtures are built from code points rather than written as literal characters, so it
+  holds itself to the rule. A guard that has to exempt itself is not a guard.
+- Non-English **input** belongs in tests as escapes or generated strings, never as literal source text.
+- New contributors see the rule at the point of contribution: [CONTRIBUTING.md](CONTRIBUTING.md) and the
+  issue/PR templates in [.github/](.github/).
+
 ## Commands
 
 | Command | Purpose |
