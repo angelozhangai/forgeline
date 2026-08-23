@@ -47,7 +47,7 @@ test('parseStoredRef：无前缀 / 空 source / 空 token → null（绝不猜�
 test('readDoc：未注册的源 → 如实报错并列出已注册源（不静默当读失败）', async () => {
   const r = await docs.readDoc({ source: 'notion', token: 'p1' });
   assert.equal(r.ok, false);
-  assert.match(r.error ?? '', /未注册的文档源/);
+  assert.match(r.error ?? '', /Unregistered document source/);
   assert.match(r.error ?? '', /feishu/);
 });
 

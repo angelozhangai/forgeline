@@ -1,9 +1,11 @@
-// 文档层薄缝——**注册表与唯一接线处**。核心（intake / gates / actions / listen / backfill）
-// 只 import 本文件，永不直接依赖某个具体文档源。
+// Thin document-layer seam — **the registry and the single wiring point**. The core (intake / gates /
+// actions / listen / backfill) imports only this file and never depends on a concrete document source.
 //
-// 为什么是注册表而不是「选择点」（对比 messaging/index.ts 的 `port`）：一套部署只能有一个 IM
-// （否则审批轨迹分叉），但同一条消息里完全可能同时贴飞书文档和别的源的链接——文档源天然是**多个并存**，
-// 靠内容寻址（谁认得出就归谁）而不是靠配置选一个。
+// Why a registry rather than a "selection point" (contrast `port` in messaging/index.ts): a deployment
+// can have only one IM (otherwise the approval trail forks), but one message may perfectly well carry
+// both a Feishu document and a link from another source — document sources naturally **coexist**, and
+// are resolved by content addressing (whoever recognises it owns it) rather than by picking one in
+// config.
 import { extDocSources } from '../ext/index.ts';
 import { log } from '../util/log.ts';
 import { feishuDocs } from './feishu.ts';
@@ -13,40 +15,48 @@ import { formatRef, parseStoredRef, type DocClaimInput, type DocReadResult, type
 export { formatRef, parseStoredRef };
 export type { DocRef, DocReadResult, DocSource, DocClaimInput } from './port.ts';
 
-// **核心自带**的文档源。加一个源 = 在这里加一行（外加它自己的 docs/<id>.ts），核心其余部分一行不动。
-// plaintext 是**兜底源**（fallback:true）且默认关——它排在最后只是可读性，真正决定顺位的是那个标志位。
+// The document sources the **core ships**. Adding one = one line here (plus its own docs/<id>.ts);
+// nothing else in the core changes.
+// plaintext is the **fallback source** (fallback:true) and is off by default — its position last is
+// only for readability, the flag is what actually determines precedence.
 const CORE: DocSource[] = [feishuDocs, plaintextDocs];
 
-// 下游扩展包也能注册文档源（ExtensionPack.docSources）。这里能做而 messaging 那侧做不到，
-// 差别在**时序**：messaging 的选择点在模块加载期同步求值，接不上异步装入的扩展包；
-// 而这张表是每次调用现查的（claimDocs / sourceById / readDoc 都在消息到达时才读它），
-// 所以只要扩展包在第一条消息之前装好，追加就是安全的。见 src/ext/port.ts 的「非目标」。
+// Downstream extension packs can register document sources too (ExtensionPack.docSources). This is
+// possible here while it is not on the messaging side, and the difference is **timing**: the messaging
+// selection point is evaluated synchronously at module load and cannot reach an asynchronously loaded
+// extension pack, whereas this table is consulted on every call (claimDocs / sourceById / readDoc all
+// read it when a message arrives), so appending is safe as long as the pack is loaded before the first
+// message. See "Non-goals" in src/ext/port.ts.
 //
-// 合并规则本身是纯函数，好让下面那几条（核心优先、兜底顺位）能被真正单测。
+// The merge rule itself is a pure function, so the rules below (core wins, fallback ordering) can
+// actually be unit-tested.
 export function mergeSources(core: DocSource[], extra: DocSource[]): DocSource[] {
   const out = [...core];
   const taken = new Set(core.map((s) => s.id));
   for (const s of extra) {
-    // **核心源永远优先**——同「核心命令永远优先」那条。下游没法把飞书源换掉，
-    // 否则一个 id 打错的扩展就能悄悄接管所有文档解析，而症状只是「读出来的正文不对」。
+    // **Core sources always win** — the same rule as "core commands always win". Downstream cannot
+    // replace the Feishu source; otherwise a single mistyped id in an extension could quietly take
+    // over all document parsing, with no symptom beyond "the body it read is wrong".
     if (taken.has(s.id)) {
-      log.warn(`扩展文档源「${s.id}」与核心源同名 → 忽略扩展那份（核心永远优先）`);
+      log.warn(`Extension document source "${s.id}" collides with a core source -> ignoring the extension's copy (core always wins)`);
       continue;
     }
     taken.add(s.id);
     out.push(s);
   }
-  // 兜底源按**顺序**定先后，而核心排在前面 → plaintext 开着时它赢。两个兜底源同时活着是配置冲突，
-  // 说出来（一次），别让人对着「为什么我的兜底源没上场」猜。
+  // Fallback sources are ordered by **position**, with core first -> plaintext wins when it is on.
+  // Two live fallback sources is a configuration conflict: say so (once), rather than leaving someone
+  // to guess why their fallback source never got a turn.
   const fallbacks = out.filter((s) => s.fallback).map((s) => s.id);
   if (fallbacks.length > 1) {
-    log.warn(`注册了多个兜底文档源（${fallbacks.join('、')}）→ 按注册顺序取第一个认领成功的，核心源在前`);
+    log.warn(`Multiple fallback document sources registered (${fallbacks.join(', ')}) -> the first one that claims wins, in registration order, core first`);
   }
   return out;
 }
 
-// 合并结果按「当前装载的扩展包」记忆：扩展包一个进程只装一次，所以这就是一次性开销，
-// 也让上面那两条 warn 每装一次只出一遍，而不是每来一条消息刷一次。
+// The merged result is memoised against "the currently loaded extension pack": a pack loads once per
+// process, so this is a one-off cost, and it also means the two warnings above are emitted once per
+// load rather than on every incoming message.
 let memoKey: DocSource[] | null = null;
 let memo: DocSource[] = CORE;
 
@@ -63,10 +73,14 @@ export function sourceById(id: string): DocSource | null {
   return sources().find((s) => s.id === id) ?? null;
 }
 
-// 认领一条消息里的需求文档 —— **规则本身**（纯函数，对任意源列表成立）。
-// 非兜底源取**并集**（一条消息里贴了两个源的链接，两份都该进）；一个都没认领时才轮到兜底源，
-// 且**最多取一条**（兜底源认的是「正文本身就是需求」这类，多取只会把同一段话拆成好几个需求）。
-// fallback 是标志位而非数组位置——位置太脆，一重排就会让兜底源把别人的链接全吞了。
+// Claim the requirement documents in a message — **the rule itself** (a pure function, valid for any
+// list of sources).
+// Non-fallback sources contribute a **union** (a message carrying links from two sources should bring
+// in both); only when nothing was claimed does a fallback source get a turn, and then **at most one
+// entry** (a fallback source claims things like "the body itself is the requirement", and taking more
+// would only split one paragraph into several requirements).
+// `fallback` is a flag rather than an array position — position is too fragile, and one reorder would
+// have the fallback source swallowing everyone else's links.
 export function resolveClaims(list: DocSource[], input: DocClaimInput): DocRef[] {
   const primary: DocRef[] = [];
   const seen = new Set<string>();
@@ -74,7 +88,7 @@ export function resolveClaims(list: DocSource[], input: DocClaimInput): DocRef[]
     if (s.fallback) continue;
     for (const ref of s.claim(input)) {
       const key = formatRef(ref);
-      if (seen.has(key)) continue; // 同一份文档被同源多次认领（正文 + 兜底块都出现）→ 只留一份
+      if (seen.has(key)) continue; // same document claimed twice by the same source (body + fallback block) -> keep one
       seen.add(key);
       primary.push(ref);
     }
@@ -88,8 +102,10 @@ export function resolveClaims(list: DocSource[], input: DocClaimInput): DocRef[]
   return [];
 }
 
-// 把一个链接/裸 token 解析成 DocRef —— **规则本身**。非兜底源先问，都不认再问兜底源。
-// 谁都不认 → null，由调用方**显式报错**（绝不猜一个源出来，猜错就是把需求登记到读不出正文的源上）。
+// Parse a link or bare token into a DocRef — **the rule itself**. Non-fallback sources are asked
+// first; only if none recognise it are the fallback sources asked.
+// Nobody recognises it -> null, and the caller **reports that explicitly** (never guess a source: a
+// wrong guess registers the requirement against a source whose body cannot be read).
 export function resolveRef(list: DocSource[], urlOrToken: string): DocRef | null {
   for (const s of list) {
     if (s.fallback) continue;
@@ -104,8 +120,10 @@ export function resolveRef(list: DocSource[], urlOrToken: string): DocRef | null
   return null;
 }
 
-// 上面两条规则**接到真实注册表上**。规则与接线分开，是为了让「多源怎么解析」能被真正单测——
-// 否则测试只能对着唯一一个已注册源自说自话，或者复制一份规则来测（那测的是副本，不是实现）。
+// The two rules above, **wired to the real registry**. Rules and wiring are separated so that "how
+// multi-source resolution works" can genuinely be unit-tested — otherwise a test could only talk to
+// itself against the single registered source, or would have to duplicate the rules (which tests the
+// copy, not the implementation).
 export function claimDocs(input: DocClaimInput): DocRef[] {
   return resolveClaims(sources(), input);
 }
@@ -114,36 +132,41 @@ export function parseAnyRef(urlOrToken: string): DocRef | null {
   return resolveRef(sources(), urlOrToken);
 }
 
-// 已注册源的 id 列表（报错文案用：告诉人「现在认得哪些源」，而不是干巴巴一句无法识别）。
+// The ids of registered sources (used in error text: tell the reader which sources are recognised
+// right now, rather than a bare "unrecognised").
 export function registeredIds(): string[] {
   return sources().map((s) => s.id);
 }
 
-// 读正文。未注册的源 → **如实报错**，绝不静默当成读失败或空文档（库里存着一个没人认领的 ref，
-// 通常意味着配置被改小了/源被摘掉了，这必须看得见）。
+// Read the body. An unregistered source is **reported faithfully** and never silently turned into a
+// read failure or an empty document (a stored ref that nobody claims usually means config was
+// narrowed or a source was removed, and that has to be visible).
 export async function readDoc(ref: DocRef): Promise<DocReadResult> {
   const s = sourceById(ref.source);
-  if (!s) return { ok: false, text: '', error: `未注册的文档源「${ref.source}」（已注册：${registeredIds().join('/') || '无'}）` };
+  if (!s) {
+    return { ok: false, text: '', error: `Unregistered document source "${ref.source}" (registered: ${registeredIds().join('/') || 'none'})` };
+  }
   return s.read(ref);
 }
 
-// 回写批注（best-effort，绝不阻断闸）。三种结局分得很清楚：
-//  · 源不支持回写（没有 comment 方法）= 能力缺口，静默跳过——回写从来就只是锦上添花；
-//  · 源支持但这次失败 = **记日志**（失败不静默）；
-//  · 库里的 ref 解析不出 / 源没注册 = 记日志。
+// Write a comment back (best-effort, never blocks a gate). The three outcomes are kept distinct:
+//  · the source does not support write-back (no comment method) = a capability gap, silently skipped —
+//    write-back was always a nice-to-have;
+//  · the source supports it but this call failed = **logged** (a failure is never silent);
+//  · the stored ref does not parse / the source is not registered = logged.
 export async function commentDoc(storedRef: string | null | undefined, text: string): Promise<void> {
   const ref = parseStoredRef(storedRef);
-  if (!ref) return; // 没有文档来源（手动 add / standalone issue）→ 本就无处可写
+  if (!ref) return; // no document origin (manual add / standalone issue) -> there was never anywhere to write
   const s = sourceById(ref.source);
   if (!s) {
-    log.warn(`文档批注跳过：未注册的文档源「${ref.source}」`);
+    log.warn(`Document comment skipped: unregistered document source "${ref.source}"`);
     return;
   }
-  if (!s.comment) return; // 能力缺口：该源不支持回写
+  if (!s.comment) return; // capability gap: this source does not support write-back
   try {
     const r = await s.comment(ref, text);
-    if (!r.ok) log.warn(`文档批注失败（${ref.source}）：${(r.error ?? '').slice(0, 200)}`);
+    if (!r.ok) log.warn(`Document comment failed (${ref.source}): ${(r.error ?? '').slice(0, 200)}`);
   } catch (e) {
-    log.warn(`文档批注异常（${ref.source}）：${String(e).slice(0, 200)}`);
+    log.warn(`Document comment threw (${ref.source}): ${String(e).slice(0, 200)}`);
   }
 }

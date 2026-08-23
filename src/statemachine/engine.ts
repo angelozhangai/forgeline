@@ -1,64 +1,81 @@
 import type { State } from './states.ts';
 
-// 合法转移表。自转移（from===to）放行，便于 ADVERSARIAL_LOOP 循环与幂等 patch。
+// The legal transition table. Self-transitions (from === to) are allowed, which is what lets
+// ADVERSARIAL_LOOP loop and makes patches idempotent.
 const ALLOWED: Record<State, State[]> = {
   INTAKE: ['GATE_A_RUNNING', 'GATE_A_FAILED'],
-  // 闸A 首轮或复评跑完后：还有问题→等 PM；无剩余→进 codex 对抗复审；到上限→停泊裁决；失败→停泊。
-  // （CONFIRMED 保留：M 在 AWAITING_PM_CONFIRM/STALLED 强制结束的目的态，FSM 层放行。）
+  // After Gate A's first round or a re-review: questions remain -> wait for the PM; nothing left ->
+  // go to the codex adversarial pass; cap reached -> park for arbitration; failure -> park.
+  // (CONFIRMED is kept: it is the target when the maintainer forces an end from
+  // AWAITING_PM_CONFIRM/STALLED, and the FSM layer allows it.)
   GATE_A_RUNNING: ['AWAITING_PM_CONFIRM', 'GATE_A_ADVERSARIAL', 'CONFIRMED', 'GATE_A_STALLED', 'GATE_A_FAILED'],
-  // PM 答复→进复评点；CONFIRMED 留给 M 强制结束。
+  // The PM answered -> go to the re-review point; CONFIRMED is reserved for the maintainer forcing an end.
   AWAITING_PM_CONFIRM: ['GATE_A_REVISION_REQUESTED', 'CONFIRMED'],
   GATE_A_REVISION_REQUESTED: ['GATE_A_RUNNING', 'GATE_A_FAILED'],
-  // 闸A 对抗：codex LGTM 且无新开放问题→确认；对抗补出 PM 未答的漏问→弹回 PM 答复；到上限→停泊裁决；
-  // 每-tick 上限→自转移续跑；失败→停泊。不升级人在环（PRD 拿不准走 PM loop）。
+  // Gate A adversarial: codex says LGTM with no new open questions -> confirm; the adversarial pass
+  // surfaced a question the PM never answered -> bounce back to the PM; cap reached -> park for
+  // arbitration; per-tick cap -> self-transition to continue; failure -> park.
+  // It never escalates to a human in the loop (an uncertain PRD goes through the PM loop).
   GATE_A_ADVERSARIAL: ['GATE_A_ADVERSARIAL', 'AWAITING_PM_CONFIRM', 'CONFIRMED', 'GATE_A_STALLED', 'GATE_A_FAILED'],
-  // M 裁决：强制通过 / 补输入再跑一轮。
+  // Maintainer arbitration: force it through, or supply input and run another round.
   GATE_A_STALLED: ['CONFIRMED', 'GATE_A_REVISION_REQUESTED'],
   CONFIRMED: ['GATE_B_REQUESTED'],
   GATE_B_REQUESTED: ['GATE_B_RUNNING', 'GATE_B_FAILED'],
   GATE_B_RUNNING: ['ADVERSARIAL_LOOP', 'GATE_B_FAILED'],
-  // 对抗循环：clean→GO；claude 升级→等 M 答复；到上限→停泊裁决；每-tick 上限→自转移续跑；失败→停泊。
+  // Adversarial loop: clean -> GO; claude escalated -> await the maintainer; cap reached -> park for
+  // arbitration; per-tick cap -> self-transition to continue; failure -> park.
   ADVERSARIAL_LOOP: ['ADVERSARIAL_LOOP', 'AWAITING_GO', 'AWAITING_GATE_B_INPUT', 'GATE_B_STALLED', 'GATE_B_FAILED'],
-  // M 答复升级问题 → 进续修点。
+  // The maintainer answered the escalated questions -> go to the resume point.
   AWAITING_GATE_B_INPUT: ['GATE_B_REVISION_REQUESTED'],
-  // M 答复后 resume 续修 → 回循环态再评；失败→停泊。
+  // Resume after the maintainer answered -> back into the loop for another review; failure -> park.
   GATE_B_REVISION_REQUESTED: ['ADVERSARIAL_LOOP', 'GATE_B_FAILED'],
-  // M 裁决：强制立项 / 再修一轮。
+  // Maintainer arbitration: force the requirement through, or one more revision.
   GATE_B_STALLED: ['AWAITING_GO', 'GATE_B_REVISION_REQUESTED'],
   AWAITING_GO: ['WRITING', 'GO_DENIED'],
   WRITING: ['DONE', 'WRITE_FAILED'],
-  // 下游入口：issue 已建后由带权限的 forge implement 触发闸C（standalone 裸 issue 直接置 GATE_C_REQUESTED）。
+  // Downstream entry point: once the issues exist, an authorised `forge implement` triggers Gate C
+  // (a standalone bare issue is set straight to GATE_C_REQUESTED).
   DONE: ['GATE_C_REQUESTED'],
-  // ── 下游闸C：实现 + 本地CI ──
+  // -- Downstream Gate C: implementation + local CI --
   GATE_C_REQUESTED: ['GATE_C_RUNNING', 'GATE_C_FAILED'],
   GATE_C_RUNNING: ['GATE_C_LOOP', 'GATE_C_FAILED'],
-  // 实现⇄CI 循环：绿→等开PR；升级→等 M 答复；到上限→停泊裁决；每-tick 上限→自转移续跑；失败→停泊。
+  // Implement/CI loop: green -> await the PR; escalated -> await the maintainer; cap reached -> park
+  // for arbitration; per-tick cap -> self-transition to continue; failure -> park.
   GATE_C_LOOP: ['GATE_C_LOOP', 'AWAITING_GATE_D', 'AWAITING_GATE_C_INPUT', 'GATE_C_STALLED', 'GATE_C_FAILED'],
   AWAITING_GATE_C_INPUT: ['GATE_C_REVISION_REQUESTED'],
   GATE_C_REVISION_REQUESTED: ['GATE_C_LOOP', 'GATE_C_FAILED'],
-  // M 裁决：只能给输入再修一轮——**绝不能跳到 AWAITING_GATE_D**。闸C 的 stall = 确定性 CI/验收未绿，
-  // 红线#3「确定性闸永不可人工跳过」在此落地：CI 没绿就不许进开 PR（区别于闸D stall 是主观分歧、且 CI 已绿，故闸D 可放行）。
+  // Maintainer arbitration: input plus one more revision, and nothing else — **it may never jump to
+  // AWAITING_GATE_D**. A Gate C stall means a deterministic CI/acceptance check is not green, and this
+  // is where red line #3 ("a deterministic gate is never manually skippable") lands: a red CI does not
+  // get to open a PR. (Contrast a Gate D stall, which is a subjective disagreement with CI already
+  // green, and may therefore be forced forward.)
   GATE_C_STALLED: ['GATE_C_REVISION_REQUESTED'],
-  // ── 下游闸D：PR 对抗 review + 测试补强 + merge readiness ──
+  // -- Downstream Gate D: adversarial PR review + test hardening + merge readiness --
   AWAITING_GATE_D: ['GATE_D_REQUESTED'],
   GATE_D_REQUESTED: ['GATE_D_LOOP', 'GATE_D_FAILED'],
-  // 对抗循环：LGTM→补内环测试；升级→等 M 答复；到上限→停泊裁决；每-tick 上限→自转移续跑；失败→停泊。
+  // Adversarial loop: LGTM -> add inner-loop tests; escalated -> await the maintainer; cap reached ->
+  // park for arbitration; per-tick cap -> self-transition to continue; failure -> park.
   GATE_D_LOOP: ['GATE_D_LOOP', 'GATE_D_HARDENING', 'AWAITING_GATE_D_INPUT', 'GATE_D_STALLED', 'GATE_D_FAILED'],
   AWAITING_GATE_D_INPUT: ['GATE_D_REVISION_REQUESTED'],
   GATE_D_REVISION_REQUESTED: ['GATE_D_LOOP', 'GATE_D_FAILED'],
-  // 单仓/最后一条 leg 补强完 → 合并就绪；多仓还有未审 leg → 切下一条 leg 回 GATE_D_LOOP 复审（逐仓一树一PR，
-  // 全部 leg 补强完才 AWAITING_HUMAN_MERGE，见 worker.runGateDHardenStep + legs.planGateDAdvance）。
+  // Single repo, or the last leg hardened -> ready to merge; multiple repos with legs still unreviewed
+  // -> switch to the next leg and go back to GATE_D_LOOP (one tree and one PR per repo; only once
+  // every leg is hardened does it reach AWAITING_HUMAN_MERGE — see worker.runGateDHardenStep and
+  // legs.planGateDAdvance).
   GATE_D_HARDENING: ['AWAITING_HUMAN_MERGE', 'GATE_D_LOOP', 'GATE_D_FAILED'],
-  // M 裁决：强制前进到合并就绪 / 再修一轮。
+  // Maintainer arbitration: force forward to merge-ready, or one more revision.
   GATE_D_STALLED: ['AWAITING_HUMAN_MERGE', 'GATE_D_REVISION_REQUESTED'],
-  // 人工合并后确认；或要求再改 → 回续修点。
+  // Confirmed after a human merge; or more changes requested -> back to the resume point.
   AWAITING_HUMAN_MERGE: ['SHIPPED', 'GATE_D_REVISION_REQUESTED'],
   SHIPPED: [],
-  // retry / 孤儿复位：首轮失败回 INTAKE；复评失败回复评点；对抗失败原地续跑（不丢已累计的 PM 轮次）。
+  // retry / orphan recovery: a first-round failure goes back to INTAKE; a re-review failure back to
+  // the re-review point; an adversarial failure resumes in place (without losing the PM rounds
+  // already accumulated).
   GATE_A_FAILED: ['GATE_A_RUNNING', 'INTAKE', 'GATE_A_REVISION_REQUESTED', 'GATE_A_ADVERSARIAL'],
-  // retry / 孤儿复位：无初稿→干净重跑；有初稿→原地复位续跑（ADVERSARIAL_LOOP / 续修点，不丢轮次）。
+  // retry / orphan recovery: no draft yet -> a clean rerun; a draft exists -> resume in place
+  // (ADVERSARIAL_LOOP / the resume point, without losing rounds).
   GATE_B_FAILED: ['GATE_B_RUNNING', 'GATE_B_REQUESTED', 'ADVERSARIAL_LOOP', 'GATE_B_REVISION_REQUESTED'],
-  // retry / 孤儿复位：原地复位续跑（建树/实现/续做点）。
+  // retry / orphan recovery: resume in place (worktree creation / implementation / the resume point).
   GATE_C_FAILED: ['GATE_C_REQUESTED', 'GATE_C_RUNNING', 'GATE_C_LOOP', 'GATE_C_REVISION_REQUESTED'],
   GATE_D_FAILED: ['GATE_D_REQUESTED', 'GATE_D_LOOP', 'GATE_D_REVISION_REQUESTED', 'GATE_D_HARDENING'],
   GO_DENIED: ['AWAITING_GO'],
