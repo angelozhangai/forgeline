@@ -168,7 +168,7 @@ test('陌生人点击强制通过：不推进 CONFIRMED，留审计，并给失�
   assert.equal((await sessions.get(slug))!.state, 'GATE_A_STALLED');
   assert.ok((await sessions.events(slug)).some((e) => e.kind === 'permission_denied' && (e.detail ?? '').includes('confirm')));
   assert.equal(notifyCalls.length, 0, '越权强制通过不应发 needs_gateb，让团队误以为已确认');
-  assert.match(dmTexts.at(-1)?.lines.join('\n') ?? '', /无确认权限/);
+  assert.match(dmTexts.at(-1)?.lines.join('\n') ?? '', /may not confirm/);
 });
 
 test('授权 M 点击强制通过：真实卡片链路推进 CONFIRMED 并通知出闸B', async () => {
@@ -200,7 +200,7 @@ test('BD 可出技术方案但不能 GO：同一真实点击人在不同产品�
 
   assert.equal((await sessions.get(goSlug))!.state, 'AWAITING_GO');
   assert.ok((await sessions.events(goSlug)).some((e) => e.kind === 'permission_denied' && (e.detail ?? '').includes('go')));
-  assert.match(dmTexts.at(-1)?.lines.join('\n') ?? '', /无 GO 权限/);
+  assert.match(dmTexts.at(-1)?.lines.join('\n') ?? '', /may not GO/);
 });
 
 test('项目级 operators（配置分化·Blocker）：acme 卡 ou_xw→EO 过 acme 自己的 gate_b_allowed；map 合并保留的全局 ou_m→M 不在 acme 名单被拒', async () => {
@@ -231,7 +231,7 @@ test('陌生人点击打回：不进入 GO_DENIED；授权 M 点击才真正打�
 
   assert.equal((await sessions.get(strangerSlug))!.state, 'AWAITING_GO');
   assert.ok((await sessions.events(strangerSlug)).some((e) => e.kind === 'permission_denied' && (e.detail ?? '').includes('deny')));
-  assert.match(dmTexts.at(-1)?.lines.join('\n') ?? '', /无打回权限/);
+  assert.match(dmTexts.at(-1)?.lines.join('\n') ?? '', /may not send it back/);
 
   reset();
   const mSlug = await sessionAt('AWAITING_GO');
@@ -239,5 +239,5 @@ test('陌生人点击打回：不进入 GO_DENIED；授权 M 点击才真正打�
 
   assert.equal((await sessions.get(mSlug))!.state, 'GO_DENIED');
   assert.ok((await sessions.events(mSlug)).some((e) => e.kind === 'go_denied'));
-  assert.match(dmTexts.at(-1)?.lines.join('\n') ?? '', /已打回/);
+  assert.match(dmTexts.at(-1)?.lines.join('\n') ?? '', /sent back/);
 });

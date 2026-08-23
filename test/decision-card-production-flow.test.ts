@@ -144,17 +144,17 @@ test('PM 只点逐条下拉：复评输入和 PRD 留痕都保留第 6-8 条业�
   assert.match(s.gate_a_pending_input ?? '', /H1 \(第1个业务决定？\): 推荐答案1/);
   assert.match(s.gate_a_pending_input ?? '', /H6 \(第6个业务决定？\): 推荐答案6/);
   assert.match(s.gate_a_pending_input ?? '', /H8 \(第8个业务决定？\): 备选答案8/);
-  assert.match(s.confirmed_notes ?? '', /第2轮答复/);
+  assert.match(s.confirmed_notes ?? '', /\[round 2 answers\]/);
   assert.match(s.confirmed_notes ?? '', /备选答案8/);
   assert.equal(tickCalls, 1);
 
   assert.equal(comments.length, 1);
   assert.equal(comments[0].token, `doc-${id}`);
-  assert.match(comments[0].text, /【PM确认 · 第2轮】/);
-  assert.match(comments[0].text, /选择：采纳建议，确认通过/);
-  assert.match(comments[0].text, /批注：H1 \(第1个业务决定？\): 推荐答案1/);
+  assert.match(comments[0].text, /\[Product confirmed · round 2\]/);
+  assert.match(comments[0].text, /Choice: suggestions accepted, confirmed/);
+  assert.match(comments[0].text, /Notes: H1 \(\u7b2c1\u4e2a\u4e1a\u52a1\u51b3\u5b9a\uff1f\): \u63a8\u8350\u7b54\u68481/);
   assert.match(comments[0].text, /H8 \(第8个业务决定？\): 备选答案8/);
-  assert.doesNotMatch(comments[0].text, /批注：（无）/);
+  assert.doesNotMatch(comments[0].text, /Notes: \(none\)/);
 });
 
 test('PM 选其他但未补充：不会伪造选项答案，复评明确收到部分采纳', async () => {
@@ -176,7 +176,7 @@ test('PM 选其他但未补充：不会伪造选项答案，复评明确收到�
   assert.equal(s.gate_a_pending_input, 'Partially accepted');
   assert.match(s.confirmed_notes ?? '', /Partially accepted/);
   assert.equal(comments.length, 1);
-  assert.match(comments[0].text, /选择：部分采纳/);
-  assert.match(comments[0].text, /批注：（无）/);
+  assert.match(comments[0].text, /Choice: partially accepted/);
+  assert.match(comments[0].text, /Notes: \(none\)/);
   assert.equal(tickCalls, 1);
 });

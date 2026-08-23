@@ -140,7 +140,7 @@ test('createEpic：任一子 issue 建失败 → ok=false + stderr 点名（失�
   });
   const r = await paEpic.createEpic('feat-x', 'E', [{ repo: 'C', title: 'c' }, { repo: 'U', title: 'u' }], {});
   assert.equal(r.ok, false, '任一子 issue 失败 → 整体 ok=false（doWrites 据此 WRITE_FAILED）');
-  assert.match(r.stderr, /子\(web\)/);
+  assert.match(r.stderr, /child\(web\)/);
 });
 
 test('createEpic dryRun：零 gh 调用，预演伞仓+各子仓', async () => {

@@ -21,7 +21,7 @@ test('./forge eval --fixture 不存在：非 0 退出，且不打印付费调用
   });
 
   assert.equal(r.status, 1, r.stderr);
-  assert.match(r.stdout, /找不到 fixture：definitely-not-a-fixture/);
+  assert.match(r.stdout, /no such fixture: definitely-not-a-fixture/);
   assert.doesNotMatch(`${r.stdout}\n${r.stderr}`, /真实调用 claude|逐个真评审/);
 });
 
@@ -80,7 +80,7 @@ process.stdin.on('end', () => {
 
   assert.equal(r.status, 1, r.stderr);
   assert.equal(Number(readFileSync(state, 'utf8')), 4, '1 个闸B fixture × 2 runs，且每次多 1 发 acceptance judge');
-  assert.match(r.stdout, /1 个 fixture（含 1 个带 acceptance-judge，各多一发） × 2 次 = 4 发 claude/);
+  assert.match(r.stdout, /1 fixture\(s\) \(1 of them with an acceptance-judge, each costing one extra call\) x 2 run\(s\) = 4 claude calls/);
   assert.match(r.stdout, /✖ recharge-gateb/);
   assert.match(r.stdout, /\[1\/2 runs passed\]/);
   assert.match(r.stdout, /✖ the issues cover the repos \{C,U\} \(missing U \(actual C\)\)/);

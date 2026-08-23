@@ -154,7 +154,7 @@ test('闸B通过但负载全探测失败：待GO可见，但不能创建无DRI�
   const r = await actions.go(slug, 'M');
   s = (await sessions.get(slug))!;
   assert.equal(r.ok, false);
-  assert.match(r.msg, /未指派 DRI/);
+  assert.match(r.msg, /no DRI is assigned/);
   assert.equal(s.state, 'AWAITING_GO');
   assert.equal(singleCreates, 0);
   assert.ok((await sessions.events(slug)).some((e) => e.kind === 'go_blocked_no_assignee'));

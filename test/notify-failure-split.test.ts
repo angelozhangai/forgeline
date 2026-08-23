@@ -36,8 +36,8 @@ test('群状态卡 *_FAILED：只显示「处理中」，绝不含具体错误�
     const c = json(buildStatusCard(sess({ state: st })));
     assert.doesNotMatch(c, /CONTRACT_DRIFT|thread\.started|信封|出错|失败|处理中断/, `${st} 群卡泄漏了错误`);
     assert.doesNotMatch(c, /"template":"red"/, `${st} 群卡不该报红`);
-    assert.match(c, /处理中|正在/, `${st} 群卡应显示进行中文案`);
-    assert.doesNotMatch(c, /闸A|闸B|GATE_/, `${st} 群卡泄漏黑话`);
+    assert.match(c, /In progress|reviewing|designing|creating/, `${st} 群卡应显示进行中文案`);
+    assert.doesNotMatch(c, /Gate [ABCD]|GATE_/, `${st} 群卡泄漏黑话`);
   }
 });
 

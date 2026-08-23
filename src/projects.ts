@@ -1,57 +1,73 @@
-// 「完整目标项目」解析：把 Stage 1 的路径 Project（src/project.ts）与运行期配置
-// （repos / branches / 发布开关）合成一个对象，供按 session.project_id 解析。
+// Resolving the "full target project": it composes stage 1's path-only Project (src/project.ts) with the
+// runtime configuration (repos, branches, the publish switch) into one object, resolved by
+// session.project_id.
 //
-// Stage 2a（本提交）：只有默认项目，配置取自 runtime.yaml，root 来自 defaultProject()；
-//   project(id) 对任何 id 都回默认项目 —— 行为与改造前完全一致（所有 session 的 project_id 都是 'demo'）。
-// Stage 2b：引入 config/projects.yaml 注册表，非默认项目从注册表解析 root/repos/branches/发布。
+// Stage 2a: the default project only, with its configuration from runtime.yaml and its root from
+// defaultProject(); project(id) returns the default project for any id — behaviour identical to before the
+// change (every session's project_id is 'demo').
+// Stage 2b: the config/projects.yaml registry arrives, and a non-default project resolves its root, repos,
+// branches and publish settings from it.
 import { resolve } from 'node:path';
 import { defaultProject, makeProject, DEFAULT_PROJECT_ID, type Project } from './project.ts';
 import { loadConfig } from './config.ts';
 import type { ProjectScripts, Config, ProjectEntry, PermissionsConfig, RoutingConfig, AssignmentConfig } from './config.ts';
 
-// 路径 Project + 该项目的运行期配置 + 仓身份方案。
+// The path-only Project, plus that project's runtime configuration, plus how its repos are identified.
 export interface ProjectFull extends Project {
-  repos: string[]; // 本地 repo key/path（读代码真源）；monorepo 用 '.'
-  repoSlugs: Record<string, string>; // 本地 repo key → GitHub repo slug（gh -R owner/<slug>）；缺省空=key 即 slug
-  owner: string; // GitHub org（建 issue / 查标签 / 漂移对账）；缺省 DEFAULT_OWNER
-  actions: 'demo' | 'native'; // 机械动作 adapter（缺省 demo 主仓脚本）；见 src/project/index.ts 选择点
+  repos: string[]; // the local repo keys/paths (where the code source of truth is read); a monorepo uses '.'
+  repoSlugs: Record<string, string>; // local repo key -> GitHub repo slug (gh -R owner/<slug>); empty by default, meaning the key is the slug
+  owner: string; // the GitHub org (creating issues, reading labels, drift reconciliation); DEFAULT_OWNER by default
+  actions: 'demo' | 'native'; // the mechanical-action adapter (the demo main-repo scripts by default); see the selection point in src/project/index.ts
   branches: { prod: string; dev: string };
   defaultBranch: 'prod' | 'dev';
   techDesignPublish?: { enabled: boolean; base: string };
-  repoMap: Record<string, string>; // 闸B 信封里的仓字母 → 仓名（建 issue 用）
-  umbrella: string; // 多仓 Epic 本体所在仓
-  scripts: ProjectScripts; // 下游机械动作委托脚本（项目级覆盖 runtime.yaml 兜底，逐键合并）
-  autonomy: { level: number; actor: string }; // 渐进自治：等级（0=全人工）+ 自动动作署名（缺省 routing.lead）。项目级覆盖 runtime。
+  repoMap: Record<string, string>; // the repo letters in Gate B's envelope -> repo names (used when creating issues)
+  umbrella: string; // the repo a multi-repo Epic itself lives in
+  scripts: ProjectScripts; // the scripts the downstream mechanical actions delegate to (a project-level override over runtime.yaml's fallback, merged key by key)
+  autonomy: { level: number; actor: string }; // progressive autonomy: the level (0 = entirely manual) plus who an automatic action is signed as (routing.lead by default). A project-level override over runtime.
 }
 
-// 默认项目（demo）的仓身份：字母 C/U/A/E → 仓名 + 伞仓（E=example-engine AIGC 引擎，与 demo 后端同属后端侧）。
-// Stage 2b 注册表引入后，非默认项目从 config/projects.yaml 各自定义；这里是默认兜底。
+// The default project's (demo's) repo identity: the letters C/U/A/E mapped to repo names, plus the umbrella
+// repo (E = example-engine, which sits on the backend side alongside demo).
+// Once stage 2b's registry arrives, a non-default project defines its own in config/projects.yaml; this is
+// only the default fallback.
 const DEFAULT_REPO_MAP: Record<string, string> = { C: 'demo', U: 'example-web', A: 'example-admin', E: 'example-engine' };
 const DEFAULT_UMBRELLA = 'example-project';
-// 默认项目 GitHub org。非默认项目（如 your-monorepo，很可能在别的 org）须在 projects.yaml 显式 owner。
+// The default project's GitHub org. A non-default project (your-monorepo, say, which is very likely in a
+// different org) has to set owner explicitly in projects.yaml.
 export const DEFAULT_OWNER = 'your-org';
 
-// 按 id 解析「该用哪个项目条目」：注册表命中 → (id, entry)；未注册（含无注册表、未知 id）→ 防御性退回默认项目。
-// project() 与 configForProject() 共用，确保「未注册退默认」口径一致。
+// Resolve "which project entry applies" from an id: a registry hit gives (id, entry); unregistered (including
+// no registry at all, or an unknown id) defensively falls back to the default project.
+// project() and configForProject() share this, so "unregistered falls back to the default" means the same
+// thing in both.
 function resolveEntry(cfg: Config, id?: string): { pid: string; entry?: ProjectEntry } {
   const reg = cfg.projects;
   const defaultId = reg?.default_project ?? DEFAULT_PROJECT_ID;
   let pid = id || defaultId;
   let entry = reg?.projects?.[pid];
   if (!entry && pid !== defaultId) {
-    // 未注册的 id（理论上 intake 只产合法 id）→ 防御性退回默认项目，绝不对着空配置跑。
+    // An unregistered id (in theory intake only produces valid ones) defensively falls back to the default
+    // project — it never runs against an empty configuration.
     pid = defaultId;
     entry = reg?.projects?.[defaultId];
   }
   return { pid, entry };
 }
 
-// 三类策略合并：项目级覆盖 > 全局兜底。两种语义——
-//   ① **策略名单**（allow-lists / pool / 阈值）：字段级**替换**（项目要自己的授权集，不与全局混淆；项目只改一个时其余仍回退全局）。
-//   ② **身份映射**（reviewers 短码→login、operators open_id→短码）：map 级**合并** `{...全局, ...项目}`——绝不整表替换，
-//      否则项目从全局**继承**来的名单短码（如继承的 go_approvers=[M]）在项目自己的 reviewers/operators 表里查不到映射，
-//      令 `inAllowList` 的 login 比对 / 卡片 open_id 解析对继承短码静默失效（Codex SF/Blocker）。
-// 缺省（无覆盖）→ 直接返回全局引用（引用相等，省构造、便于「无 projects.yaml 即原样」判定）。
+// Merging the three kinds of policy: a project-level override wins over the global fallback. There are two
+// distinct semantics —
+//   (1) **Policy lists** (allow-lists, the pool, thresholds) are **replaced** field by field: a project wants
+//       its own authorised set and must not blend it with the global one, and overriding one field still
+//       leaves the rest falling back to global.
+//   (2) **Identity mappings** (reviewers: short code -> login; operators: open_id -> short code) are
+//       **merged** at the map level, `{...global, ...project}` — never replaced wholesale. Replacing them
+//       would leave a short code the project **inherited** from the global lists (an inherited
+//       go_approvers=[M], say) with no entry in the project's own reviewers/operators table, silently
+//       breaking `inAllowList`'s login comparison and the card's open_id resolution for every inherited code
+//       (the blocker Codex raised).
+// With no override at all, the global reference is returned directly (reference-equal, which saves
+// constructing anything and makes "no projects.yaml means unchanged" easy to assert).
 function mergePermissions(g: PermissionsConfig, o?: Partial<PermissionsConfig>): PermissionsConfig {
   if (!o) return g;
   return {
@@ -60,7 +76,7 @@ function mergePermissions(g: PermissionsConfig, o?: Partial<PermissionsConfig>):
     gate_c_allowed: o.gate_c_allowed ?? g.gate_c_allowed,
     pr_create_approvers: o.pr_create_approvers ?? g.pr_create_approvers,
     merge_ack_allowed: o.merge_ack_allowed ?? g.merge_ack_allowed,
-    operators: o.operators ? { ...(g.operators ?? {}), ...o.operators } : g.operators, // 身份映射：map 合并
+    operators: o.operators ? { ...(g.operators ?? {}), ...o.operators } : g.operators, // an identity mapping: merged at the map level
   };
 }
 function mergeRouting(g: RoutingConfig, o?: Partial<RoutingConfig>): RoutingConfig {
@@ -68,7 +84,7 @@ function mergeRouting(g: RoutingConfig, o?: Partial<RoutingConfig>): RoutingConf
   return {
     min_confidence: o.min_confidence ?? g.min_confidence,
     sensitive_areas: o.sensitive_areas ?? g.sensitive_areas,
-    reviewers: o.reviewers ? { ...g.reviewers, ...o.reviewers } : g.reviewers, // 身份映射：map 合并（继承短码仍可解析 login）
+    reviewers: o.reviewers ? { ...g.reviewers, ...o.reviewers } : g.reviewers, // an identity mapping: merged at the map level, so an inherited short code still resolves to a login
     lead: o.lead ?? g.lead,
   };
 }
@@ -81,20 +97,25 @@ function mergeAssignment(g: AssignmentConfig, o?: Partial<AssignmentConfig>): As
   };
 }
 
-// 按 id 解析完整目标项目。
-// 注册表（config/projects.yaml）给了此 id 的条目 → 用条目（缺字段回退 runtime.yaml/默认仓身份）；
-// 没条目（含无注册表、未知 id）→ 落默认项目：路径自动解析兄弟 ../example-project，配置取 runtime.yaml。
+// Resolve the full target project from an id.
+// If the registry (config/projects.yaml) has an entry for this id, the entry is used (a missing field falls
+// back to runtime.yaml, or to the default repo identity).
+// With no entry (including no registry at all, or an unknown id) it lands on the default project: the path
+// resolves automatically to the sibling ../example-project, and the configuration comes from runtime.yaml.
 export function project(id?: string): ProjectFull {
   const cfg = loadConfig();
   const rt = cfg.runtime;
   const { pid, entry } = resolveEntry(cfg, id);
-  // 路径：注册表给 root 用它；否则默认项目自动解析（FORGE_PROJECT_ROOT/兄弟 ../example-project）。
+  // The path: the registry's root if it gives one; otherwise the default project resolves it automatically
+  // (FORGE_PROJECT_ROOT, or the sibling ../example-project).
   const root = entry?.root ? resolve(entry.root) : defaultProject().root;
   const base = makeProject(pid, root);
   const repos = entry?.repos ?? rt.repos;
-  // demo 默认仓身份（DEFAULT_REPO_MAP/DEFAULT_UMBRELLA）**只兜底默认项目**——非默认项目绝不继承 demo 的仓字母/伞仓
-  // （0.3：your-monorepo 等若省略，旧逻辑会拿到 {C:demo,...}/example-project，指错仓）。非默认缺省：repoMap 空（用字母
-  // 编码 Epic 的项目须在 projects.yaml 自带）、umbrella 取自身 repos[0]。
+  // demo's default repo identity (DEFAULT_REPO_MAP / DEFAULT_UMBRELLA) is **the fallback for the default
+  // project only** — a non-default project never inherits demo's repo letters or umbrella (in 0.3, if
+  // your-monorepo omitted them the old logic handed it {C:demo,...} and example-project, pointing at the
+  // wrong repos). A non-default project's defaults are: an empty repoMap (a project that encodes its Epics
+  // with letters has to bring its own in projects.yaml), and umbrella taken from its own repos[0].
   const isDefault = pid === DEFAULT_PROJECT_ID;
   return {
     ...base,
@@ -107,11 +128,14 @@ export function project(id?: string): ProjectFull {
     techDesignPublish: entry?.tech_design_publish ?? rt.tech_design_publish,
     repoMap: entry?.repoMap ?? (isDefault ? DEFAULT_REPO_MAP : {}),
     umbrella: entry?.umbrella ?? (isDefault ? DEFAULT_UMBRELLA : (repos[0] ?? DEFAULT_UMBRELLA)),
-    // 逐键合并：项目级覆盖运行期兜底（任一缺省 → 空对象，消费方按需判空）。
+    // Merged key by key: a project-level override over the runtime fallback (either being absent gives an
+    // empty object, and consumers check for that themselves).
     scripts: { ...(rt.scripts ?? {}), ...(entry?.scripts ?? {}) },
-    // 自治**字段级**合并：项目级覆盖 > runtime 兜底，逐字段独立——项目只想调 level 时绝不连带把 runtime 的 actor 丢掉
-    // 而回退到更高权限的 lead（Codex SF）。actor 缺省最终回退**项目级 lead**（routing 覆盖后的 lead），
-    // 须在该项目权限名单里，否则动作 !ok 留人工。
+    // Autonomy is merged **field by field**: a project-level override over the runtime fallback, each field
+    // independently — a project that only wants to change the level must not also drop runtime's actor and
+    // fall back to the higher-privileged lead (the surprising-failure Codex raised). The actor's final
+    // fallback is **the project-level lead** (the lead after routing's override), which has to be on that
+    // project's permission list, or the action returns !ok and is left to a human.
     autonomy: {
       level: entry?.autonomy?.level ?? rt.autonomy?.level ?? 0,
       actor: entry?.autonomy?.actor ?? rt.autonomy?.actor ?? mergeRouting(cfg.routing, entry?.routing).lead,
@@ -119,10 +143,13 @@ export function project(id?: string): ProjectFull {
   };
 }
 
-// 按项目把 permissions/routing/assignment **字段级**合并到全局 Config 上（runtime/projects/env 原样）。
-// 这是「配置分化」的单一入口：消费方把 loadConfig() 换成 configForProject(session.project_id)，
-// inAllowList/resolveLogin/cfg.permissions/cfg.routing/cfg.assignment 全部自动用项目级口径。
-// 无覆盖（无 projects.yaml / 该项目三类皆未覆盖）→ 直接返回全局 Config 引用，单项目零行为变更。
+// Merge a project's permissions, routing and assignment onto the global Config **field by field** (runtime,
+// projects and env pass through unchanged).
+// This is the single entry point for "configuration diverges per project": a consumer swaps loadConfig() for
+// configForProject(session.project_id), and inAllowList, resolveLogin, cfg.permissions, cfg.routing and
+// cfg.assignment all follow the project's own settings automatically.
+// With no override (no projects.yaml, or that project overriding none of the three) the global Config
+// reference is returned directly, so a single-project setup behaves exactly as before.
 export function configForProject(id?: string): Config {
   const cfg = loadConfig();
   const { entry } = resolveEntry(cfg, id);
@@ -135,22 +162,23 @@ export function configForProject(id?: string): Config {
   };
 }
 
-// 便捷：按 session 解析其项目级 Config。
+// A convenience: resolve a session's project-level Config.
 export function configForSession(s: { project_id?: string }): Config {
   return configForProject(s.project_id);
 }
 
-// 便捷：按 session 解析其目标项目。
+// A convenience: resolve a session's target project.
 export function projectForSession(s: { project_id?: string }): ProjectFull {
   return project(s.project_id);
 }
 
-// 默认项目 id（注册表的 default_project，缺省 'demo'）。
+// The default project id (the registry's default_project, or 'demo').
 export function defaultProjectId(): string {
   return loadConfig().projects?.default_project ?? DEFAULT_PROJECT_ID;
 }
 
-// 群 → 项目路由：哪个项目把该 chat_id 列进了 chats。无注册表/未命中 → undefined。
+// Channel-to-project routing: which project lists this chat_id under its chats. No registry, or no match ->
+// undefined.
 export function projectForChat(chatId?: string | null): string | undefined {
   if (!chatId) return undefined;
   const reg = loadConfig().projects;
