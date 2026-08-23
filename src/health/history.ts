@@ -1,5 +1,7 @@
-// 滚动健康历史：守护每 ~60s 落一行采样，状态页画近 N 小时在线率 + 宕机/恢复事件时间线。
-// 按 health.history_retain_hours 剪枝（旧样本删掉，库不膨胀）。
+// The rolling health history: the daemon records one sample row roughly every 60 seconds, and the status page
+// draws the uptime over the last N hours plus a timeline of outages and recoveries.
+// Pruned according to health.history_retain_hours (old samples are deleted, so the database does not grow
+// without bound).
 import { db } from '../store/db.ts';
 import { hours } from '../util/time.ts';
 import type { HealthReport, Status } from './check.ts';
@@ -17,23 +19,26 @@ export interface FlipResult {
   curr: Status;
 }
 
-// 上一条采样的总状态（去抖/翻转检测用）。
+// The overall status of the previous sample (used for debouncing and flip detection).
 export function lastSampleStatus(): Status | null {
   const row = db().prepare('SELECT status FROM health_sample ORDER BY ts DESC LIMIT 1').get() as { status: Status } | undefined;
   return row?.status ?? null;
 }
 
-// 落一行采样 + 剪枝，返回是否相对上一条翻转（用于告警去抖）。
+// Record one sample row and prune, returning whether it flipped relative to the previous one (which is what
+// debounces the alerting).
 export function recordSample(report: HealthReport, retainHours: number, now: number = report.ts): FlipResult {
   const prev = lastSampleStatus();
   const wsState = !report.ws.configured ? 'na' : report.ws.connected ? 'connected' : 'disconnected';
-  const dbCheck = report.checks.find((c) => c.name === 'SQLite 状态库');
+  // Matched against the name check.ts gives this check. The coupling is by display string, so the two have to
+  // move together — renaming it there without renaming it here would leave db_ok silently null forever.
+  const dbCheck = report.checks.find((c) => c.name === 'SQLite state store');
   const dbOk = dbCheck ? (dbCheck.status === 'healthy' ? 1 : 0) : null;
   const detail = JSON.stringify(report.checks.filter((c) => c.status !== 'healthy' && c.status !== 'na').map((c) => `${c.name}:${c.status}`));
   db()
     .prepare('INSERT INTO health_sample (ts, status, ws, db_ok, active_gates, detail) VALUES (?,?,?,?,?,?)')
     .run(now, report.status, wsState, dbOk, report.daemon.activeGates, detail);
-  // 剪枝
+  // Prune
   db().prepare('DELETE FROM health_sample WHERE ts < ?').run(now - hours(retainHours));
   return { flipped: prev !== null && prev !== report.status, prev, curr: report.status };
 }
@@ -48,15 +53,16 @@ export interface HistoryView {
   since: number;
   now: number;
   count: number;
-  uptimePct: number; // status != down 的样本占比
+  uptimePct: number; // the share of samples whose status is not down
   healthyPct: number;
   degradedPct: number;
   downPct: number;
-  events: HistoryEvent[]; // 总状态翻转点（宕机/恢复时间线）
+  events: HistoryEvent[]; // where the overall status flipped (the outage and recovery timeline)
   samples: SampleRow[];
 }
 
-// 近 sinceMs..now 的历史聚合：在线率 + 翻转事件 + 原始采样（状态页画横条）。
+// The history aggregated over sinceMs..now: the uptime, the flip events, and the raw samples (which the
+// status page draws as a bar).
 export function history(sinceMs: number, now: number = Date.now()): HistoryView {
   const rows = db()
     .prepare('SELECT ts, status, ws, active_gates FROM health_sample WHERE ts >= ? ORDER BY ts ASC')
