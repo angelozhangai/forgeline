@@ -1,14 +1,16 @@
 name: CI
 
-# 两道闸口合一：
-#  - pull_request：PR CI（合并前必须绿；配 branch protection 设为 required check 即成硬门）
-#  - push 到 main：主干 CI（合并后回归，守护 main 始终可跑）
+# Two gates in one workflow:
+#  - pull_request: CI on the PR. It has to be green before a merge, and marking it a required check in the
+#    branch protection ruleset is what turns it into a hard gate.
+#  - push to main: CI on the trunk, a post-merge regression run that keeps main always runnable.
 on:
   pull_request:
   push:
     branches: [main]
 
-# 同一 PR/分支的新推送取消尚在跑的旧 run，省 runner、给快反馈
+# A new push to the same PR or branch cancels the run still in flight -- it saves runner time and gives
+# faster feedback.
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.ref }}
   cancel-in-progress: true
@@ -27,19 +29,21 @@ jobs:
       - name: Setup Node
         uses: actions/setup-node@v4
         with:
-          # 与本机开发 runtime 对齐；node:sqlite / node:test 在该版本免 flag 可用
+          # Matches the local development runtime; node:sqlite and node:test need no flag on this version.
           node-version: '26'
           cache: npm
 
-      # 干净、可复现安装（按 lockfile，禁止隐式改 lock）
+      # A clean, reproducible install straight from the lockfile, with no implicit changes to it.
       - run: npm ci
 
-      # 与本地 `npm run ci` 同一组检查：biome lint + tsc strict + node:test
-      # （覆盖率下限闸防覆盖率静默退化；用例数地板防「测试没跑完就退出」静默少跑——
-      #  这两道闸都必须在远端也生效，否则本地拦得住、CI 拦不住，等于没拦）
+      # The same set of checks as `npm run ci` locally: biome lint, tsc in strict mode, and node:test.
+      # The coverage floors stop coverage degrading silently, and the test-count floor stops a run that
+      # exited before every file reported from silently running fewer tests.
+      # Both gates have to hold remotely too -- caught locally but not in CI is the same as not caught.
       - run: npm run lint
       - run: npm run typecheck
       - run: tools/test-with-floor.sh npm run test:cov
 
-      # 依赖漏洞闸（high+）：只在远端跑——audit 要查 registry（联网），本地 pre-commit 须能离线工作不放进 ci。
+      # The dependency vulnerability gate (high and above) runs remotely only: audit queries the registry over
+      # the network, and the local pre-commit hook has to work offline, so it stays out of `npm run ci`.
       - run: npm run audit

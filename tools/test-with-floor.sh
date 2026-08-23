@@ -1,15 +1,18 @@
 #!/usr/bin/env bash
-# 跑测试，并断言「汇报出来的用例总数不低于地板」。
+# Run the tests, and assert that the number of tests they report is not below the floor.
 #
-# 为什么需要这个：`--test-force-exit` 曾经让 node:test 在部分测试文件汇报之前就杀掉进程。
-# 同一份代码连跑三次得到 875 / 875 / 856 个用例，而且**三次都报 `fail 0`**——
-# 绿灯掩盖了 19 个根本没跑的用例。这是护栏上最坏的一种洞：它不响。
+# Why this exists: `--test-force-exit` used to kill the node:test process before some test files had
+# reported. The same commit run three times in a row reported 875 / 875 / 856 tests, and said `fail 0`
+# **every time** -- a green light covering 19 tests that never ran at all. That is the worst kind of hole in
+# a guardrail: the silent kind.
 #
-# 那个 flag 已经拿掉（拿掉后 5 次连跑稳定 875，且进程能自己退出）。这条地板是防它、
-# 或任何同类的「提前退出 → 静默少跑」悄悄回来。
+# The flag is gone (with it removed, five consecutive runs held steady at 875 and the process exited on its
+# own). This floor is what stops it, or anything else that exits early and quietly runs fewer tests, from
+# creeping back.
 #
-# 加了新测试就把地板抬上去，用法与 test:cov 的覆盖率下限完全一致：
-# 地板是**棘轮**，只许往上，往下调必须是一次有意的、写清楚理由的改动。
+# Raise the floor whenever you add tests, exactly as you would the coverage floors behind test:cov:
+# the floor is a **ratchet**. It only goes up, and lowering it has to be a deliberate change with the reason
+# written down.
 set -euo pipefail
 
 FLOOR="${TEST_COUNT_FLOOR:-1191}"
@@ -22,27 +25,30 @@ status=${PIPESTATUS[0]}
 set -e
 [ "$status" -eq 0 ] || exit "$status"
 
-# 取最后一行 `ℹ tests N`（覆盖率报告在后面，不含这个模式）。
+# Take the last `ℹ tests N` line; the coverage report follows it and contains no such line.
 count="$(grep -oE '^ℹ tests [0-9]+' "$LOG" | tail -1 | grep -oE '[0-9]+$' || true)"
 if [ -z "$count" ]; then
-  echo "✗ 没能从输出里读到用例总数——汇总行格式变了？地板检查失效等于没有护栏，故判失败。" >&2
+  echo "✗ could not read the test count out of the output -- has the summary line changed format? A floor check that cannot run is no guardrail at all, so this counts as a failure." >&2
   exit 1
 fi
 
 if [ "$count" -lt "$FLOOR" ]; then
-  # heredoc 里的变量一律加花括号：`$FLOOR。` 后面紧跟中文标点时，bash 会把那个多字节
-  # 字符的头几个字节也当成变量名的一部分，于是 set -u 抢在提示打印之前把脚本打死——
-  # 护栏本身报不出错，等于没有护栏。差值也先算好，别在 heredoc 里做算术。
+  # Always brace variables inside the heredoc. This bit once: `$FLOOR` followed immediately by a multi-byte
+  # character made bash read the leading bytes of that character as part of the variable name, so `set -u`
+  # killed the script before the message could print -- a guardrail that cannot report its own failure is no
+  # guardrail. Work the difference out beforehand too, rather than doing arithmetic inside the heredoc.
   missing=$((FLOOR - count))
   cat >&2 <<MSG
 
-✗ 只汇报了 ${count} 个用例，低于地板 ${FLOOR}。
+✗ only ${count} tests were reported, which is below the floor of ${FLOOR}.
 
-  测试全绿但少跑了 ${missing} 个 —— 几乎可以肯定是有测试文件在汇报前进程就退出了
-  （历史坑：--test-force-exit）。**不要**为了让它过而调低地板。
-  先确认所有测试文件都真的跑了；确实是有意删掉了测试，再连同理由一起下调 FLOOR。
+  Everything passed, but ${missing} fewer tests ran -- almost certainly a test file whose results never
+  reported before the process exited (the historical culprit was --test-force-exit). Do **not** lower the
+  floor to make this pass.
+  First confirm every test file really ran. Only if tests were deliberately deleted should FLOOR come down,
+  and then together with the reason.
 MSG
   exit 1
 fi
 
-echo "✓ 用例数 $count ≥ 地板 $FLOOR"
+echo "✓ ${count} tests reported, at or above the floor of ${FLOOR}"

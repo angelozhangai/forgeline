@@ -1,18 +1,19 @@
 #!/bin/sh
-# 提交前本地 CI 闸口：lint + typecheck + test:cov（含覆盖率下限闸）必须全绿，否则拒绝提交。
-# 顶层规则见 CLAUDE.md「提交前必做：本地 CI 全绿」。
+# The local CI gate before a commit: lint + typecheck + test:cov, coverage floors included, all have to be
+# green or the commit is refused.
+# The top rule this enforces is in CLAUDE.md: local CI must be green before every commit.
 #
-# 启用一次（本仓约定，每个 clone 各跑一次）：
+# Enable it once per clone (this repo's convention):
 #   git config core.hooksPath .githooks
-# 临时绕过（仅限紧急，须在 PR 说明原因）：
+# Bypassing it temporarily is for emergencies only, and the reason has to be stated in the PR:
 #   git commit --no-verify
 set -e
 
 if [ ! -d node_modules ]; then
-  echo "[pre-commit] 缺 node_modules，先 npm ci/npm install 再提交" >&2
+  echo "[pre-commit] node_modules is missing -- run npm ci or npm install before committing" >&2
   exit 1
 fi
 
-echo "[pre-commit] 本地 CI：npm run ci（lint + typecheck + test:cov）..."
+echo "[pre-commit] local CI: npm run ci (lint + typecheck + test:cov)..."
 npm run --silent ci
-echo "[pre-commit] ✓ 本地 CI 全绿，放行提交"
+echo "[pre-commit] ✓ local CI is green, letting the commit through"

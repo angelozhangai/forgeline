@@ -15,7 +15,7 @@
   },
   "scripts": {
     "forge": "node --no-warnings src/index.ts",
-    "hooks": "git config core.hooksPath .githooks && echo '✓ git hooks 已启用（pre-commit: npm run ci；pre-push: 拦直推 main）'",
+    "hooks": "git config core.hooksPath .githooks && echo '✓ git hooks enabled (pre-commit: npm run ci; pre-push: refuses a direct push to main)'",
     "audit": "npm audit --omit=dev --audit-level=high",
     "lint": "biome lint ./src ./test",
     "typecheck": "tsc --noEmit",
