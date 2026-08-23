@@ -12,7 +12,7 @@ export interface RunOpts {
   env?: NodeJS.ProcessEnv;
   input?: string;
   timeoutMs?: number;
-  onStdoutLine?: (line: string) => void; // 每收到一整行 stdout 回调（用于 stream-json 实时进度）
+  onStdoutLine?: (line: string) => void; // called back with each complete line of stdout (used for live stream-json progress)
 }
 
 export function run(bin: string, args: string[], opts: RunOpts = {}): Promise<RunResult> {
@@ -50,7 +50,7 @@ export function run(bin: string, args: string[], opts: RunOpts = {}): Promise<Ru
     });
     child.on('close', (code) => {
       if (to) clearTimeout(to);
-      if (onLine && lineBuf.trim()) onLine(lineBuf); // 冲刷无换行结尾的最后一行
+      if (onLine && lineBuf.trim()) onLine(lineBuf); // flush a final line that had no trailing newline
       resolve({ code, stdout, stderr, timedOut });
     });
     if (opts.input != null) {
@@ -62,7 +62,7 @@ export function run(bin: string, args: string[], opts: RunOpts = {}): Promise<Ru
   });
 }
 
-// 同步小命令（git fetch / git show 等），返回 stdout，失败抛错。
+// A small synchronous command (git fetch, git show and the like): returns stdout, throws on failure.
 export function runSync(bin: string, args: string[], cwd?: string): string {
   const r = spawnSync(bin, args, { cwd, encoding: 'utf8', maxBuffer: 64 * 1024 * 1024 });
   if (r.error) throw r.error;
