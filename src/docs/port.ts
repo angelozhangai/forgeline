@@ -1,21 +1,30 @@
-// 文档层薄缝——**DocSourcePort**：核心与「需求文档从哪来」之间的唯一接口。
-// 核心只认一个 provider 无关的 DocRef（哪个源 + 源内稳定 id），不认飞书 wiki/docx、不认 Notion page、
-// 不认一段裸文本。每个源的 adapter（见 docs/<source>.ts）各自负责认领链接、读正文、（可选）回写批注。
+// Thin document-layer seam — **DocSourcePort**: the one interface between the core and "where a
+// requirement document comes from".
+// The core knows only a provider-neutral DocRef (which source + a stable id within it). It does not
+// know about Feishu wiki/docx, about a Notion page, or about a bare paragraph of text. Each source's
+// adapter (see docs/<source>.ts) is responsible for claiming links, reading the body and — optionally
+// — writing comments back.
 //
-// 为什么这条缝跟 MessagingPort **形状不同**：IM 是**选择**（一套部署只能有一个 IM，否则审批轨迹分叉），
-// 文档源是**注册表**（同一条消息里可能同时贴飞书文档和 Notion 链接，都该被认领）。所以这里没有
-// 「唯一 port 常量」，只有一份注册表 + 一套内容寻址的解析规则（见 docs/index.ts）。
-// 一份需求文档的 provider 无关引用。
+// Why this seam is **shaped differently** from MessagingPort: IM is a **selection** (a deployment can
+// have only one IM, or the approval trail forks), while document sources are a **registry** (one
+// message may legitimately carry both a Feishu document and a Notion link, and both should be
+// claimed). So there is no single port constant here, only a registry plus a set of content-addressed
+// resolution rules (see docs/index.ts).
+
+// A provider-neutral reference to one requirement document.
 export interface DocRef {
-  // 源 id（'feishu' / 'plaintext' / 'notion'…）。**不许含 ':'**——落库键是 `<source>:<token>`。
+  // Source id ('feishu' / 'plaintext' / 'notion'…). **Must not contain ':'** — the persisted key is
+  // `<source>:<token>`.
   source: string;
-  // 源内稳定 id。同一份文档的各种 URL 变体（查询参数/末尾斜杠/分享后缀）必须归一到同一个 token，
-  // 否则 PRD 级去重（红线）会漏。
+  // Stable id within the source. Every URL variant of the same document (query parameters, trailing
+  // slash, sharing suffix) must normalise to the same token, or PRD-level dedup — a red line — leaks.
   token: string;
-  // 人能点开的链接。有的源没有（plaintext 就没有）→ 省略。仅用于展示 + 兼容旧的 prd_url 去重路径。
+  // A link a person can open. Some sources have none (plaintext does not) -> omitted. Used only for
+  // display and for compatibility with the old prd_url dedup path.
   url?: string;
-  // **不落库**：claim() → read() 之间的搬运通道。用于「消息正文本身就是需求」这类不可回源的源
-  // （plaintext）——它没有可以再读一次的远端，正文只在这一趟里存在。
+  // **Never persisted**: a carrier between claim() and read(). For sources where the message body
+  // itself is the requirement and there is nothing to re-read (plaintext) — there is no remote to
+  // fetch again, and the body exists only during this one pass.
   raw?: string;
 }
 
@@ -25,52 +34,67 @@ export interface DocReadResult {
   error?: string;
 }
 
-// claim() 的入参：一条 IM 消息的可搜文本面（正文 + adapter 挖出的兜底文本块）。
-// 故意不是 InboundMessage：文档层不该知道 IM 的存在，只需要「一堆可以扫的文本」。
+// Input to claim(): the searchable text surface of one IM message (the body plus any fallback text
+// blocks the adapter dug out).
+// Deliberately not an InboundMessage: the document layer should not know that IM exists, it only
+// needs "some text to scan".
 export interface DocClaimInput {
   text: string;
   searchTexts?: string[];
 }
 
-// 文档源契约探针结果（provider 无关，与 messaging 的 InboundProbe 同构）。
+// Result of a document source's contract probe (provider-neutral, structurally identical to
+// messaging's InboundProbe).
 export interface DocProbe {
-  available: boolean; // 凭据齐、能探
-  ok: boolean; // 信封完好
+  available: boolean; // credentials present, a probe is possible
+  ok: boolean; // envelope intact
   detail: string;
   raw?: string;
-  kind?: 'auth' | 'drift'; // auth=凭据/权限/网络；drift=信封字段缺失
+  kind?: 'auth' | 'drift'; // auth = credentials/permissions/network; drift = an envelope field is missing
 }
 
 export interface DocSource {
   readonly id: string;
-  // 兜底源：只有当**没有任何**非兜底源认领时才轮到它，且最多取一条。
-  // 是**标志位、不是数组位置**——位置太脆：数组一重排，plaintext 就会把所有 Notion 链接吞掉。
+  // A fallback source: it only gets a turn when **no** non-fallback source claimed, and at most one
+  // entry is taken.
+  // This is a **flag, not a position in the array** — position is too fragile: reorder the array once
+  // and plaintext swallows every Notion link.
   readonly fallback?: boolean;
 
-  // 从一条消息里认领属于本源的文档（可能多份）。不认领 → 空数组。
+  // Claim the documents in a message that belong to this source (there may be several). Nothing
+  // claimed -> an empty array.
   claim(input: DocClaimInput): DocRef[];
-  // 把一个链接/裸 token 解析成本源的 ref（CLI `--prd <url>` 走这条）。不属于本源 → null。
+  // Parse a link or bare token into this source's ref (the CLI's `--prd <url>` takes this path).
+  // Not ours -> null.
   parseRef(urlOrToken: string): DocRef | null;
-  // 读正文。失败**如实报错**（错误原文进 error），绝不返回空串装作读到了——上游据此停泊。
+  // Read the body. On failure **report it faithfully** (the raw error goes into `error`); never return
+  // an empty string pretending the read succeeded — callers park the session on that signal.
   read(ref: DocRef): Promise<DocReadResult>;
-  // 回写批注（可选能力）。没有这个方法 = 该源不支持回写，核心静默跳过；
-  // 有这个方法但调用失败 = 记日志（best-effort，不阻断闸）。
+  // Write a comment back (optional capability). Method absent = this source does not support
+  // write-back and the core silently skips it; method present but the call failed = logged
+  // (best-effort, never blocks a gate).
   comment?(ref: DocRef, text: string): Promise<{ ok: boolean; error?: string }>;
-  // 契约探针（可选）：只读往返验自家 API 信封。**故意用本地形状**，跟 messaging 的 InboundProbe 一样——
-  // 文档层不该 import llm/probes.ts 的 ProbeResult（那会把 ProbeDep 联合类型和一条 docs→llm 的依赖
-  // 一起焊进来）。健康页长出「文档源」那一行时，由 llm/probes.ts 写薄壳映射，与 probeFeishu 同构。
-  // 目前核心尚无消费方：声明在这里是让实现方现在就有地方放，而不是回头改接口。
+  // Contract probe (optional): a read-only round trip verifying this source's own API envelope.
+  // **Deliberately a local shape**, exactly as with messaging's InboundProbe — the document layer must
+  // not import ProbeResult from llm/probes.ts (that would weld in the ProbeDep union type and a
+  // docs -> llm dependency along with it). When the health page grows a "document source" row, the
+  // thin mapping goes in llm/probes.ts, structurally identical to probeFeishu.
+  // The core has no consumer yet: it is declared here so implementers have somewhere to put it now,
+  // rather than the interface changing later.
   probe?(): Promise<DocProbe>;
 }
 
-// 落库键：`<source>:<token>`。带上源前缀是因为**跨源 token 会撞**——裸 token 做唯一索引，
-// 迟早有两个源给出同一个字符串，然后两份毫不相干的需求被判成重复。
+// The persisted key: `<source>:<token>`. The source prefix is there because **tokens collide across
+// sources** — with a bare token as the unique index, two sources will eventually produce the same
+// string and two entirely unrelated requirements get judged duplicates.
 export function formatRef(ref: DocRef): string {
   return `${ref.source}:${ref.token}`;
 }
 
-// 反解落库键。按**第一个** ':' 切——token 里允许再出现 ':'（源 id 不允许）。
-// 无前缀 / 空 source / 空 token 一律 null：宁可让调用方显式处理，也不猜一个源出来。
+// Parse a persisted key back. Split on the **first** ':' — a token may contain further colons (a
+// source id may not).
+// No prefix / empty source / empty token all return null: better to make the caller handle it
+// explicitly than to guess a source.
 export function parseStoredRef(stored: string | null | undefined): DocRef | null {
   if (!stored) return null;
   const i = stored.indexOf(':');

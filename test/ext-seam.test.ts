@@ -493,7 +493,7 @@ describe('扩展注册文档源', () => {
     resetExtensionsForTest(); // = 部署里把扩展包摘掉了，但库里还存着 notion:pg1
     const after = await docs.readDoc(ref);
     assert.equal(after.ok, false);
-    assert.match(after.error ?? '', /未注册的文档源「notion」/);
+    assert.match(after.error ?? '', /Unregistered document source "notion"/);
     assert.match(after.error ?? '', /feishu\/plaintext/); // 告诉人现在认得哪些
   });
 });

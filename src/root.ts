@@ -1,8 +1,11 @@
-// 路径锚点。两类：
-//   ① Forge 服务自身（与项目无关）：SVC_DIR / config / prompts / state / logs / db / 心跳。定义在这里。
-//   ② 目标项目相关：ROOT / scripts / docs-delivery / 子仓。源自 src/project.ts 的 defaultProject()。
-// Stage 1：项目相关锚点改为委托 defaultProject()（默认项目），行为与旧实现完全一致；
-// Stage 2 起，需要按 session 解析的调用点改用 project(s.project_id)，这些全局默认锚点保留给非 session 场景。
+// Path anchors. Two kinds:
+//   1. The Forge service itself (project-independent): SVC_DIR / config / prompts / state / logs / db /
+//      heartbeat. Defined here.
+//   2. Target-project related: ROOT / scripts / docs-delivery / sub-repos. Derived from
+//      defaultProject() in src/project.ts.
+// Stage 1: project-related anchors delegate to defaultProject() (the default project), behaving
+// exactly as the old implementation did. From stage 2 on, call sites that need per-session resolution
+// use project(s.project_id); these global default anchors remain for non-session cases.
 import { existsSync, readFileSync } from 'node:fs';
 import { resolve } from 'node:path';
 import { SVC_DIR, defaultProject } from './project.ts';
@@ -11,57 +14,65 @@ export { SVC_DIR } from './project.ts';
 
 const _proj = defaultProject();
 
-// 环境变量当目录用：空串/纯空格视同未设置。少了这层，`FORGE_HOME=` 这种
-// "导出了但没值" 的写法会把所有路径锚到进程 cwd，症状极难追。
+// Environment variables used as directories: an empty or whitespace-only value counts as unset.
+// Without this layer, an "exported but empty" form like `FORGE_HOME=` would anchor every path to the
+// process cwd, and the symptom would be extremely hard to trace.
 function envDir(name: string): string | undefined {
   const v = process.env[name]?.trim();
   return v ? resolve(v) : undefined;
 }
 
-// 部署接缝：把「服务自身的可变状态」整体搬出检出目录。
-// FORGE_HOME 一次性搬走 config/state/logs 三者；单项 FORGE_CONFIG_DIR /
-// FORGE_STATE_DIR / FORGE_LOGS_DIR 优先级更高。三者都不设时，全部落回检出
-// 目录内 —— 与从前逐字节一致，所以这是纯增量的向后兼容改动。
+// Deployment seam: move the service's own mutable state out of the checkout entirely.
+// FORGE_HOME relocates config/state/logs in one go; the individual FORGE_CONFIG_DIR /
+// FORGE_STATE_DIR / FORGE_LOGS_DIR take precedence. With none of them set, everything falls back
+// inside the checkout — byte for byte identical to before, which makes this a purely additive,
+// backward-compatible change.
 //
-// 为什么需要：私有部署要用自己的 assignment.yaml / routing.yaml，而这两个文件
-// 在本仓是**被追踪**的。就地改会让检出变脏、git pull 冲突；指到仓外就干净了，
-// 核心检出可以只读、可以随时删掉重新 clone。
+// Why it is needed: a private deployment wants its own assignment.yaml / routing.yaml, and both files
+// are **tracked** in this repo. Editing them in place makes the checkout permanently dirty and makes
+// `git pull` conflict; pointing them outside the repo keeps it clean, so the core checkout can be
+// read-only and can be deleted and re-cloned at any time.
 const HOME = envDir('FORGE_HOME');
 const svcDir = (env: string, name: string): string =>
   envDir(env) ?? (HOME ? resolve(HOME, name) : resolve(SVC_DIR, name));
 
-// ── ② 目标项目相关（默认项目）──
+// -- 2. Target-project related (the default project) --
 export const ROOT = _proj.root;
 export const SCRIPTS_DIR = _proj.scriptsDir;
 export const DELIVERY_DIR = _proj.deliveryDir;
 export function repoPath(repo: string): string {
   return _proj.repoPath(repo);
 }
-// ── ① Forge 服务自身（与项目无关）──
-/** 仓内自带的默认配置目录。叠加目录缺某个文件时逐文件回落到这里。 */
+// -- 1. The Forge service itself (project-independent) --
+/** The default config directory shipped in the repo. When an overlay directory is missing a file, resolution falls back here per file. */
 export const CONFIG_REPO_DIR = resolve(SVC_DIR, 'config');
-/** 生效的配置目录。未设叠加时 === CONFIG_REPO_DIR。 */
+/** The effective config directory. With no overlay set, === CONFIG_REPO_DIR. */
 export const CONFIG_DIR = svcDir('FORGE_CONFIG_DIR', 'config');
 export const PROMPTS_DIR = resolve(SVC_DIR, 'prompts');
 export const STATE_DIR = svcDir('FORGE_STATE_DIR', 'state');
 export const LOGS_DIR = svcDir('FORGE_LOGS_DIR', 'logs');
 /**
- * 扩展包目录（见 src/ext/）。下游产品在这里放 `index.ts` 默认导出一个 ExtensionPack，
- * 就能加自己的 CLI 命令与生命周期钩子，**不必 fork、不必改核心任何文件**。
+ * The extension pack directory (see src/ext/). A downstream product drops an `index.ts` here that
+ * default-exports an ExtensionPack, and gains its own CLI commands and lifecycle hooks **without
+ * forking and without editing a single core file**.
  *
- * 与 config/state/logs 同一套接缝规则：`FORGE_EXT_DIR` 显式指定 > `$FORGE_HOME/ext` >
- * 检出目录内 `ext/`（本仓不自带，所以缺省就是「没有扩展」= 纯 OSS 行为逐字节不变）。
- * 复用 FORGE_HOME 而不发明新约定：下游的部署根本来就已经用它搬走 config/state/logs。
+ * Same seam rules as config/state/logs: an explicit `FORGE_EXT_DIR` > `$FORGE_HOME/ext` > `ext/`
+ * inside the checkout (this repo ships none, so the default is "there is no extension" = pure-OSS
+ * behaviour byte for byte unchanged).
+ * It reuses FORGE_HOME rather than inventing a new convention: a downstream deployment root already
+ * uses it to relocate config/state/logs.
  */
 export const EXT_DIR = svcDir('FORGE_EXT_DIR', 'ext');
 
 /**
- * 配置文件的实际路径：叠加目录里有就用叠加的，没有就回落到仓内默认。
- * 解析规则与 loadPrompt 一致（见 src/util/render.ts）—— 私有部署只覆盖它在乎的
- * 那几个文件，其余跟着仓库一起升级，不必为了改一个 yaml 而 fork 整个 config/。
+ * The actual path of a config file: the overlay's copy if it has one, otherwise the repo default.
+ * The resolution rule matches loadPrompt (see src/util/render.ts) — a private deployment overrides
+ * only the few files it cares about, and everything else keeps upgrading with the repo, rather than
+ * having to fork the whole of config/ to change one yaml.
  *
- * ⚠️ 回落是静默的：叠加目录里把文件名打错，跑起来用的是仓内默认版而不会报错。
- * 私有叠加仓应当自带一个「叠加文件名 vs 仓内 config/ + prompts/」的对账检查。
+ * Warning: the fallback is silent. Mistype a filename in the overlay directory and it runs the repo
+ * default without complaining. A private overlay repo should carry its own reconciliation check of
+ * "overlay filenames vs this repo's config/ and prompts/ trees".
  */
 export function configFile(name: string): string {
   if (CONFIG_DIR !== CONFIG_REPO_DIR) {
@@ -71,19 +82,23 @@ export function configFile(name: string): string {
   return resolve(CONFIG_REPO_DIR, name);
 }
 
-// FORGE_DB 覆盖便于测试隔离（:memory: 或临时文件）。
+// FORGE_DB overrides the path for test isolation (:memory: or a temp file).
 export const DB_PATH = process.env.FORGE_DB || resolve(STATE_DIR, 'service.db');
-export const ENV_FILE = configFile('forge.env'); // 两侧都 gitignore
-// 健康/保活：守护写心跳、看门狗读心跳。FORGE_* 覆盖便于测试隔离。
+export const ENV_FILE = configFile('forge.env'); // gitignored on both sides
+// Health / liveness: the daemon writes the heartbeat, the watchdog reads it. FORGE_* overrides exist
+// for test isolation.
 export const HEARTBEAT_PATH = process.env.FORGE_HEARTBEAT || resolve(STATE_DIR, 'heartbeat.json');
 export const WATCHDOG_STATE_PATH = process.env.FORGE_WATCHDOG_STATE || resolve(STATE_DIR, 'watchdog.json');
-export const LAUNCHD_LOG = resolve(LOGS_DIR, 'launchd.log'); // forge-daemon 落盘的合并日志（看门狗轮转它）
+export const LAUNCHD_LOG = resolve(LOGS_DIR, 'launchd.log'); // the combined log written by forge-daemon (the watchdog rotates it)
 
 /**
- * 解析 forge.env（`KEY=value`，支持 # 注释与成对引号）。**放在 root.ts 而不是 config.ts**：
- * 传输层选择点（messaging/index.ts）需要在模块加载期读一个变量决定接哪个 IM，而它绝不能为此
- * 把 config.ts 整条 yaml+zod 校验链拖进每一个 import 它的文件。root.ts 没有重依赖，正合适。
- * config.ts 仍是 env 的**权威**入口（它在此之上叠加 process.env 覆盖）；这里只提供最朴素的一层。
+ * Parse forge.env (`KEY=value`, supporting # comments and matched quotes). **It lives in root.ts
+ * rather than config.ts** because the transport selection point (messaging/index.ts) has to read one
+ * variable at module-load time to decide which IM to use, and it must not drag config.ts's entire
+ * yaml + zod validation chain into every file that imports it. root.ts has no heavy dependencies,
+ * which makes it the right home.
+ * config.ts remains the **authoritative** entry point for env (it layers process.env overrides on top
+ * of this); what lives here is only the plainest possible layer.
  */
 export function loadEnvFile(): Record<string, string> {
   const env: Record<string, string> = {};
