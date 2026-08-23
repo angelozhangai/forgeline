@@ -1,10 +1,14 @@
-// 集成：worker.applyAutonomy 接线——停泊在授权点的 session 按**项目**自治等级自动触发对应 action + 落审计事件。
-// 验：默认 L0 零动作；L2 触发 requestGateB+go 不触发更高的；L4 全触发；红线态（merge/确定性 stall）永不被触发；
-// 动作 !ok（权限/lint 不过）不落审计、留人工；署名 = 配置 actor。mock projects(控 level/actor) + actions(捕获)。
+// Integration: how worker.applyAutonomy is wired - a session parked at an authorisation point has its matching
+// action triggered automatically, according to its **project's** autonomy level, and an audit event recorded.
+// It verifies: the default level 0 does nothing; level 2 triggers requestGateB and go but nothing higher;
+// level 4 triggers all of them; the red-line states (a merge, or a deterministic stall) are never triggered; an
+// action returning !ok (a permission or lint check not passing) leaves the session to a human; and the actions
+// are signed with the configured actor. projects (which controls the level and actor) and actions (which
+// captures the calls) are mocked.
 process.env.FORGE_DB = ':memory:';
 import { test, mock, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
-const { loadConfig } = await import('../src/config.ts'); // 动态导入（绝不静态！静态会 hoist 到 FORGE_DB=:memory: 之前 → root.ts 落真库 → 并发串库）。桩回退真配置。
+const { loadConfig } = await import('../src/config.ts'); // a dynamic import (never a static one! a static import hoists above FORGE_DB=':memory:', so root.ts would resolve the real database and concurrent tests would share it). The stub falls back to the real config.
 
 let autonomyLevel = 0;
 let autonomyActor = 'M';
@@ -19,10 +23,11 @@ mock.module('../src/projects.ts', {
   },
 });
 
-// 捕获被自治触发的 4 个动作；markReviewActive/autoAssignOnGo 是 worker 也 import 的桩。
+// Capture the four actions autonomy can trigger; markReviewActive and autoAssignOnGo are stubs the worker also
+// imports.
 let calls: { fn: string; by: string }[] = [];
 let actionOk = true;
-const cap = (fn: string) => (_slug: string, by: string) => { calls.push({ fn, by }); return { ok: actionOk, msg: actionOk ? 'ok' : '无权限/lint 未过' }; };
+const cap = (fn: string) => (_slug: string, by: string) => { calls.push({ fn, by }); return { ok: actionOk, msg: actionOk ? 'ok' : 'no permission, or lint did not pass' }; };
 mock.module('../src/actions.ts', {
   namedExports: {
     markReviewActive: () => {},
@@ -40,7 +45,8 @@ const sessions = await import('../src/store/sessions.ts');
 const { db } = await import('../src/store/db.ts');
 const worker = await import('../src/orchestrator/worker.ts');
 
-// 各授权停泊点 + 红线态的合法转移路径（按管线序，切到目标态）。
+// The legal transition path through every authorisation resting point and the red-line states (in pipeline
+// order, stopping at the target state).
 const PATH = ['GATE_A_RUNNING', 'AWAITING_PM_CONFIRM', 'CONFIRMED', 'GATE_B_REQUESTED', 'GATE_B_RUNNING', 'ADVERSARIAL_LOOP', 'AWAITING_GO', 'WRITING', 'DONE', 'GATE_C_REQUESTED', 'GATE_C_RUNNING', 'GATE_C_LOOP', 'AWAITING_GATE_D', 'GATE_D_REQUESTED', 'GATE_D_LOOP', 'GATE_D_HARDENING', 'AWAITING_HUMAN_MERGE'];
 let n = 0;
 async function mkAt(target: string): Promise<string> {
@@ -52,7 +58,7 @@ async function mkAt(target: string): Promise<string> {
   }
   return id;
 }
-// GATE_C_STALLED 走支线（GATE_C_LOOP → GATE_C_STALLED）
+// GATE_C_STALLED takes a side branch (GATE_C_LOOP -> GATE_C_STALLED)
 async function mkStalled(): Promise<string> {
   const id = `a${++n}`;
   await sessions.create({ id, slug: id, title: 'T', branch: 'main' });
@@ -62,31 +68,33 @@ async function mkStalled(): Promise<string> {
   return id;
 }
 
-// 清表隔离：DB 跨 test 共享，且 mock 动作不真推进状态 → 不清会让授权点 session 累积污染后续断言。
+// Clearing the tables for isolation: the database is shared across tests, and the mocked actions do not really
+// advance the state, so without clearing them the sessions at authorisation points would accumulate and
+// pollute later assertions.
 beforeEach(() => {
   db().exec('DELETE FROM session; DELETE FROM event_log;');
   calls = []; actionOk = true; autonomyLevel = 0; autonomyActor = 'M';
 });
 
-test('L0（默认）：4 个授权点都停着也零动作、零审计事件（零行为变更）', async () => {
+test('level 0 (the default): with all four authorisation points parked it still takes no action and records no audit event (behaviour is unchanged)', async () => {
   const ids = await Promise.all(['CONFIRMED', 'AWAITING_GO', 'DONE', 'AWAITING_GATE_D'].map(mkAt));
   await worker.applyAutonomy();
   assert.deepEqual(calls, []);
   for (const id of ids) assert.ok(!(await sessions.events(id)).some((e) => e.kind === 'autonomy_auto_triggered'));
 });
 
-test('L2：触发 requestGateB(CONFIRMED)+go(AWAITING_GO)，不触发更高级的 requestGateC/requestReviewPr', async () => {
+test('level 2: triggers requestGateB (CONFIRMED) and go (AWAITING_GO), but not the higher requestGateC or requestReviewPr', async () => {
   autonomyLevel = 2;
   const cId = await mkAt('CONFIRMED');
   await mkAt('AWAITING_GO');
   await mkAt('DONE');
   await mkAt('AWAITING_GATE_D');
   await worker.applyAutonomy();
-  assert.deepEqual(calls.map((c) => c.fn).sort(), ['go', 'requestGateB']); // 恰 L≤2 的两个
-  assert.ok((await sessions.events(cId)).some((e) => e.kind === 'autonomy_auto_triggered')); // 落审计
+  assert.deepEqual(calls.map((c) => c.fn).sort(), ['go', 'requestGateB']); // exactly the two at level <= 2
+  assert.ok((await sessions.events(cId)).some((e) => e.kind === 'autonomy_auto_triggered')); // the audit event is recorded
 });
 
-test('L4：4 个授权点全触发各自动作', async () => {
+test('level 4: all four authorisation points trigger their own action', async () => {
   autonomyLevel = 4;
   await mkAt('CONFIRMED');
   await mkAt('AWAITING_GO');
@@ -96,45 +104,45 @@ test('L4：4 个授权点全触发各自动作', async () => {
   assert.deepEqual(calls.map((c) => c.fn).sort(), ['go', 'requestGateB', 'requestGateC', 'requestReviewPr']);
 });
 
-test('红线：AWAITING_HUMAN_MERGE + GATE_C_STALLED 即便 L4 也永不被自动触发', async () => {
+test('the red line: AWAITING_HUMAN_MERGE and GATE_C_STALLED are never triggered automatically, even at level 4', async () => {
   autonomyLevel = 4;
   const mergeId = await mkAt('AWAITING_HUMAN_MERGE');
   const stalledId = await mkStalled();
   await worker.applyAutonomy();
-  assert.deepEqual(calls, [], '红线态不在授权点集合 → applyAutonomy 根本不碰');
+  assert.deepEqual(calls, [], 'the red-line states are not in the authorisation-point set, so applyAutonomy never touches them');
   assert.ok(!(await sessions.events(mergeId)).some((e) => e.kind === 'autonomy_auto_triggered'));
   assert.ok(!(await sessions.events(stalledId)).some((e) => e.kind === 'autonomy_auto_triggered'));
 });
 
-test('动作 !ok（权限/lint 未过）：先落「已尝试」审计、结果记 !ok、留人工（Blocker 修复：审计先于副作用）', async () => {
+test('an action returning !ok (a permission or lint check not passing): the "attempted" audit event is recorded first, the result records !ok, and it is left to a human (the blocker fix: the audit comes before the side effect)', async () => {
   autonomyLevel = 1;
   actionOk = false;
   const id = await mkAt('CONFIRMED');
   await worker.applyAutonomy();
-  assert.equal(calls.length, 1, '尝试调了'); // 调用发生
+  assert.equal(calls.length, 1, 'it did attempt the call'); // the call happened
   const evs = await sessions.events(id);
-  assert.ok(evs.some((e) => e.kind === 'autonomy_auto_triggered'), '先落已尝试审计（即便动作后续失败也有痕）');
+  assert.ok(evs.some((e) => e.kind === 'autonomy_auto_triggered'), 'the "attempted" audit event is recorded first, so even an action that later fails leaves a trace');
   const res = evs.find((e) => e.kind === 'autonomy_auto_result');
-  assert.equal(JSON.parse(res!.detail ?? '{}').ok, false, '结果事件记 !ok');
+  assert.equal(JSON.parse(res!.detail ?? '{}').ok, false, 'the result event records !ok');
 });
 
-test('去抖（SF1）：!ok 留停泊 → 同一态再 tick 不重试、不再刷事件', async () => {
+test('the debounce (SF1): an !ok leaves it parked -> another tick in the same state does not retry and does not spam events', async () => {
   autonomyLevel = 1;
   actionOk = false;
   const id = await mkAt('CONFIRMED');
   await worker.applyAutonomy();
-  await worker.applyAutonomy(); // 第二轮：session 未变（mock 动作不 transition、appendEvent 不 bump updated_at）→ 去抖跳过
-  assert.equal(calls.length, 1, '只尝试一次，第二轮被去抖跳过');
-  assert.equal((await sessions.events(id)).filter((e) => e.kind === 'autonomy_auto_triggered').length, 1, '尝试审计只一条');
+  await worker.applyAutonomy(); // the second round: the session has not changed (the mocked action does not transition, and appendEvent does not bump updated_at) -> the debounce skips it
+  assert.equal(calls.length, 1, 'it attempts once, and the second round is skipped by the debounce');
+  assert.equal((await sessions.events(id)).filter((e) => e.kind === 'autonomy_auto_triggered').length, 1, 'there is exactly one attempt audit event');
 });
 
-test('署名 actor：自动动作用配置的 actor 调，审计事件记 by=actor', async () => {
+test('signing with the actor: an automatic action is called as the configured actor, and the audit event records by=actor', async () => {
   autonomyLevel = 1;
   autonomyActor = 'EO';
   const id = await mkAt('CONFIRMED');
   await worker.applyAutonomy();
   assert.equal(calls[0].by, 'EO');
   const ev = (await sessions.events(id)).find((e) => e.kind === 'autonomy_auto_triggered');
-  assert.equal(JSON.parse(ev!.detail ?? '{}').by, 'EO'); // 审计 detail 记 by=actor
+  assert.equal(JSON.parse(ev!.detail ?? '{}').by, 'EO'); // the audit detail records by=actor
 
 });
