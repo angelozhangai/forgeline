@@ -5,6 +5,8 @@ Thanks for looking at this. Two documents matter before you write anything:
 - **[README.md](README.md)** — what the service is, the state machine, how to run it.
 - **[AGENTS.md](AGENTS.md)** — the engineering rules. It is the single source of truth for commit and
   quality discipline, and `CLAUDE.md` just points at it. Humans and coding agents read the same file.
+  If you edit a skill under `.claude/skills/`, copy it to `.agents/skills/` **in the same commit** — CI
+  asserts the two trees are byte-identical, so Claude Code and Codex can never be given different rules.
 
 Everything below is the short version of AGENTS.md. Where the two disagree, AGENTS.md wins.
 

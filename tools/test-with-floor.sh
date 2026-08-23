@@ -15,7 +15,7 @@
 # written down.
 set -euo pipefail
 
-FLOOR="${TEST_COUNT_FLOOR:-1191}"
+FLOOR="${TEST_COUNT_FLOOR:-1194}"
 LOG="$(mktemp)"
 trap 'rm -f "$LOG"' EXIT
 
