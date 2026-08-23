@@ -1,25 +1,29 @@
-// 飞书 provider 层——**群历史拉取**（im/v1/messages）。这里只剩「一次 API 往返 + 分页」，
-// 补拉的业务循环（游标水位 / 抽链接 / 登记需求 / 防重入）已上移到 provider 无关的
-// [messaging/backfill.ts](../messaging/backfill.ts)：换 IM 只换本文件的对等实现，那段
-// 「离线不漏需求」的正确性逻辑一行不动。
+// Feishu provider layer — **chat history retrieval** (im/v1/messages). All that is left here is one API
+// round trip plus pagination; backfill's business loop (cursor watermark / link extraction / requirement
+// registration / re-entrancy guard) has moved up into the provider-neutral
+// [messaging/backfill.ts](../messaging/backfill.ts): swapping IM means writing this file's equivalent,
+// and the "never lose a requirement while offline" correctness logic does not change by a line.
 //
-// 只被 messaging/feishu.ts（唯一 adapter）调用——核心层直连本文件会被架构边界闸拦下。
+// Called only by messaging/feishu.ts (the single adapter) — the architecture boundary gate blocks the
+// core from importing this file directly.
 import { log } from '../util/log.ts';
 import { botTenantToken, FEISHU_BASE } from './dm.ts';
 
-// im/v1/messages 的历史条目（只声明我们真读的字段）。
+// A history entry from im/v1/messages (only the fields we actually read are declared).
 export interface FeishuHistMsg {
   message_id?: string;
   msg_type?: string;
   create_time?: string;
   sender?: { id?: string; id_type?: string };
   chat_id?: string;
-  // 会话类型（'group' / 'p2p'）。live 事件的 message.chat_type 一定有；**历史条目不一定**——
-  // 带就用，不带就回落到 chatIsGroup() 现问一次（见下）。
+  // The conversation type ('group' / 'p2p'). A live event's message.chat_type is always present;
+  // **a history entry's is not** — use it when present, otherwise fall back to asking chatIsGroup() once
+  // (see below).
   chat_type?: string;
   body?: { content?: string };
-  // 服务端填充的 @ 列表。live 事件里一定有；历史条目是否带取决于飞书信封——
-  // 缺失与「真的没人被 @」不可区分，故 adapter 映射时用 undefined/[] 区分（见 messaging/feishu.ts）。
+  // The server-populated mention list. Always present on live events; whether a history entry carries it
+  // depends on Feishu's envelope — a missing list is indistinguishable from "genuinely nobody was
+  // mentioned", so the adapter distinguishes undefined from [] when mapping (see messaging/feishu.ts).
   mentions?: { id?: { open_id?: string }; id_type?: string; name?: string }[];
 }
 interface ListResp {
@@ -28,8 +32,10 @@ interface ListResp {
   data?: { items?: FeishuHistMsg[]; has_more?: boolean; page_token?: string };
 }
 
-// 拉某群从 startSec(秒) 起的历史，按时间升序分页（上限 20 页 = 1000 条，防失控）。
-// best-effort：鉴权/网络/接口报错一律返回**已拿到的部分** + warn，绝不抛（补拉不该拖垮周期循环）。
+// Fetch a chat's history from startSec (seconds) onwards, paginated in ascending time order (capped at 20
+// pages = 1000 entries, as a runaway guard).
+// Best-effort: an auth, network or API error returns **whatever was already retrieved** plus a warning,
+// and never throws (a backfill should not take the periodic loop down with it).
 export async function listMessages(chatId: string, startSec: number): Promise<FeishuHistMsg[]> {
   const token = await botTenantToken();
   if (!token) return [];
@@ -48,18 +54,20 @@ export async function listMessages(chatId: string, startSec: number): Promise<Fe
       const res = await fetch(url, { headers: { Authorization: `Bearer ${token}` } });
       j = (await res.json()) as ListResp;
     } catch (e) {
-      log.warn(`补拉群历史网络异常（${chatId}）：${String(e).slice(0, 120)}`);
+      log.warn(`Network error while backfilling chat history (${chatId}): ${String(e).slice(0, 120)}`);
       return out;
     }
     if (j.code !== 0) {
-      log.warn(`补拉群历史失败（${chatId}）：${j.code} ${(j.msg ?? '').slice(0, 140)}`);
-      return out; // 权限/错误 → 返回已得，不抛
+      log.warn(`Backfilling chat history failed (${chatId}): ${j.code} ${(j.msg ?? '').slice(0, 140)}`);
+      return out; // permissions or an error -> return what we have, do not throw
     }
     out.push(...(j.data?.items ?? []));
-    // 契约守卫（廉价）：has_more=true 但没给 page_token = 分页信封漂移，会让我们静默早停、漏补消息。
-    // backfill 是 best-effort，不停泊，只 warn 留痕（真探测由 probeFeishu/每日契约检查负责）。
+    // A cheap contract guard: has_more=true with no page_token means the pagination envelope has drifted,
+    // which would make us stop early in silence and miss messages.
+    // Backfill is best-effort and does not park, so this only warns to leave a trace (real detection is
+    // probeFeishu's and the daily contract check's job).
     if (j.data?.has_more && !j.data?.page_token) {
-      log.warn(`FEISHU_PAGINATION_DRIFT：has_more=true 但无 page_token（疑似 im/v1/messages 分页 schema 变更），${chatId} 本轮提前结束`);
+      log.warn(`FEISHU_PAGINATION_DRIFT: has_more=true but no page_token (im/v1/messages' pagination schema may have changed); ${chatId} ends this round early`);
     }
     if (!j.data?.has_more || !j.data?.page_token) break;
     pageToken = j.data.page_token;
@@ -68,17 +76,19 @@ export async function listMessages(chatId: string, startSec: number): Promise<Fe
 }
 
 
-// ── 这个会话是群还是私聊 ────────────────────────────────────────────
-// 补拉必须知道这件事：把私聊历史当成群消息，会撞上「群里没 @ 我」的入口闸被丢掉——
-// 离线期间私聊过来的需求就此静默消失，而那正是补拉存在的唯一理由。
+// -- Is this conversation a channel or a DM ----------------------------------
+// Backfill has to know: treating DM history as channel messages makes them hit the "nobody @-mentioned
+// me" intake gate and be dropped — requirements sent by DM while offline silently vanish, and that is the
+// sole reason backfill exists.
 //
-// ⚠️ 用 **chat_mode**，不是 chat_type。同一个名字在飞书两个接口里意思不一样：
-//   · 事件 message.chat_type：'group' / 'p2p'   ← 会话形态
-//   · im/v1/chats 的 chat_type：'private' / 'public' ← 群的**可见性**
-// 拿后者当前者用，所有公开群都会被判成私聊，入口闸整个失效。
+// Warning: use **chat_mode**, not chat_type. The same name means different things in two Feishu APIs:
+//   · an event's message.chat_type: 'group' / 'p2p'      <- the conversation's shape
+//   · im/v1/chats's chat_type:      'private' / 'public' <- a group's **visibility**
+// Using the latter as the former judges every public group a DM and disables the intake gate entirely.
 //
-// 会话形态一辈子不变 → 按 chatId 记忆，一个进程一次往返。拿不到就返回 null，由调用方决定怎么办
-// （绝不猜一个，猜错的两个方向代价完全不对称）。
+// A conversation's shape never changes -> memoise by chatId, one round trip per process. When it cannot
+// be obtained, return null and let the caller decide (never guess: the two directions of a wrong guess
+// have completely asymmetric costs).
 const CHAT_IS_GROUP = new Map<string, boolean>();
 
 interface ChatResp {
@@ -97,11 +107,11 @@ export async function chatIsGroup(chatId: string): Promise<boolean | null> {
     const res = await fetch(`${FEISHU_BASE}/im/v1/chats/${encodeURIComponent(chatId)}`, { headers: { Authorization: `Bearer ${token}` } });
     j = (await res.json()) as ChatResp;
   } catch (e) {
-    log.warn(`取会话类型网络异常（${chatId}）：${String(e).slice(0, 120)}`);
+    log.warn(`Network error while fetching the conversation type (${chatId}): ${String(e).slice(0, 120)}`);
     return null;
   }
   if (j.code !== 0 || typeof j.data?.chat_mode !== 'string') {
-    log.warn(`取会话类型失败（${chatId}）：${j.code} ${(j.msg ?? '').slice(0, 120)}（需要 im:chat:readonly）`);
+    log.warn(`Fetching the conversation type failed (${chatId}): ${j.code} ${(j.msg ?? '').slice(0, 120)} (requires im:chat:readonly)`);
     return null;
   }
   const isGroup = j.data.chat_mode !== 'p2p';
@@ -109,7 +119,7 @@ export async function chatIsGroup(chatId: string): Promise<boolean | null> {
   return isGroup;
 }
 
-/** 仅供测试：清掉会话类型记忆。 */
+/** Test-only: clear the memoised conversation types. */
 export function __clearChatKindCacheForTest(): void {
   CHAT_IS_GROUP.clear();
 }

@@ -1,6 +1,9 @@
-// 单元/契约：Feishu adapter 的真实 probe 入口要把生产故障归因成 auth 或 drift。
-// 只 mock 飞书 token/HTTP 边界；feishuPort.probe 的 URL 构造、响应解析、kind 输出走真实代码。
-// 禁止镜像测试：不检查内部 if 分支，只验证 Feishu 真实返回形态会导向正确的 operator 告警语义。
+// Unit/contract: the Feishu adapter's real probe entry point must attribute production failures as
+// either auth or drift.
+// Only the Feishu token and HTTP boundaries are mocked; feishuPort.probe's URL construction, response
+// parsing and kind output all run the real code.
+// No mirror testing: this does not inspect internal if branches, only that the shapes Feishu really
+// returns lead to the correct operator alert semantics.
 process.env.FORGE_DB = ':memory:';
 process.env.FORGE_FUN = '0';
 
@@ -57,7 +60,7 @@ function reset(): void {
   requestedUrl = '';
 }
 
-test('tenant token 取不到：归 auth，提示查凭据/网络，而不是 schema drift', async () => {
+test('the tenant token cannot be obtained: attributed to auth, pointing at credentials/network rather than schema drift', async () => {
   reset();
   tenantToken = null;
 
@@ -69,7 +72,7 @@ test('tenant token 取不到：归 auth，提示查凭据/网络，而不是 sch
   assert.match(r.detail, /tenant_access_token/);
 });
 
-test('Feishu API 返回权限/加群错误 code：归 auth，并按观察群做只读探针', async () => {
+test('the Feishu API returns a permission / not-in-chat code: attributed to auth, probing read-only against the watched chat', async () => {
   reset();
   responseBody = { code: 99991663, msg: 'permission denied' };
 
@@ -81,7 +84,7 @@ test('Feishu API 返回权限/加群错误 code：归 auth，并按观察群做�
   assert.match(requestedUrl, /page_size=1/);
 });
 
-test('Feishu API 成功但分页信封字段缺失：归 drift，并保留 raw 供告警排查', async () => {
+test('the Feishu API succeeds but pagination envelope fields are missing: attributed to drift, keeping raw for alert triage', async () => {
   reset();
   responseBody = { code: 0, data: { items: [] } };
 
@@ -89,16 +92,16 @@ test('Feishu API 成功但分页信封字段缺失：归 drift，并保留 raw �
 
   assert.equal(r.ok, false);
   assert.equal(r.kind, 'drift');
-  assert.match(r.detail, /缺分页信封字段/);
+  assert.match(r.detail, /missing pagination envelope fields/);
   assert.match(r.raw ?? '', /"items"/);
 });
 
-test('Feishu API 分页信封完整：ok，无 kind', async () => {
+test('the Feishu pagination envelope is intact: ok, with no kind', async () => {
   reset();
 
   const r = await feishuPort.probe();
 
   assert.equal(r.ok, true);
   assert.equal(r.kind, undefined);
-  assert.match(r.detail, /分页信封完好/);
+  assert.match(r.detail, /pagination envelope intact/);
 });

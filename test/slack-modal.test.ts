@@ -1,8 +1,11 @@
-// 模态往返（src/slack/modal.ts）——Slack 与飞书唯一一处真正的交互差异。
-// 赌的就是一件事：**上下文能靠 private_metadata 活着回来**，而字段能靠 state.values 一次全拿到。
-// 这里把往返的两端拼起来跑一遍（build → 模拟提交 → parse），载荷形状取自 Slack 官方文档。
+// The modal round trip (src/slack/modal.ts) — the one genuine interaction difference between Slack and
+// Feishu.
+// It rests on a single bet: **the context survives via private_metadata**, and every field arrives at
+// once via state.values. This file joins both ends of the round trip and runs them (build -> simulated
+// submit -> parse), with payload shapes taken from Slack's official documentation.
 //
-// ⚠️ 钉的是我们的处理，不是 Slack 的真实行为——真工作区联调仍是 PR 里列的未验项。
+// Warning: what is pinned here is our handling, not Slack's actual behaviour — an integration pass
+// against a real workspace remains on the unverified list in the PR.
 process.env.FORGE_DB = ':memory:';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -10,12 +13,13 @@ import { buildDecisionModal, buildGoModal, flattenStateValues, parseViewSubmissi
 import type { DecisionItem } from '../src/gates/envelopes.ts';
 
 const ITEMS: DecisionItem[] = [
-  { id: 'H1', prompt: '要不要限额？', severity: 'high', options: [{ label: '要', recommended: true }, { label: '不要' }], hint: '按风控口径' },
-  { id: 'H2', prompt: '什么时候上？', options: [{ label: '本周' }, { label: '下周' }] },
+  { id: 'H1', prompt: 'Should there be a cap?', severity: 'high', options: [{ label: 'Yes', recommended: true }, { label: 'No' }], hint: 'Per the risk-control definition' },
+  { id: 'H2', prompt: 'When does it ship?', options: [{ label: 'This week' }, { label: 'Next week' }] },
 ];
 const CTX: ModalContext = { action: 'confirm_submit', slug: 'refund', round: 3, kind: 'decision' };
 
-// 模拟 Slack 提交：把每个 input 块按用户填的内容装成 state.values 的两层结构。
+// Simulate a Slack submission: pack what the user filled in for each input block into state.values'
+// two-level structure.
 function submit(view: Record<string, unknown>, filled: Record<string, string>): Record<string, unknown> {
   const values: Record<string, Record<string, unknown>> = {};
   for (const b of view.blocks as { type: string; block_id?: string; element?: { type: string; action_id: string } }[]) {
@@ -27,48 +31,48 @@ function submit(view: Record<string, unknown>, filled: Record<string, string>): 
   return { type: 'view_submission', user: { id: 'U42' }, view: { private_metadata: view.private_metadata, state: { values } } };
 }
 
-test('决策模态：每条待决项一个 input 块，block_id/action_id 都是 ask_<id>（与回拼同序对齐，绝不串题）', () => {
-  const v = buildDecisionModal(CTX, { items: ITEMS, verdict: true, submitText: '提交答复', notesLabel: '补充说明', notesPlaceholder: '写点什么' });
+test('decision modal: one input block per open question, with block_id/action_id both ask_<id> (lined up with the reassembly, so answers can never be attached to the wrong question)', () => {
+  const v = buildDecisionModal(CTX, { items: ITEMS, verdict: true, submitText: 'Submit answers', notesLabel: 'Additional notes', notesPlaceholder: 'Write something' });
   const ids = (v.blocks as { block_id?: string }[]).map((b) => b.block_id);
   assert.deepEqual(ids, ['ask_H1', 'ask_H2', 'verdict', 'notes']);
   assert.equal(v.type, 'modal');
-  assert.equal((v.submit as { text: string }).text, '提交答复');
+  assert.equal((v.submit as { text: string }).text, 'Submit answers');
 });
 
-test('决策模态：选项带 ★推荐 + 「其他」兜底；hint 落 hint 字段', () => {
+test('decision modal: options carry a star on the recommendation plus an "other" fallback; the hint lands in the hint field', () => {
   const v = buildDecisionModal(CTX, { items: ITEMS, submitText: 's', notesLabel: 'n', notesPlaceholder: 'p' });
   const first = (v.blocks as Record<string, unknown>[])[0] as { element: { options: { text: { text: string }; value: string }[] }; hint?: { text: string } };
-  assert.deepEqual(first.element.options.map((o) => o.text.text), ['★ 要', '不要', '其他（在下方补充说明里填）']);
+  assert.deepEqual(first.element.options.map((o) => o.text.text), ['★ Yes', 'No', 'Other (write it in the notes below)']);
   assert.equal(first.element.options[2].value, '__other__');
-  assert.match(first.hint?.text ?? '', /按风控口径/);
+  assert.match(first.hint?.text ?? '', /Per the risk-control definition/);
 });
 
-test('决策模态：每一项都是 optional——PM 可以只答一部分，剩下写补充框（与飞书语义一致）', () => {
+test('decision modal: every item is optional — the PM may answer only some and write the rest in the notes box (matching the Feishu semantics)', () => {
   const v = buildDecisionModal(CTX, { items: ITEMS, verdict: true, submitText: 's', notesLabel: 'n', notesPlaceholder: 'p' });
   for (const b of v.blocks as { type: string; optional?: boolean }[]) {
     if (b.type === 'input') assert.equal(b.optional, true);
   }
 });
 
-test('往返：{action,slug,round} 经 private_metadata 原样回来，字段一次全到（这就是本阶段赌的那件事）', () => {
+test('round trip: {action,slug,round} come back verbatim through private_metadata and every field arrives at once (this is the bet this phase rests on)', () => {
   const v = buildDecisionModal(CTX, { items: ITEMS, verdict: true, submitText: 's', notesLabel: 'n', notesPlaceholder: 'p' });
-  const payload = submit(v, { ask_H1: '要', ask_H2: '下周', verdict: 'accept', notes: '按风控口径来' });
+  const payload = submit(v, { ask_H1: 'Yes', ask_H2: 'Next week', verdict: 'accept', notes: 'Go with the risk-control definition' });
   const parsed = parseViewSubmission(payload);
   assert.deepEqual(parsed, {
     action: 'confirm_submit',
     slug: 'refund',
     round: 3,
-    formValues: { ask_H1: '要', ask_H2: '下周', verdict: 'accept', notes: '按风控口径来' },
+    formValues: { ask_H1: 'Yes', ask_H2: 'Next week', verdict: 'accept', notes: 'Go with the risk-control definition' },
   });
 });
 
-test('往返：没选的项**不出现**在 formValues 里（填空串会把「没答」写成「答了空」）', () => {
+test('round trip: unanswered items **do not appear** in formValues (filling in an empty string would record "unanswered" as "answered with nothing")', () => {
   const v = buildDecisionModal(CTX, { items: ITEMS, verdict: true, submitText: 's', notesLabel: 'n', notesPlaceholder: 'p' });
-  const parsed = parseViewSubmission(submit(v, { ask_H1: '要' }));
-  assert.deepEqual(parsed?.formValues, { ask_H1: '要' });
+  const parsed = parseViewSubmission(submit(v, { ask_H1: 'Yes' }));
+  assert.deepEqual(parsed?.formValues, { ask_H1: 'Yes' });
 });
 
-test('立项模态：DRI 下拉 + 预选推荐人；提交回来是 assignee', () => {
+test('filing modal: a DRI dropdown with the recommendation preselected; the submission comes back as assignee', () => {
   const ctx: ModalContext = { action: 'go', slug: 'refund', kind: 'go' };
   const v = buildGoModal(ctx, ['M', 'CC'], 'CC');
   const el = (v.blocks as Record<string, unknown>[])[0] as { element: { type: string; initial_option?: { value: string } } };
@@ -77,20 +81,20 @@ test('立项模态：DRI 下拉 + 预选推荐人；提交回来是 assignee', (
   assert.deepEqual(parseViewSubmission(submit(v, { assignee: 'M' })), { action: 'go', slug: 'refund', round: 0, formValues: { assignee: 'M' } });
 });
 
-test('立项模态：拿不到 DRI 池（守护重启的降级路径）→ 退成自由文本，绝不让按钮点了没反应', () => {
+test('filing modal: no DRI pool available (the degraded path after a daemon restart) -> fall back to free text, never let the button do nothing', () => {
   const v = buildGoModal({ action: 'go', slug: 's', kind: 'go' }, [], null);
   const el = (v.blocks as Record<string, unknown>[])[0] as { element: { type: string } };
   assert.equal(el.element.type, 'plain_text_input');
 });
 
-test('parseViewSubmission：private_metadata 坏/缺/无 slug → null（认不出就是认不出，绝不猜一个 slug）', () => {
-  assert.equal(parseViewSubmission({ view: { private_metadata: '不是json' } }), null);
+test('parseViewSubmission: broken / missing private_metadata, or no slug -> null (unrecognised is unrecognised; never guess a slug)', () => {
+  assert.equal(parseViewSubmission({ view: { private_metadata: 'not json' } }), null);
   assert.equal(parseViewSubmission({ view: { private_metadata: '{}' } }), null);
   assert.equal(parseViewSubmission({ view: { private_metadata: '{"action":"go"}' } }), null);
   assert.equal(parseViewSubmission({}), null);
 });
 
-test('flattenStateValues：两层嵌套拍平；下拉取 selected_option.value，文本取 value', () => {
+test('flattenStateValues: flattens the two levels; a dropdown takes selected_option.value, a text field takes value', () => {
   assert.deepEqual(
     flattenStateValues({
       values: {
@@ -105,48 +109,49 @@ test('flattenStateValues：两层嵌套拍平；下拉取 selected_option.value�
   assert.deepEqual(flattenStateValues(undefined), {});
 });
 
-test('决策模态：没有待决项也给得出合法 view（Slack 不接受空 blocks，会整个报错）', () => {
+test('decision modal: even with no open questions it produces a valid view (Slack rejects empty blocks outright)', () => {
   const v = buildDecisionModal(CTX, { items: [], submitText: 's', notesLabel: 'n', notesPlaceholder: 'p' });
   assert.ok((v.blocks as unknown[]).length >= 1);
 });
 
-// ── plain_text 的上限是按字段分的，超了不是截断而是**整发失败** ───────────
-// view.title/submit/close = 24；option.text/value = 75；placeholder = 150；input.label/hint = 2000。
-// 违反哪一条，views.open 都只回一个 ok:false —— 用户侧的症状是「按钮点了没反应」，
-// 日志里也只有一行 invalid_arguments。这类错只有真工作区点一次才会出现，所以在这里钉死。
+// -- plain_text limits are per field, and going over is not truncation but **total failure** ---------
+// view.title/submit/close = 24; option.text/value = 75; placeholder = 150; input.label/hint = 2000.
+// Violate any of them and views.open returns nothing but ok:false — the user-visible symptom is "the
+// button does nothing", with a single invalid_arguments line in the log. This class of error only appears
+// when someone clicks once in a real workspace, so it is pinned here.
 const lenOf = (t: string): number => Array.from(t).length;
 const textOf = (o: unknown): string => (o as { text: string }).text;
 
-test('模态标题/提交/取消封顶 24 字符——超了 views.open 直接 ok:false，人看到的是「按钮点了没反应」', () => {
-  const v = buildDecisionModal(CTX, { items: ITEMS, submitText: '提交决议'.repeat(10), notesLabel: 'n', notesPlaceholder: 'p', title: '这是一个非常非常非常长的模态标题'.repeat(3) });
-  assert.ok(lenOf(textOf(v.title)) <= 24, `title 超限：${textOf(v.title)}`);
-  assert.ok(lenOf(textOf(v.submit)) <= 24, `submit 超限：${textOf(v.submit)}`);
+test('modal title/submit/close cap at 24 characters — over that, views.open returns ok:false outright and the person sees "the button does nothing"', () => {
+  const v = buildDecisionModal(CTX, { items: ITEMS, submitText: 'Submit the decision'.repeat(10), notesLabel: 'n', notesPlaceholder: 'p', title: 'A really really really long modal title'.repeat(3) });
+  assert.ok(lenOf(textOf(v.title)) <= 24, `title over the limit: ${textOf(v.title)}`);
+  assert.ok(lenOf(textOf(v.submit)) <= 24, `submit over the limit: ${textOf(v.submit)}`);
   assert.ok(lenOf(textOf(v.close)) <= 24);
-  assert.match(textOf(v.submit), /…$/, '截断要看得出来是截断');
+  assert.match(textOf(v.submit), /…$/, 'truncation has to be visible as truncation');
 });
 
-test('提交文案为空同样是 ok:false（空 plain_text 不合法）→ 退到兜底文案，绝不发一个开不出来的模态', () => {
+test('empty submit text is equally ok:false (an empty plain_text is invalid) -> fall back to a placeholder, never send a modal that cannot open', () => {
   const v = buildDecisionModal(CTX, { items: ITEMS, submitText: '   ', notesLabel: 'n', notesPlaceholder: 'p', title: '' });
-  assert.equal(textOf(v.submit), '提交');
-  assert.equal(textOf(v.title), '需求评审');
+  assert.equal(textOf(v.submit), 'Submit');
+  assert.equal(textOf(v.title), 'Requirement review');
 });
 
-test('截断按码点走：绝不把 emoji 的代理对劈成两半（非法 UTF-16 会让整个 view 被拒）', () => {
+test('truncation works on code points: an emoji surrogate pair is never split in half (invalid UTF-16 gets the whole view rejected)', () => {
   const v = buildDecisionModal(CTX, { items: [], submitText: '🔴'.repeat(40), notesLabel: 'n', notesPlaceholder: 'p' });
   const t = textOf(v.submit);
   assert.ok(lenOf(t) <= 24);
-  assert.doesNotMatch(t, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/, '不该出现落单的代理项');
+  assert.doesNotMatch(t, /[\uD800-\uDBFF](?![\uDC00-\uDFFF])|(?<![\uD800-\uDBFF])[\uDC00-\uDFFF]/, 'no lone surrogate should appear');
 });
 
-test('待决项 label 按 2000 封顶而不是 150——PM 不该在模态里只看见半句问题', () => {
-  const long = '为'.repeat(600);
+test('an open-question label caps at 2000 rather than 150 — a PM should not see half a question inside the modal', () => {
+  const long = 'w'.repeat(600);
   const v = buildDecisionModal(CTX, { items: [{ id: 'H1', prompt: long, options: [{ label: 'a' }] }], submitText: 's', notesLabel: 'n', notesPlaceholder: 'p' });
   const label = textOf((v.blocks as { label: unknown }[])[0].label);
-  assert.ok(lenOf(label) > 150, '150 是 placeholder 的上限，不是 label 的');
+  assert.ok(lenOf(label) > 150, '150 is the placeholder limit, not the label limit');
   assert.ok(lenOf(label) <= 2000);
 });
 
-test('下拉选项 text/value 封顶 75；value 不带省略号（它要原样回喂给核心，不是给人看的）', () => {
+test('dropdown option text/value cap at 75; the value gets no ellipsis (it is fed back to the core verbatim, not read by a person)', () => {
   const long = 'x'.repeat(200);
   const v = buildDecisionModal(CTX, { items: [{ id: 'H1', prompt: 'p', options: [{ label: long }] }], submitText: 's', notesLabel: 'n', notesPlaceholder: 'p' });
   const opt = (v.blocks as { element: { options: { text: unknown; value: string }[] } }[])[0].element.options[0];

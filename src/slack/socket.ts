@@ -1,28 +1,37 @@
-// Slack provider 层——**Socket Mode 长连接**。零新依赖：apps.connections.open 换 wss URL，
-// 再用 Node 原生 WebSocket（≥22 内置，本仓要求 ≥24）连上去。跟飞书那边用 lark SDK 是对等的一层。
+// Slack provider layer — **the Socket Mode connection**. Zero new dependencies:
+// apps.connections.open returns a wss URL, and Node's native WebSocket (built in since 22; this repo
+// requires 24) connects to it. This is the peer of the lark SDK layer on the Feishu side.
 //
-// 手搓要正确处理的就五件事，全在下面：
-//   ① 每条带 envelope_id 的信封**必须立刻 ack**，否则 Slack 3 秒后重投，业务动作会被执行两次；
-//   ② Slack 会定期主动发 type:'disconnect'（refresh_requested）并随后断开——这是常态，不是故障。
-//      两条推论：**不报错**（报了核心就 markWs(false)+log.err，每半小时一次假警报），
-//      且**先建新连接再关旧的**——中间留空窗的话，落在窗口里的按钮点击就没了：
-//      群消息还能靠重连后的补拉捞回来，interactive 载荷捞不回来；
-//   ③ 硬断时原生 WebSocket 会**先 error 再 close**（本地 spike 实测：open→…→error→close:1006），
-//      两个事件都触发重连的话会开出两条连接，于是每条信封收两遍。故一次连接只允许结算一次。
-//   ④ 首连失败要如实 reject（交核心决定降级为仅周期 tick），重连失败则退避重试、绝不放弃；
-//   ⑤ close() 要关掉**所有**还活着的连接、且任何一条路径都不能留下不结算的 promise。
-//      ②带来的重叠窗口里有两条连接，漏掉一条 daemon 就退不出去；漏掉一次 resolve，启动就挂在 await 上。
-//      两种都不报错，只是「停不下来」或「起不来」。
+// Writing it by hand means getting exactly five things right, and all five are below:
+//   1. Every envelope carrying an envelope_id **must be acked immediately**, or Slack redelivers after
+//      3 seconds and the business action runs twice;
+//   2. Slack periodically sends type:'disconnect' (refresh_requested) and then closes the connection —
+//      this is normal, not a fault. Two consequences: **do not report an error** (reporting it makes the
+//      core call markWs(false) + log.err, a bogus alarm every half hour), and **establish the new
+//      connection before closing the old one** — leaving a gap in between loses any button click that
+//      lands in it: channel messages can still be recovered by the backfill after reconnect, but
+//      interactive payloads cannot;
+//   3. On a hard drop the native WebSocket fires **error before close** (measured in a local spike:
+//      open -> … -> error -> close:1006), and reconnecting on both events opens two connections, so
+//      every envelope arrives twice. Hence one connection may settle only once.
+//   4. A failed first connect must reject faithfully (leaving the core to decide whether to degrade to
+//      periodic ticks only), while a failed reconnect backs off and retries and never gives up;
+//   5. close() must close **every** connection still alive, and no path may leave an unsettled promise.
+//      The overlap window from (2) holds two connections, and missing one means the daemon cannot exit;
+//      missing one resolve() means startup hangs on the await. Neither reports an error — they just
+//      manifest as "it won't stop" or "it won't start".
 //
-// 依赖全部可注入（openUrl / connect / sleep），所以上面这套状态机能在**没有网络、没有 Slack 工作区**
-// 的情况下被单测钉死。这正是它值得手写的前提：不可测的手写长连接才是负债。
+// Every dependency is injectable (openUrl / connect / sleep), so the state machine above can be pinned
+// by unit tests **with no network and no Slack workspace**. That is precisely what makes hand-writing it
+// defensible: an untestable hand-written connection is the thing that would be a liability.
 //
-// 只允许 messaging/slack.ts 使用（架构边界闸守着）。
+// Only messaging/slack.ts may use this (the architecture boundary gate enforces it).
 import { log } from '../util/log.ts';
 import { appToken } from './web.ts';
 import { slackApi } from './web.ts';
 
-// 我们只用到 WebSocket 的这几件事——收窄成最小接口，测试才能塞假的进来。
+// We use only these few things from WebSocket — narrowed to the smallest interface so tests can inject a
+// fake.
 export interface WsLike {
   addEventListener(type: string, cb: (ev: { data?: unknown; code?: number; reason?: string }) => void): void;
   send(data: string): void;
@@ -30,7 +39,8 @@ export interface WsLike {
 }
 
 export interface SocketHandlers {
-  // 一条已 ack 的信封：type 是 Slack 的信封类型（events_api / interactive / slash_commands），payload 是原始载荷。
+  // One acked envelope: `type` is Slack's envelope type (events_api / interactive / slash_commands) and
+  // `payload` is the raw payload.
   onEnvelope(type: string, payload: Record<string, unknown>): void;
   onError(reason: string): void;
   onReconnected(): void;
@@ -45,7 +55,8 @@ export interface SocketDeps {
 const BACKOFF_BASE_MS = 1000;
 const BACKOFF_CAP_MS = 60_000;
 
-// 退避：1s → 2s → 4s … 封顶 60s。导出供单测直接断言（重连节奏错了会把工作区打成 429）。
+// Backoff: 1s -> 2s -> 4s … capped at 60s. Exported so unit tests can assert on it directly (getting the
+// reconnect cadence wrong would hammer the workspace into 429s).
 export function backoffMs(attempt: number): number {
   return Math.min(BACKOFF_CAP_MS, BACKOFF_BASE_MS * 2 ** Math.max(0, attempt));
 }
@@ -64,8 +75,9 @@ export interface SocketChannel {
   close(): void;
 }
 
-// 一条连接的私有状态。superseded = 「它已经被一条新连接接住了」——那它之后的断开是**计划内**的：
-// 不该报错，也不该再触发一次重连（否则一次换连接会开出两条，每条信封收两遍）。
+// One connection's private state. superseded = "a new connection has already taken over from it", which
+// makes its subsequent disconnect **planned**: it should not report an error and should not trigger
+// another reconnect (otherwise one connection swap opens two, and every envelope arrives twice).
 interface Conn {
   sock: WsLike;
   superseded: boolean;
@@ -73,11 +85,13 @@ interface Conn {
 
 export function createSocketChannel(handlers: SocketHandlers, overrides: Partial<SocketDeps> = {}): SocketChannel {
   const deps: SocketDeps = { ...defaultDeps, ...overrides };
-  // 同时活着的连接**不止一条**：计划内换连接会短暂两条并存（先建新的、连上再关旧的）。
-  // 所以不能只记「当前那条」——close() 正好落在重叠窗口里的话，另一条就成了没人管的连接：
-  // 它不会再重连（superseded），也永远不会被关掉，于是进程带着一个活着的句柄退不出去。
+  // **More than one** connection can be alive at a time: a planned swap briefly holds two (build the new
+  // one, then close the old once it is up).
+  // So tracking only "the current one" is not enough — if close() lands inside the overlap window, the
+  // other connection is left unowned: it will not reconnect (superseded) and will never be closed, so the
+  // process cannot exit while holding a live handle.
   const live = new Set<WsLike>();
-  let closed = false; // 调用方显式 close() 之后不再重连
+  let closed = false; // once the caller has explicitly called close(), never reconnect again
   let attempt = 0;
   let everConnected = false;
 
@@ -86,21 +100,24 @@ export function createSocketChannel(handlers: SocketHandlers, overrides: Partial
     try {
       sock.close();
     } catch {
-      /* 已经断了 */
+      /* already disconnected */
     }
   }
 
-  // 起一条连接。首连（first=true）把失败原样 reject 交给核心；重连则自行退避重试。
-  // onOpened：新连接**真的连上之后**才执行的收尾（换连接时用来关掉旧的那条）。
+  // Open one connection. The first connect (first=true) rejects faithfully so the core can decide;
+  // a reconnect backs off and retries on its own.
+  // onOpened: cleanup that runs only **after the new connection is genuinely up** (used during a swap to
+  // close the old one).
   function open(first: boolean, onOpened?: () => void): Promise<void> {
     return new Promise<void>((resolve, reject) => {
       void (async () => {
         const got = await deps.openUrl();
-        // 等 openUrl 期间调用方关了通道 → 不再往下建连接。但 promise **必须落地**：
-        // 首连时 connect() 是被 await 的，留一个永不结算的 promise 会把启动路径直接挂住。
+        // The caller closed the channel while openUrl was in flight -> do not go on to build a connection.
+        // But the promise **must settle**: connect() is awaited on the first connect, and leaving a
+        // never-settling promise would hang the startup path outright.
         if (closed) return void resolve();
         if (!got.ok || !got.url) {
-          const reason = `apps.connections.open 失败：${got.error ?? '无 url'}`;
+          const reason = `apps.connections.open failed: ${got.error ?? 'no url'}`;
           if (first) return reject(new Error(reason));
           handlers.onError(reason);
           return void scheduleReconnect();
@@ -108,30 +125,31 @@ export function createSocketChannel(handlers: SocketHandlers, overrides: Partial
         const sock = deps.connect(got.url);
         live.add(sock);
         const conn: Conn = { sock, superseded: false };
-        // ③ 一次连接只结算一次：error 与 close 常常成对出现，各触发一次重连就会开出两条连接。
+        // (3) One connection settles once: error and close usually arrive as a pair, and reconnecting on
+        // each of them would open two connections.
         let settled = false;
         const settle = (reason: string): void => {
           if (settled) return;
           settled = true;
-          if (closed || conn.superseded) return; // 计划内换连接：旧连接的断开既不报错也不再重连
+          if (closed || conn.superseded) return; // a planned swap: the old connection's close neither reports nor reconnects
           handlers.onError(reason);
           void scheduleReconnect();
         };
         sock.addEventListener('open', () => {
           if (closed) {
-            closeQuietly(sock); // 建连过程中被 close()：别留一条没人管的连接
-            return void resolve(); // 同上：调用方已经不要这条通道了，但 promise 不能吊着
+            closeQuietly(sock); // close() arrived while connecting: do not leave an unowned connection
+            return void resolve(); // as above: the caller no longer wants this channel, but the promise must not dangle
           }
-          attempt = 0; // 连上了就把退避清零，下次断开重新从 1s 起
+          attempt = 0; // connected, so reset the backoff; the next disconnect starts from 1s again
           if (everConnected) handlers.onReconnected();
           everConnected = true;
-          onOpened?.(); // 新连接已就绪 → 这时才关旧连接，中间不留空窗
+          onOpened?.(); // the new connection is ready -> only now close the old one, leaving no gap
           resolve();
         });
         sock.addEventListener('message', (ev) => onFrame(conn, ev?.data));
         sock.addEventListener('error', () => settle('WebSocket error'));
         sock.addEventListener('close', (ev) => {
-          live.delete(sock); // 已经断了，不必再关它（也别让 live 随重连一路涨下去）
+          live.delete(sock); // already disconnected, no need to close it (and do not let `live` grow with every reconnect)
           settle(`WebSocket closed code=${ev?.code ?? '?'}`);
         });
       })();
@@ -140,31 +158,34 @@ export function createSocketChannel(handlers: SocketHandlers, overrides: Partial
 
   function onFrame(conn: Conn, data: unknown): void {
     const sock = conn.sock;
-    if (typeof data !== 'string') return; // Slack 只发文本帧；二进制不是我们的东西
+    if (typeof data !== 'string') return; // Slack sends text frames only; binary is not ours
     let env: { envelope_id?: string; type?: string; payload?: unknown; reason?: string };
     try {
       env = JSON.parse(data) as typeof env;
     } catch {
-      log.warn(`Slack 信封不是合法 JSON（已跳过）：${data.slice(0, 120)}`);
+      log.warn(`Slack envelope is not valid JSON (skipped): ${data.slice(0, 120)}`);
       return;
     }
-    // ① 先 ack 再处理：ack 迟于 3s 就会被重投，那意味着同一个按钮点击被执行两次。
+    // (1) Ack before handling: an ack later than 3s means redelivery, which means the same button click
+    // executes twice.
     if (env.envelope_id) {
       try {
         sock.send(JSON.stringify({ envelope_id: env.envelope_id }));
       } catch (e) {
-        log.warn(`Slack ack 发送失败（会被重投）：${String(e).slice(0, 120)}`);
+        log.warn(`Failed to send the Slack ack (it will be redelivered): ${String(e).slice(0, 120)}`);
       }
     }
-    if (env.type === 'hello') return; // 建连问候，无载荷
+    if (env.type === 'hello') return; // the connection greeting, no payload
     if (env.type === 'disconnect') {
-      // ② 常态：Slack 定期要求换连接，并在短暂宽限后断开这一条。这是**计划内**的：
-      // 不走 onError（否则核心每半小时被报一次假故障），也不走退避——直接现在就建新连接，
-      // 等新连接 open 了再关旧的。空窗期丢掉的按钮点击是补拉捞不回来的，所以宁可短暂两条并存
-      //（Slack 把每条事件只投给其中一条，重叠不会重复投递）。
-      if (conn.superseded) return; // 同一条连接上重复收到 disconnect：新连接已在建，别再开一条
+      // (2) Normal operation: Slack periodically asks for a connection swap and closes this one after a
+      // short grace period. This is **planned**: it does not go through onError (which would report a
+      // bogus fault to the core every half hour) and does not go through backoff — build the new
+      // connection right now and close the old one once the new one is open. Button clicks lost in a gap
+      // cannot be recovered by backfill, so two briefly coexisting connections is the better trade (Slack
+      // delivers each event to only one of them, so an overlap does not double-deliver).
+      if (conn.superseded) return; // a repeated disconnect on the same connection: a new one is already being built, do not open another
       conn.superseded = true;
-      log.info(`Slack 要求换连接（${env.reason ?? 'disconnect'}）→ 先建新连接，连上后再关旧的`);
+      log.info(`Slack requested a connection swap (${env.reason ?? 'disconnect'}) -> building the new connection first, closing the old one once it is up`);
       void open(false, () => closeQuietly(sock)).catch(() => undefined);
       return;
     }
@@ -177,7 +198,7 @@ export function createSocketChannel(handlers: SocketHandlers, overrides: Partial
     const wait = backoffMs(attempt++);
     void deps.sleep(wait).then(() => {
       if (closed) return;
-      void open(false).catch(() => undefined); // 重连路径自己会继续退避，不再向上抛
+      void open(false).catch(() => undefined); // the reconnect path keeps backing off on its own and does not rethrow
     });
   }
 
@@ -185,7 +206,7 @@ export function createSocketChannel(handlers: SocketHandlers, overrides: Partial
     connect: () => open(true),
     close() {
       closed = true;
-      for (const s of [...live]) closeQuietly(s); // 重叠窗口里可能有两条，一条都不能漏
+      for (const s of [...live]) closeQuietly(s); // the overlap window may hold two; not one may be missed
     },
   };
 }
