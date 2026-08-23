@@ -1,52 +1,61 @@
-// remotePull——runner 经 HTTP 从**控制面**拉到期 job（GitHub-runner 模式：runner 先向控制面要 job）。
-// 与 localJobSource（同进程 DB 枚举）实现同一 JobSource 接口；选择点（jobs/index.ts）按 FORGE_CONTROL_URL 切。
+// remotePull - a runner pulls due jobs from the **control plane** over HTTP (the GitHub-runner model: the
+// runner asks the control plane for work first).
+// It implements the same JobSource interface as localJobSource (which enumerates the DB in-process); the
+// selection point (jobs/index.ts) switches on FORGE_CONTROL_URL.
 //
-// wire 契约：控制面 `GET /jobs` → 到期 session 的 JSON 数组（POLLER_DRIVEN 态）。client（runner）与 server
-// （控制面）共用本文件的序列化/解析，保证两端对齐。控制面侧用 `dueJobsPayload(localJobSource)` 出 payload
-// （待挂进控制面 HTTP server，本切片先备好 + 往返测试验证；生产挂载是后续）。
+// The wire contract: the control plane's `GET /jobs` returns a JSON array of due sessions (those in a
+// POLLER_DRIVEN state). The client (runner) and the server (control plane) share this file's serialisation and
+// parsing, which keeps both ends aligned. The control-plane side produces its payload with
+// `dueJobsPayload(localJobSource)`.
 //
-// 失败不静默：网络/HTTP 非 2xx/坏 JSON/非法 job → **抛**。runner 据此知道「拉不到 job」，绝不把拉取失败
-// 静默当成「无活」而空转睡过去（那会让所有需求静默卡死）。
+// No silent failures: a network error, a non-2xx, broken JSON or a malformed job all **throw**. That is how the
+// runner knows "no jobs could be pulled" and never silently treats a failed pull as "there is no work" and
+// sleeps through it (which would stall every requirement without a symptom).
 import type { Session } from '../../types.ts';
 import type { JobSource } from './port.ts';
 
 const TIMEOUT_MS = 30_000;
 
-// 控制面侧：把本地到期 job 序列化成 wire payload（JSON 数组）。limit = 请求方 runner 的本轮容量。
+// The control-plane side: serialise the local due jobs into the wire payload (a JSON array). limit is the
+// requesting runner's capacity for this round.
 export async function dueJobsPayload(src: JobSource, limit: number): Promise<string> {
   return JSON.stringify(await src.claimDueJobs(limit));
 }
 
-// 解析 + 轻校验 wire payload（绝不信任外部输入：非数组 / job 缺 id|state → 抛，不静默放过坏数据）。
+// Parse and lightly validate the wire payload (external input is never trusted: anything that is not an array,
+// or a job missing id or state, throws rather than letting bad data through silently).
 function parseJobs(text: string): Session[] {
   let arr: unknown;
   try {
     arr = JSON.parse(text);
   } catch {
-    throw new Error('控制面 /jobs 返回非法 JSON');
+    throw new Error('control plane /jobs returned invalid JSON');
   }
-  if (!Array.isArray(arr)) throw new Error('控制面 /jobs 返回非数组');
+  if (!Array.isArray(arr)) throw new Error('control plane /jobs did not return an array');
   for (const j of arr) {
     if (!j || typeof (j as Session).id !== 'string' || typeof (j as Session).state !== 'string') {
-      throw new Error('控制面 /jobs 含非法 job（缺 id/state）');
+      throw new Error('control plane /jobs returned an invalid job (id or state is missing)');
     }
   }
   return arr as Session[];
 }
 
-// runner 客户端：从 baseUrl 拉到期 job。baseUrl 末尾斜杠归一（避免 `//jobs`）。token 给定则带
-// `Authorization: Bearer <token>`（控制面鉴权边界，shared secret）。runnerId 给定则 `?runner=<id>`——控制面据此
-// 把租约记在本 runner 名下（多 runner 防重领）；缺省则控制面用自己的 RUNNER_ID（loopback/单 runner 兜底）。
+// The runner client: pull due jobs from baseUrl. Trailing slashes on baseUrl are normalised away (so it never
+// requests `//jobs`). When a token is given it sends `Authorization: Bearer <token>` (the control plane's
+// authentication boundary, a shared secret). When a runnerId is given it appends `?runner=<id>`, so the control
+// plane records the lease under this runner; without one the control plane uses its own RUNNER_ID (the
+// loopback / single-runner fallback).
 export function makeRemoteJobSource(baseUrl: string, token?: string, runnerId?: string): JobSource {
   const base = baseUrl.replace(/\/+$/, '');
   const headers: Record<string, string> = token ? { Authorization: `Bearer ${token}` } : {};
   const runnerQs = runnerId ? `runner=${encodeURIComponent(runnerId)}` : '';
   return {
     claimDueJobs: async (limit: number) => {
-      // limit 本轮并发容量随请求带上 → 控制面据此 FIFO 占租至多 limit 条给本 runner（多 runner 分摊 backlog）。
+      // This round's concurrency capacity travels with the request, so the control plane leases at most `limit`
+      // jobs FIFO to this runner (which is what spreads the backlog across runners).
       const qs = [runnerQs, `limit=${encodeURIComponent(String(limit))}`].filter(Boolean).join('&');
       const res = await fetch(`${base}/jobs?${qs}`, { headers, signal: AbortSignal.timeout(TIMEOUT_MS) });
-      if (!res.ok) throw new Error(`控制面 /jobs HTTP ${res.status}`);
+      if (!res.ok) throw new Error(`control plane /jobs returned HTTP ${res.status}`);
       return parseJobs(await res.text());
     },
   };

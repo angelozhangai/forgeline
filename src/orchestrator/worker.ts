@@ -2,8 +2,8 @@ import { existsSync, readFileSync, writeFileSync, unlinkSync, mkdirSync, statSyn
 import { resolve, dirname } from 'node:path';
 import { hours } from '../util/time.ts';
 import { STATE_DIR } from '../root.ts';
-import { store as sessions } from '../store/index.ts'; // 经 SessionStore 接缝（选择点），不直连 store/sessions.ts
-import { jobSource } from './jobs/index.ts'; // 控制面/Runner 边界接缝：tick 经此取到期 job，不直接 DB 枚举
+import { store as sessions } from '../store/index.ts'; // through the SessionStore seam (the selection point), never directly from store/sessions.ts
+import { jobSource } from './jobs/index.ts'; // the control-plane / runner boundary seam: the tick takes due jobs through this rather than enumerating the DB itself
 import type { State } from '../statemachine/states.ts';
 import { runGateA, runGateARevision } from '../gates/gateA.ts';
 import type { GateAOutcome } from '../gates/gateA.ts';
@@ -36,8 +36,11 @@ import type { NotifyKind } from '../notify.ts';
 import type { Session } from '../types.ts';
 import { fireTickStart, fireTickEnd } from '../ext/index.ts';
 
-// ── 节点失败统一停泊：分类 → 瞬时则排程退避自动重试（耗尽转死信），永久则立即停泊等人 ──
-// 替换原先「一律 transition(*_FAILED) + notify」，把瞬时基础设施抖动与语义失败分流（落实 P0-A/B）。
+// -- One place to park a step failure: classify it, and for a transient one schedule an automatic retry with a
+//    backoff (moving to the dead-letter queue once those are exhausted); for a permanent one park immediately
+//    and wait for a human. --
+// This replaced the old "always transition(*_FAILED) + notify", separating an infrastructure wobble from a
+// semantic failure.
 async function parkFailure(
   id: string,
   failState: State,
@@ -49,25 +52,28 @@ async function parkFailure(
   const msg = String(err).slice(0, 500);
   const tries = s.retry_count ?? 0;
 
-  // 瞬时 + 未达上限 + 未死信 → 排程退避自动重试（不发通知避免噪声；下个 tick 到点 reconcile 拾起）。
+  // Transient, under the cap, and not dead-lettered -> schedule an automatic retry with a backoff (no
+  // notification, to avoid noise; a later tick's reconcile picks it up once the backoff expires).
   if (klass === 'transient' && tries < maxAutoRetries() && !s.dead_letter) {
     const attempt = tries + 1;
     const delay = backoffMs(attempt);
     await sessions.transition(id, failState, { error: msg, retry_count: attempt, next_retry_at: Date.now() + delay });
     await sessions.appendEvent(id, 'retry_scheduled', { stage: stages.event, attempt, max: maxAutoRetries(), klass, delay_ms: delay });
-    log.warn(`${s.slug}: ${stages.label} 瞬时失败（第${attempt}/${maxAutoRetries()}次）→ ${Math.round(delay / 1000)}s 后自动重试 — ${msg.slice(0, 120)}`);
+    log.warn(`${s.slug}: ${stages.label} failed transiently (attempt ${attempt}/${maxAutoRetries()}) -> retrying automatically in ${Math.round(delay / 1000)}s - ${msg.slice(0, 120)}`);
     return;
   }
 
-  // 永久 / 瞬时重试耗尽 → 停泊等人。耗尽的瞬时标死信（automation 放弃，人工 retry 清）。
+  // Permanent, or a transient whose retries are exhausted -> park and wait for a human. An exhausted transient
+  // is marked dead-letter (automation has given up; a manual retry clears it).
   const exhausted = klass === 'transient' && tries >= maxAutoRetries();
   await sessions.transition(id, failState, { error: msg, next_retry_at: null, ...(exhausted ? { dead_letter: 1 } : {}) });
   await sessions.appendEvent(id, 'error', { stage: stages.event, msg: String(err), klass, dead_letter: exhausted ? 1 : 0 });
-  log.err(`${s.slug}: ${stages.label} 失败（${klass}${exhausted ? '·重试耗尽→死信' : ''}）— ${msg.slice(0, 160)}`);
+  log.err(`${s.slug}: ${stages.label} failed (${klass}${exhausted ? ', retries exhausted -> dead letter' : ''}) - ${msg.slice(0, 160)}`);
   await notify('failed', (await sessions.get(id))!, { stage: stages.label, error: String(err) });
 }
 
-// 成功推进 → 清重试簿记（下次失败从零计数；毒丸计数归零）。仅在确有簿记时写，省无谓 UPDATE。
+// Advancing successfully clears the retry bookkeeping (so the next failure counts from zero, and the poison-pill
+// counter resets). It only writes when there is bookkeeping to clear, avoiding a pointless UPDATE.
 async function clearRetry(id: string): Promise<void> {
   const s = (await sessions.get(id))!;
   if (s.retry_count || s.next_retry_at || s.reclaim_count || s.dead_letter) {
@@ -75,50 +81,59 @@ async function clearRetry(id: string): Promise<void> {
   }
 }
 
-// 闸A 一轮（首轮/复评）跑完，据结论转移：无剩余→进 codex 对抗复审；到上限→GATE_A_STALLED；否则→等 PM 下一轮。
+// One Gate A round (the first, or a re-review) has finished; transition on its conclusion: nothing left open ->
+// enter the codex adversarial re-review; at the cap -> GATE_A_STALLED; otherwise wait for the PM's next round.
 async function afterGateA(id: string, outcome: GateAOutcome): Promise<void> {
   const s = (await sessions.get(id))!;
   if (outcome.resolved) {
-    // PM loop 无剩余开放问题 → 不直接确认，先过一道 codex 对抗复审（不通过继续，过了才 CONFIRMED）。
-    // 进对抗即落 gate_a_adv_round=0 标记：万一首轮 codex 调用就失败（计轮/起线之前），retry 也能据此原地续跑
-    // 对抗（不退回 INTAKE 重跑整闸 A、不重新打扰 PM）——见 planRetry。
+    // The PM loop has no open questions left -> do not confirm directly; first pass a codex adversarial
+    // re-review (it keeps going until that passes, and only then is it CONFIRMED).
+    // Entering the adversarial phase writes gate_a_adv_round=0 as a marker: if the very first codex call fails
+    // (before any round is counted or a thread started), a retry can still use it to continue the adversarial
+    // loop in place rather than falling back to INTAKE, re-running all of Gate A and bothering the PM again -
+    // see planRetry.
     await sessions.transition(id, 'GATE_A_ADVERSARIAL', { gate_a_adv_round: 0 });
     await sessions.appendEvent(id, 'gate_a_resolved', { round: outcome.round });
-    log.ok(`${s.slug}: 闸A 第${outcome.round}轮无剩余开放问题 → 进 codex 对抗复审`);
+    log.ok(`${s.slug}: Gate A round ${outcome.round} left no open questions -> entering the codex adversarial re-review`);
     await syncGroupCard((await sessions.get(id))!);
     return;
   }
   if (outcome.stalled) {
     await sessions.transition(id, 'GATE_A_STALLED');
     await sessions.appendEvent(id, 'gate_a_stalled', { round: outcome.round, open_questions: outcome.openQuestions });
-    log.warn(`${s.slug}: 闸A 到 ${outcome.round - 1} 轮 PM 评审仍有 ${outcome.openQuestions} 条未决 → 停泊交 M 裁决`);
+    log.warn(`${s.slug}: after ${outcome.round - 1} rounds of PM review, Gate A still has ${outcome.openQuestions} unresolved question(s) -> parking for the owner to arbitrate`);
     await notify('needs_arbitration', (await sessions.get(id))!);
     return;
   }
   await sessions.transition(id, 'AWAITING_PM_CONFIRM');
   await sessions.appendEvent(id, 'gate_a_done', { round: outcome.round, open_questions: outcome.openQuestions });
-  log.ok(`${s.slug}: 闸A 第${outcome.round}轮完成（${outcome.openQuestions} 条待 PM）→ 待 PM 确认`);
+  log.ok(`${s.slug}: Gate A round ${outcome.round} finished (${outcome.openQuestions} question(s) for the PM) -> awaiting the PM's confirmation`);
   await notify('needs_confirm', (await sessions.get(id))!);
 }
 
-// 闸B codex审⇄claude改 循环跑到下一停顿点，据结论转移：
-// clean→待 GO；改方升级→等 M 答复；到上限→停泊裁决；每-tick 上限/重试→留循环态（下个 tick 续）。
+// The Gate B codex-reviews / claude-revises loop has run to its next resting point; transition on its
+// conclusion: clean -> await GO; the revision escalated -> await the owner's answer; at the cap -> park for
+// arbitration; the per-tick cap or a retry -> stay in the loop state and continue next tick.
 async function afterGateB(id: string, outcome: ReviewFixOutcome): Promise<void> {
   const s = (await sessions.get(id))!;
   if (outcome.paused) {
-    // 留在 ADVERSARIAL_LOOP（poller 驱动，下个 tick 自动续跑）；不发通知，避免噪声。
+    // Stay in ADVERSARIAL_LOOP (poller-driven, so the next tick continues automatically); no notification, to
+    // avoid noise.
     await sessions.appendEvent(id, 'gateb_loop_paused', { round: outcome.round });
-    log.info(`${s.slug}: 闸B 对抗第${outcome.round}轮暂停（每-tick 上限/重试）→ 下个 tick 续`);
+    log.info(`${s.slug}: Gate B adversarial round ${outcome.round} paused (the per-tick cap, or a retry) -> continuing next tick`);
     return;
   }
   if (outcome.resolved) {
-    // 复审通过 → 清掉「再修一轮」可能残留的旧停泊意见（到此才有新结论；失败路径不经这里，残留得以留证）。
+    // The re-review passed -> clear any stale parked findings a "revise once more" round may have left behind
+    // (only now is there a new conclusion; the failure paths do not come through here, so their residue is kept
+    // as evidence).
     await sessions.patch(id, { adversarial_residual: null });
     finalizeGateBDoc((await sessions.get(id))!);
     await sessions.transition(id, 'AWAITING_GO');
     await sessions.appendEvent(id, 'gate_b_done', { round: outcome.round, verdict: outcome.verdict });
-    log.ok(`${s.slug}: 闸B codex审⇄claude改 第${outcome.round}轮通过 → 待 GO`);
-    // 算自动指派推荐并落库（best-effort），供 GO 卡展示「建议 DRI + 各人负载」。
+    log.ok(`${s.slug}: the Gate B codex-reviews / claude-revises loop passed in round ${outcome.round} -> awaiting GO`);
+    // Compute and persist the automatic assignment recommendation (best-effort), so the GO card can show the
+    // suggested DRI alongside everyone's current load.
     await autoAssignOnGo(id);
     await notify('needs_go', (await sessions.get(id))!);
     return;
@@ -127,7 +142,7 @@ async function afterGateB(id: string, outcome: ReviewFixOutcome): Promise<void> 
     await sessions.patch(id, { gate_b_human_asks: JSON.stringify(outcome.needsHuman) });
     await sessions.transition(id, 'AWAITING_GATE_B_INPUT');
     await sessions.appendEvent(id, 'gate_b_needs_human', { round: outcome.round, count: outcome.needsHuman.length });
-    log.warn(`${s.slug}: 闸B 改方第${outcome.round}轮升级 ${outcome.needsHuman.length} 个问题 → 待 M 答复`);
+    log.warn(`${s.slug}: the Gate B revision escalated ${outcome.needsHuman.length} question(s) in round ${outcome.round} -> awaiting the owner's answer`);
     await notify('needs_gateb_input', (await sessions.get(id))!);
     return;
   }
@@ -135,24 +150,28 @@ async function afterGateB(id: string, outcome: ReviewFixOutcome): Promise<void> 
     finalizeGateBDoc((await sessions.get(id))!);
     await sessions.transition(id, 'GATE_B_STALLED');
     await sessions.appendEvent(id, 'gate_b_stalled', { round: outcome.round, findings: outcome.unresolvedFindings.length });
-    log.warn(`${s.slug}: 闸B 对抗到 ${outcome.round} 轮仍有 ${outcome.unresolvedFindings.length} 条未决 → 停泊交 M 裁决`);
+    log.warn(`${s.slug}: after ${outcome.round} Gate B adversarial rounds, ${outcome.unresolvedFindings.length} finding(s) are still unresolved -> parking for the owner to arbitrate`);
     await notify('needs_gateb_arbitration', (await sessions.get(id))!);
   }
 }
 
-// 闸A codex审⇄claude改 对抗循环跑到下一停顿点，据结论转移：
-// LGTM→CONFIRMED（进闸B）；到上限→停泊裁决；每-tick 上限/重试→留循环态。闸A 不升级人在环（无 needsHuman）。
+// The Gate A codex-reviews / claude-revises adversarial loop has run to its next resting point; transition on
+// its conclusion: LGTM -> CONFIRMED (on to Gate B); at the cap -> park for arbitration; the per-tick cap or a
+// retry -> stay in the loop state. Gate A never escalates to a human in the loop (it has no needsHuman).
 async function afterGateAAdversarial(id: string, outcome: ReviewFixOutcome): Promise<void> {
   const s = (await sessions.get(id))!;
   if (outcome.paused) {
     await sessions.appendEvent(id, 'gatea_loop_paused', { round: outcome.round });
-    log.info(`${s.slug}: 闸A 对抗第${outcome.round}轮暂停（每-tick 上限/重试）→ 下个 tick 续`);
+    log.info(`${s.slug}: Gate A adversarial round ${outcome.round} paused (the per-tick cap, or a retry) -> continuing next tick`);
     return;
   }
   if (outcome.resolved) {
-    // codex 对抗复审可能据「漏问」补进新的 open_questions（gate-a-fix.md 明确要求）——这些是 PM 还没答的问题。
-    // 若有，绝不自动确认进闸B（那正是 Phase 2 要堵的「漏问→实现漂移」）：作废本轮对抗、重置对抗簿记，弹回
-    // PM 答复；PM 答复→闸A 复评清空 open_questions→再起一轮 fresh 对抗。
+    // The codex adversarial re-review may add new open_questions for points that were never asked
+    // (gate-a-fix.md requires exactly that) - and those are questions the PM has not answered yet.
+    // If there are any, it must never auto-confirm into Gate B (that unanswered-question-to-implementation-drift
+    // path is precisely what this closes): void this adversarial round, reset its bookkeeping, and bounce back
+    // to the PM. The PM answers -> the Gate A re-review empties open_questions -> a fresh adversarial round
+    // starts.
     const env = readGateAEnvelope((await sessions.get(id))!);
     if (env.open_questions.length > 0) {
       await sessions.transition(id, 'AWAITING_PM_CONFIRM', {
@@ -162,74 +181,82 @@ async function afterGateAAdversarial(id: string, outcome: ReviewFixOutcome): Pro
         gate_a_residual: null,
       });
       await sessions.appendEvent(id, 'gatea_adv_reopened', { round: outcome.round, open_questions: env.open_questions.length });
-      log.warn(`${s.slug}: 闸A 对抗第${outcome.round}轮补出 ${env.open_questions.length} 条 PM 未答问题 → 弹回 PM 答复（不自动确认）`);
+      log.warn(`${s.slug}: Gate A adversarial round ${outcome.round} surfaced ${env.open_questions.length} question(s) the PM has not answered -> bouncing back to the PM (no automatic confirmation)`);
       await notify('needs_confirm', (await sessions.get(id))!);
       return;
     }
-    await sessions.patch(id, { gate_a_residual: null }); // 清掉「停泊裁决」可能残留的旧 codex 意见
+    await sessions.patch(id, { gate_a_residual: null }); // clear any stale codex findings left over from a park-for-arbitration round
     markReviewActive(projectForSession(s).deliveryDir, s.slug);
-    const note = '闸A 评审 + AI 对抗复审通过，自动确认';
+    const note = 'the Gate A review and the AI adversarial re-review both passed; confirmed automatically';
     await sessions.transition(id, 'CONFIRMED', {
       confirmed_by: 'AI',
       confirmed_at: Date.now(),
-      confirmed_notes: s.confirmed_notes ? `${s.confirmed_notes}\n[闸A] ${note}` : note,
+      confirmed_notes: s.confirmed_notes ? `${s.confirmed_notes}\n[Gate A] ${note}` : note,
     });
     await sessions.appendEvent(id, 'gatea_adv_resolved', { round: outcome.round, verdict: outcome.verdict });
-    // 封口：把「已多轮评审 + PM 确认」机械合成进 prd-truth.md（闸B 唯一需求输入）。best-effort——
-    // 失败不挡确认（闸B loadPrdTruth 会即时兜底合成）。
+    // Seal it: mechanically synthesise "reviewed over several rounds + confirmed by the PM" into prd-truth.md
+    // (Gate B's only requirement input). Best-effort - a failure does not block the confirmation, because Gate
+    // B's loadPrdTruth synthesises a fallback on the spot.
     try {
       if (writePrdTruth((await sessions.get(id))!)) await sessions.appendEvent(id, 'prd_truth_written', { at: 'gate_a_adversarial' });
     } catch (e) {
-      log.warn(`${s.slug}: PRD 真源封口写盘失败（闸B 会兜底重建）— ${String(e).slice(0, 120)}`);
+      log.warn(`${s.slug}: sealing the PRD source of truth to disk failed (Gate B will rebuild it as a fallback) - ${String(e).slice(0, 120)}`);
     }
-    log.ok(`${s.slug}: 闸A codex 对抗第${outcome.round}轮通过 → 已确认`);
+    log.ok(`${s.slug}: the Gate A codex adversarial review passed in round ${outcome.round} -> confirmed`);
     await notify('needs_gateb', (await sessions.get(id))!);
     return;
   }
   if (outcome.stalled) {
-    // residual（codex findings）已由 loop 的 persistResidual 落 gate_a_residual；交 M 裁决。
+    // The residue (codex's findings) has already been written to gate_a_residual by the loop's persistResidual;
+    // hand it to the owner to arbitrate.
     await sessions.transition(id, 'GATE_A_STALLED');
     await sessions.appendEvent(id, 'gatea_adv_stalled', { round: outcome.round, findings: outcome.unresolvedFindings.length });
-    log.warn(`${s.slug}: 闸A 对抗到 ${outcome.round} 轮仍有 ${outcome.unresolvedFindings.length} 条未决 → 停泊交 M 裁决`);
+    log.warn(`${s.slug}: after ${outcome.round} Gate A adversarial rounds, ${outcome.unresolvedFindings.length} finding(s) are still unresolved -> parking for the owner to arbitrate`);
     await notify('needs_arbitration', (await sessions.get(id))!);
   }
 }
 
-// 跑闸A 对抗循环并据结论转移；失败统一走 parkFailure（瞬时退避自动重试 / 永久停泊 GATE_A_FAILED）。
+// Run the Gate A adversarial loop and transition on its conclusion; any failure goes through parkFailure (a
+// transient one backs off and retries automatically, a permanent one parks at GATE_A_FAILED).
 async function runGateALoopStep(id: string, stage: string): Promise<void> {
   try {
     const outcome = await runGateALoop((await sessions.get(id))!);
     await afterGateAAdversarial(id, outcome);
     await clearRetry(id);
   } catch (e) {
-    await parkFailure(id, 'GATE_A_FAILED', { event: stage, label: '闸A 对抗' }, e);
+    await parkFailure(id, 'GATE_A_FAILED', { event: stage, label: 'the Gate A adversarial review' }, e);
   }
 }
 
-// 跑闸B 对抗循环并据结论转移；失败统一走 parkFailure（瞬时退避自动重试 / 永久停泊 GATE_B_FAILED）。
+// Run the Gate B adversarial loop and transition on its conclusion; any failure goes through parkFailure (a
+// transient one backs off and retries automatically, a permanent one parks at GATE_B_FAILED).
 async function runGateBLoopStep(id: string, stage: string): Promise<void> {
   try {
     const outcome = await runGateBLoop((await sessions.get(id))!);
     await afterGateB(id, outcome);
-    await clearRetry(id); // 跑到停顿点（含 paused 续跑）即视为推进，清重试簿记
+    await clearRetry(id); // reaching a resting point (including a paused continuation) counts as progress, so the retry bookkeeping is cleared
   } catch (e) {
-    await parkFailure(id, 'GATE_B_FAILED', { event: stage, label: '闸B 对抗' }, e);
+    await parkFailure(id, 'GATE_B_FAILED', { event: stage, label: 'the Gate B adversarial review' }, e);
   }
 }
 
-// 闸C 实现⇄CI 循环跑到下一停顿点，据结论转移：
-// 绿→AWAITING_GATE_D（待开 PR）；升级→等 M 答复；到上限→停泊裁决；每-tick 上限/重试→留循环态。
+// The Gate C implement/CI loop has run to its next resting point; transition on its conclusion: green ->
+// AWAITING_GATE_D (awaiting the PR); an escalation -> await the owner's answer; at the cap -> park for
+// arbitration; the per-tick cap or a retry -> stay in the loop state.
 async function afterGateC(id: string, outcome: ReviewFixOutcome): Promise<void> {
   const s = (await sessions.get(id))!;
   if (outcome.paused) {
     await sessions.appendEvent(id, 'gatec_loop_paused', { round: outcome.round });
-    log.info(`${s.slug}: 闸C 实现第${outcome.round}轮暂停（每-tick 上限/重试）→ 下个 tick 续`);
+    log.info(`${s.slug}: Gate C implementation round ${outcome.round} paused (the per-tick cap, or a retry) -> continuing next tick`);
     return;
   }
   if (outcome.resolved) {
     await sessions.patch(id, { gate_c_residual: null });
-    // 多仓顺序驱动：当前 leg CI 绿 → 标记；还有未绿 leg → activate 它续跑（留 GATE_C_LOOP）；全绿才进 AWAITING_GATE_D。
-    // 单仓 = 恰 1 腿 → 直接全绿进 AWAITING_GATE_D（行为不变）。无 legs（旧 in-flight）→ activeLeg null，同样直接推进。
+    // Multi-repo sequential driving: the current leg's CI is green -> mark it; if a leg is still not green ->
+    // activate it and continue (staying in GATE_C_LOOP); only once every leg is green does it enter
+    // AWAITING_GATE_D.
+    // A single repo is exactly one leg, so it goes straight to AWAITING_GATE_D. With no legs (an older
+    // in-flight session) activeLeg is null and it advances the same way.
     const active = activeLeg((await sessions.get(id))!);
     const { nextRepo } = planLegAdvance(getLegs((await sessions.get(id))!), active?.repo ?? null);
     if (active) await patchLeg((await sessions.get(id))!, active.repo, { ci_ok: true });
@@ -237,12 +264,12 @@ async function afterGateC(id: string, outcome: ReviewFixOutcome): Promise<void> 
       const next = getLegs((await sessions.get(id))!).find((l) => l.repo === nextRepo);
       if (next) await activateLeg((await sessions.get(id))!, next);
       await sessions.appendEvent(id, 'gate_c_leg_done', { repo: active?.repo ?? null, round: outcome.round, next: nextRepo });
-      log.ok(`${s.slug}: 闸C 仓 ${active?.repo} 本地 CI 绿（第${outcome.round}轮）→ 切下一仓 ${nextRepo} 续实现（GATE_C_LOOP）`);
-      return; // 留 GATE_C_LOOP，下个 tick 跑 next leg
+      log.ok(`${s.slug}: Gate C repo ${active?.repo} went CI-green locally (round ${outcome.round}) -> switching to ${nextRepo} to continue implementing (GATE_C_LOOP)`);
+      return; // stay in GATE_C_LOOP; the next tick runs the next leg
     }
     await sessions.transition(id, 'AWAITING_GATE_D');
     await sessions.appendEvent(id, 'gate_c_done', { round: outcome.round, repos: getLegs((await sessions.get(id))!).map((l) => l.repo) });
-    log.ok(`${s.slug}: 闸C 全部目标仓本地 CI 全绿 → 待开 PR 复审`);
+    log.ok(`${s.slug}: every Gate C target repo is CI-green locally -> awaiting the review PR`);
     await notify('needs_review_pr', (await sessions.get(id))!);
     return;
   }
@@ -250,89 +277,101 @@ async function afterGateC(id: string, outcome: ReviewFixOutcome): Promise<void> 
     await sessions.patch(id, { gate_c_human_asks: JSON.stringify(outcome.needsHuman) });
     await sessions.transition(id, 'AWAITING_GATE_C_INPUT');
     await sessions.appendEvent(id, 'gate_c_needs_human', { round: outcome.round, count: outcome.needsHuman.length });
-    log.warn(`${s.slug}: 闸C 实现第${outcome.round}轮升级 ${outcome.needsHuman.length} 个问题 → 待 M 答复`);
+    log.warn(`${s.slug}: the Gate C implementation escalated ${outcome.needsHuman.length} question(s) in round ${outcome.round} -> awaiting the owner's answer`);
     await notify('needs_gatec_input', (await sessions.get(id))!);
     return;
   }
   if (outcome.stalled) {
     await sessions.transition(id, 'GATE_C_STALLED');
     await sessions.appendEvent(id, 'gate_c_stalled', { round: outcome.round });
-    log.warn(`${s.slug}: 闸C 到 ${outcome.round} 轮本地 CI/验收仍未全绿 → 停泊交 M 裁决`);
+    log.warn(`${s.slug}: after ${outcome.round} Gate C rounds the local CI and acceptance are still not fully green -> parking for the owner to arbitrate`);
     await notify('needs_gatec_arbitration', (await sessions.get(id))!);
   }
 }
 
-// 跑闸C 实现循环并据结论转移；失败统一走 parkFailure（瞬时退避自动重试 / 永久停泊 GATE_C_FAILED）。
+// Run the Gate C implementation loop and transition on its conclusion; any failure goes through parkFailure (a
+// transient one backs off and retries automatically, a permanent one parks at GATE_C_FAILED).
 async function runGateCLoopStep(id: string, stage: string): Promise<void> {
   try {
     const outcome = await runGateCLoop((await sessions.get(id))!);
     await afterGateC(id, outcome);
     await clearRetry(id);
   } catch (e) {
-    await parkFailure(id, 'GATE_C_FAILED', { event: stage, label: '闸C 实现' }, e);
+    await parkFailure(id, 'GATE_C_FAILED', { event: stage, label: 'the Gate C implementation' }, e);
   }
 }
 
-// 闸D PR 对抗循环跑到下一停顿点，据结论转移：
-// LGTM→GATE_D_HARDENING（补内环测试，M4）；升级→等 M 答复；到上限→停泊裁决；每-tick 上限/重试→留循环态。
+// The Gate D PR adversarial loop has run to its next resting point; transition on its conclusion: LGTM ->
+// GATE_D_HARDENING (adding the inner-loop tests); an escalation -> await the owner's answer; at the cap -> park
+// for arbitration; the per-tick cap or a retry -> stay in the loop state.
 async function afterGateD(id: string, outcome: ReviewFixOutcome): Promise<void> {
   const s = (await sessions.get(id))!;
   if (outcome.paused) {
     await sessions.appendEvent(id, 'gated_loop_paused', { round: outcome.round });
-    log.info(`${s.slug}: 闸D PR 复审第${outcome.round}轮暂停（每-tick 上限/重试）→ 下个 tick 续`);
+    log.info(`${s.slug}: Gate D PR review round ${outcome.round} paused (the per-tick cap, or a retry) -> continuing next tick`);
     return;
   }
   if (outcome.resolved) {
-    // **pin 绿态**：此刻 worktree HEAD = 被 codex LGTM 的那个提交（loop 最后一次推的绿态 / 闸C 终态）。
-    // 持久化它作补强基线——补强只 reset 到这个不可变 sha，绝不用移动 ref origin/<branch>（否则 harden/CI/push 的
-    // 对象可能 ≠ 被 codex 审过的对象，Codex M4 Blocker）。取不到 → **当场抛错停泊 GATE_D_FAILED**，绝不进 HARDENING
-    // （把诊断钉在 pin 点，免「LGTM→hardening→缺 sha」反复绕，Codex 二审 SF）。runGateDLoopStep 的 catch 接住转 park。
+    // **Pin the green state**: right now the worktree HEAD is the commit codex said LGTM to (the last green
+    // state the loop pushed, or Gate C's final state).
+    // Persisting it gives hardening its baseline - hardening only ever resets to this immutable sha, never to
+    // the moving ref origin/<branch> (otherwise what gets hardened, CI-verified and pushed may not be what codex
+    // reviewed - a Codex blocker). If it cannot be read, **throw here and park at GATE_D_FAILED**; it must never
+    // enter HARDENING (pinning the diagnosis at the point of failure avoids looping through
+    // "LGTM -> hardening -> missing sha", Codex second review SF). runGateDLoopStep's catch turns it into a park.
     const greenSha = s.worktree_path ? worktreeHeadSha(s.worktree_path) : null;
-    if (!greenSha) throw new Error('闸D LGTM 但取不到 worktree 绿态 HEAD（无法 pin 补强基线）→ 停泊，不进补强');
+    if (!greenSha) throw new Error('Gate D reached LGTM but the worktree green HEAD could not be read (so the hardening baseline cannot be pinned) -> parking rather than entering hardening');
     await sessions.patch(id, { gate_d_residual: null, gate_d_green_sha: greenSha });
     await sessions.transition(id, 'GATE_D_HARDENING');
     await sessions.appendEvent(id, 'gate_d_done', { round: outcome.round, verdict: outcome.verdict, green_sha: greenSha.slice(0, 12) });
-    log.ok(`${s.slug}: 闸D codex 审 diff⇄claude 修 第${outcome.round}轮通过 → 进测试补强（GATE_D_HARDENING）`);
-    return; // 下个 tick step(GATE_D_HARDENING) 跑补强（poller 驱动）
+    log.ok(`${s.slug}: the Gate D codex-reviews-diff / claude-revises loop passed in round ${outcome.round} -> entering test hardening (GATE_D_HARDENING)`);
+    return; // the next tick's step(GATE_D_HARDENING) runs the hardening (poller-driven)
   }
   if (outcome.needsHuman) {
     await sessions.patch(id, { gate_d_human_asks: JSON.stringify(outcome.needsHuman) });
     await sessions.transition(id, 'AWAITING_GATE_D_INPUT');
     await sessions.appendEvent(id, 'gate_d_needs_human', { round: outcome.round, count: outcome.needsHuman.length });
-    log.warn(`${s.slug}: 闸D 改方第${outcome.round}轮升级 ${outcome.needsHuman.length} 个问题 → 待 M 答复`);
+    log.warn(`${s.slug}: the Gate D revision escalated ${outcome.needsHuman.length} question(s) in round ${outcome.round} -> awaiting the owner's answer`);
     await notify('needs_gated_input', (await sessions.get(id))!);
     return;
   }
   if (outcome.stalled) {
     await sessions.transition(id, 'GATE_D_STALLED');
     await sessions.appendEvent(id, 'gate_d_stalled', { round: outcome.round, findings: outcome.unresolvedFindings.length });
-    log.warn(`${s.slug}: 闸D 对抗到 ${outcome.round} 轮仍有 ${outcome.unresolvedFindings.length} 条未决 → 停泊交 M 裁决`);
+    log.warn(`${s.slug}: after ${outcome.round} Gate D adversarial rounds, ${outcome.unresolvedFindings.length} finding(s) are still unresolved -> parking for the owner to arbitrate`);
     await notify('needs_gated_arbitration', (await sessions.get(id))!);
   }
 }
 
-// 跑闸D PR 对抗循环并据结论转移；失败统一走 parkFailure（瞬时退避自动重试 / 永久停泊 GATE_D_FAILED）。
+// Run the Gate D PR adversarial loop and transition on its conclusion; any failure goes through parkFailure (a
+// transient one backs off and retries automatically, a permanent one parks at GATE_D_FAILED).
 async function runGateDLoopStep(id: string, stage: string): Promise<void> {
   try {
     const outcome = await runGateDLoop((await sessions.get(id))!);
     await afterGateD(id, outcome);
     await clearRetry(id);
   } catch (e) {
-    await parkFailure(id, 'GATE_D_FAILED', { event: stage, label: '闸D PR 复审' }, e);
+    await parkFailure(id, 'GATE_D_FAILED', { event: stage, label: 'the Gate D PR review' }, e);
   }
 }
 
-// 跑闸D 测试补强（补内环测试 + CI 绿 + 出 merge-readiness + 推分支）。
-// 多仓顺序驱动：当前 leg 补强完 → 把其闸D 终态（绿态/已验证 sha/报告/PR）持久化回 leg；还有未审 leg → 切下一条回
-// GATE_D_LOOP 复审（留在闸D，不进合并就绪）；全部 leg 补强完才 AWAITING_HUMAN_MERGE（**永不自动 merge**）。
-// 单仓 = 恰 1 腿 → 直接合并就绪（行为不变）；无 legs（旧 in-flight）→ activeLeg null，同样直接合并就绪。
-// 失败统一 parkFailure GATE_D_FAILED（planRetry 据 gate_d_harden_round>0 回 HARDENING 续补，重入幂等；session 级字段=活跃 leg）。
+// Run the Gate D test hardening (add the inner-loop tests + get CI green + produce merge-readiness + push).
+// Multi-repo sequential driving: once the current leg finishes hardening, its Gate D terminal state (the green
+// sha, the verified sha, the report, the PR) is persisted back onto the leg; if a leg has not been reviewed yet
+// it switches to that one and returns to GATE_D_LOOP (staying in Gate D rather than reaching merge-ready); only
+// once every leg has hardened does it reach AWAITING_HUMAN_MERGE (**nothing is ever merged automatically**).
+// A single repo is exactly one leg, so it goes straight to merge-ready. With no legs (an older in-flight
+// session) activeLeg is null and it does the same.
+// Any failure goes through parkFailure to GATE_D_FAILED (planRetry sees gate_d_harden_round > 0 and returns to
+// HARDENING to continue, which is idempotent on re-entry; the session-level fields describe the active leg).
 async function runGateDHardenStep(id: string, stage: string): Promise<void> {
   try {
     await runGateDHarden((await sessions.get(id))!);
     const sNow = (await sessions.get(id))!;
     const active = activeLeg(sNow);
-    // 持久化当前 leg 的闸D 终态回 leg（gate_d_harden_verified_sha 非空 = 该 leg 过闸D；ackMerged 据各 leg pr_url 核验）。
+    // Persist the current leg's Gate D terminal state back onto the leg (a non-empty
+    // gate_d_harden_verified_sha means that leg is through Gate D; ackMerged verifies each leg by its own
+    // pr_url).
     if (active) {
       await patchLeg(sNow, active.repo, {
         gate_d_round: sNow.gate_d_round,
@@ -346,35 +385,39 @@ async function runGateDHardenStep(id: string, stage: string): Promise<void> {
     const { nextRepo } = planGateDAdvance(getLegs((await sessions.get(id))!), active?.repo ?? null);
     if (nextRepo) {
       const next = getLegs((await sessions.get(id))!).find((l) => l.repo === nextRepo);
-      if (next) await activateLeg((await sessions.get(id))!, next); // 重指下一条 leg：worktree/信封/PR + 闸D 循环态全对齐它
+      if (next) await activateLeg((await sessions.get(id))!, next); // re-point at the next leg: its worktree, envelope, PR and the whole Gate D loop state all align with it
       await sessions.appendEvent(id, 'gate_d_leg_done', { repo: active?.repo ?? null, next: nextRepo });
-      await enterRunning(id, 'GATE_D_LOOP'); // 下条 leg 从头审（activateLeg 已重置其闸D 轮次/会话）
+      await enterRunning(id, 'GATE_D_LOOP'); // the next leg is reviewed from scratch (activateLeg has already reset its Gate D rounds and sessions)
       await clearRetry(id);
-      log.ok(`${(await sessions.get(id))!.slug}: 闸D 仓 ${active?.repo} 补强+本地 CI 绿 → 切下一仓 ${nextRepo} 开 PR 复审（GATE_D_LOOP）`);
-      return; // 留闸D，下个 tick 审 next leg
+      log.ok(`${(await sessions.get(id))!.slug}: Gate D repo ${active?.repo} finished hardening with a green local CI -> switching to ${nextRepo} for its PR review (GATE_D_LOOP)`);
+      return; // stay in Gate D; the next tick reviews the next leg
     }
     await sessions.transition(id, 'AWAITING_HUMAN_MERGE');
     await sessions.appendEvent(id, 'gate_d_hardened', { round: (await sessions.get(id))!.gate_d_harden_round ?? 1, repos: getLegs((await sessions.get(id))!).map((l) => l.repo) });
     await clearRetry(id);
-    // 下游交付文档归档（config 门控 delivery_doc_commit，默认关，**绝不 push**）：此刻全部目标仓的 merge-readiness*.md
-    // 已写盘 docs/delivery/<slug>/，一并提交到目标项目当前分支。best-effort——内部已吞异常，绝不挡合并就绪。
+    // Archive the downstream delivery documents (gated by the delivery_doc_commit config, off by default, and
+    // it **never pushes**): by now every target repo's merge-readiness*.md has been written under the delivery
+    // directory, and they are committed together to the target project's current branch. Best-effort - it
+    // swallows its own exceptions internally and must never block reaching merge-ready.
     const dc = await maybeCommitDeliveryDocs((await sessions.get(id))!);
     if (dc.committed) await sessions.appendEvent(id, 'delivery_docs_committed', { slug: (await sessions.get(id))!.slug });
-    log.ok(`${(await sessions.get(id))!.slug}: 闸D 全部目标仓测试补强 + 本地 CI 全绿 → 合并就绪（AWAITING_HUMAN_MERGE，永不自动合并）`);
+    log.ok(`${(await sessions.get(id))!.slug}: every Gate D target repo finished test hardening with a fully green local CI -> merge-ready (AWAITING_HUMAN_MERGE; nothing is ever merged automatically)`);
     await notify('needs_merge', (await sessions.get(id))!);
   } catch (e) {
-    await parkFailure(id, 'GATE_D_FAILED', { event: stage, label: '闸D 测试补强' }, e);
+    await parkFailure(id, 'GATE_D_FAILED', { event: stage, label: 'the Gate D test hardening' }, e);
   }
 }
 
-// 进运行态：转移 + 刷新群卡，让团队看到「评审中/设计中/AI 复审中」而非滞后的入账「排队」文案。
-// syncGroupCard best-effort（内部 try/catch，仅群来源生效），不阻断也不会拖垮跑闸。
+// Enter a running state: transition and refresh the group card, so the team sees "under review" / "being
+// designed" / "under AI review" rather than the stale "queued" text from intake.
+// syncGroupCard is best-effort (it has its own try/catch and only applies to chat-sourced sessions); it neither
+// blocks nor slows down running the gates.
 async function enterRunning(id: string, to: State): Promise<void> {
   await sessions.transition(id, to);
   await syncGroupCard((await sessions.get(id))!);
 }
 
-// 执行一个 ready session 的下一步。失败停泊到 *_FAILED，不抛出。
+// Run the next step for one ready session. A failure parks it at the matching *_FAILED state; it never throws.
 export async function step(s: Session): Promise<void> {
   if (s.state === 'INTAKE') {
     await enterRunning(s.id, 'GATE_A_RUNNING');
@@ -383,12 +426,13 @@ export async function step(s: Session): Promise<void> {
       await afterGateA(s.id, outcome);
       await clearRetry(s.id);
     } catch (e) {
-      await parkFailure(s.id, 'GATE_A_FAILED', { event: 'gate_a', label: '闸A' }, e);
+      await parkFailure(s.id, 'GATE_A_FAILED', { event: 'gate_a', label: 'Gate A' }, e);
     }
     return;
   }
 
-  // 闸A 复评（PM 答复后）：同会话 resume 续评 → 再回 PM / 确认 / 停泊裁决。
+  // The Gate A re-review (after the PM answers): resume the same session to continue reviewing -> back to the
+  // PM, or confirm, or park for arbitration.
   if (s.state === 'GATE_A_REVISION_REQUESTED') {
     await enterRunning(s.id, 'GATE_A_RUNNING');
     try {
@@ -396,83 +440,96 @@ export async function step(s: Session): Promise<void> {
       await afterGateA(s.id, outcome);
       await clearRetry(s.id);
     } catch (e) {
-      await parkFailure(s.id, 'GATE_A_FAILED', { event: 'gate_a_revision', label: '闸A 复评' }, e);
+      await parkFailure(s.id, 'GATE_A_FAILED', { event: 'gate_a_revision', label: 'the Gate A re-review' }, e);
     }
     return;
   }
 
-  // 闸A 对抗复审：PM loop 无开放问题后，codex审⇄claude改 跑到停顿点（poller 驱动，每-tick 上限后续跑）。
+  // The Gate A adversarial re-review: once the PM loop has no open questions, the codex-reviews /
+  // claude-revises loop runs to a resting point (poller-driven, continuing after the per-tick cap).
   if (s.state === 'GATE_A_ADVERSARIAL') {
-    await runGateALoopStep(s.id, '闸A 对抗');
+    await runGateALoopStep(s.id, 'gate_a_adversarial');
     return;
   }
 
-  // 闸B：出初稿 → 进 codex审⇄claude改 对抗循环（同一 step 内一气跑到首个停顿点）。
+  // Gate B: produce the first draft -> enter the codex-reviews / claude-revises adversarial loop (running
+  // straight through to the first resting point within this one step).
   if (s.state === 'GATE_B_REQUESTED') {
     await enterRunning(s.id, 'GATE_B_RUNNING');
     try {
       await runGateB((await sessions.get(s.id))!);
     } catch (e) {
-      await parkFailure(s.id, 'GATE_B_FAILED', { event: 'gate_b', label: '闸B' }, e);
+      await parkFailure(s.id, 'GATE_B_FAILED', { event: 'gate_b', label: 'Gate B' }, e);
       return;
     }
     await enterRunning(s.id, 'ADVERSARIAL_LOOP');
-    await runGateBLoopStep(s.id, '闸B 对抗');
+    await runGateBLoopStep(s.id, 'gate_b_adversarial');
     return;
   }
 
-  // 对抗循环续跑：每-tick 上限后下个 tick / tick 中断后 poller 自愈拾起（draft+轮次+会话已持久化，原地续）。
+  // Continuing the adversarial loop: on the next tick after the per-tick cap, or picked up by the poller's
+  // self-healing after a tick was interrupted (the draft, the round counter and the sessions are all persisted,
+  // so it continues in place).
   if (s.state === 'ADVERSARIAL_LOOP') {
-    await runGateBLoopStep(s.id, '闸B 对抗');
+    await runGateBLoopStep(s.id, 'gate_b_adversarial');
     return;
   }
 
-  // 续修：M 答复升级问题后，resume 续修 → 回循环再评。
+  // Continuing the revision: after the owner answers the escalated questions, resume the revision -> back into
+  // the loop for another review.
   if (s.state === 'GATE_B_REVISION_REQUESTED') {
     await enterRunning(s.id, 'ADVERSARIAL_LOOP');
-    await runGateBLoopStep(s.id, '闸B 续修');
+    await runGateBLoopStep(s.id, 'gate_b_revision');
     return;
   }
 
-  // 闸C：建隔离 worktree → 进实现⇄CI 循环（同一 step 内一气跑到首个停顿点）。
+  // Gate C: create the isolated worktree -> enter the implement/CI loop (running straight through to the first
+  // resting point within this one step).
   if (s.state === 'GATE_C_REQUESTED') {
     await enterRunning(s.id, 'GATE_C_RUNNING');
     try {
       await runGateCSetup((await sessions.get(s.id))!);
     } catch (e) {
-      await parkFailure(s.id, 'GATE_C_FAILED', { event: 'gate_c_setup', label: '闸C 建树' }, e);
+      await parkFailure(s.id, 'GATE_C_FAILED', { event: 'gate_c_setup', label: 'the Gate C worktree setup' }, e);
       return;
     }
     await enterRunning(s.id, 'GATE_C_LOOP');
-    await runGateCLoopStep(s.id, '闸C 实现');
+    await runGateCLoopStep(s.id, 'gate_c_implement');
     return;
   }
 
-  // 实现循环续跑：每-tick 上限后下个 tick / tick 中断后 poller 自愈拾起（信封+轮次+会话已持久化）。
+  // Continuing the implementation loop: on the next tick after the per-tick cap, or picked up by the poller's
+  // self-healing after a tick was interrupted (the envelope, the round counter and the session are persisted).
   if (s.state === 'GATE_C_LOOP') {
-    await runGateCLoopStep(s.id, '闸C 实现');
+    await runGateCLoopStep(s.id, 'gate_c_implement');
     return;
   }
 
-  // 续做：M 答复实现升级问题后，resume 续做 → 回循环再跑 CI。
+  // Continuing the work: after the owner answers the escalated implementation questions, resume the work ->
+  // back into the loop to run CI again.
   if (s.state === 'GATE_C_REVISION_REQUESTED') {
     await enterRunning(s.id, 'GATE_C_LOOP');
-    await runGateCLoopStep(s.id, '闸C 续做');
+    await runGateCLoopStep(s.id, 'gate_c_revision');
     return;
   }
 
-  // 闸D 开 PR：委托 forge-create-pr.sh 推分支 + 建 PR（绝不自动 merge；脚本幂等，tick 中断下个 tick 重入安全）。
-  // 成功 → 进 GATE_D_LOOP 跑 codex 审 diff⇄claude 修；失败 → 停泊 GATE_D_FAILED。
+  // Gate D opens the PR: the project's own create-PR script pushes the branch and opens the PR (nothing is ever
+  // merged automatically; the script is idempotent, so re-entering on the next tick after an interruption is
+  // safe).
+  // On success -> enter GATE_D_LOOP and run codex-reviews-diff / claude-revises; on failure -> park at
+  // GATE_D_FAILED.
   if (s.state === 'GATE_D_REQUESTED') {
     try {
       await openReviewPr((await sessions.get(s.id))!);
     } catch (e) {
-      await parkFailure(s.id, 'GATE_D_FAILED', { event: 'gate_d_open_pr', label: '闸D 开 PR' }, e);
+      await parkFailure(s.id, 'GATE_D_FAILED', { event: 'gate_d_open_pr', label: 'opening the Gate D PR' }, e);
       return;
     }
-    // 多仓：openReviewPr 开完 N 个 PR 后 session 仍停在最后一条 gate-C leg；进闸D 前**重指 primary leg**
-    // （activateLeg 把 worktree/信封/pr_url + 闸D 循环态全对齐到 primary），否则闸D 会审「最后那条 leg 的树」却挂着
-    // primary 的 PR（错审 + 后续误判 SHIPPED，Codex 2c Blocker）。单仓/无 legs 不动——session 本就指向唯一 leg（行为不变）。
+    // Multi-repo: after openReviewPr has opened N PRs the session still points at the last gate-C leg, so
+    // before entering Gate D it **re-points at the primary leg** (activateLeg aligns the worktree, the envelope,
+    // pr_url and the whole Gate D loop state with the primary). Otherwise Gate D would review "the last leg's
+    // tree" while carrying the primary's PR - the wrong review, and later a wrongly declared SHIPPED (a Codex
+    // blocker). With a single repo or no legs nothing changes: the session already points at its only leg.
     {
       const legs = getLegs((await sessions.get(s.id))!);
       if (legs.length > 1) {
@@ -481,37 +538,46 @@ export async function step(s: Session): Promise<void> {
       }
     }
     await enterRunning(s.id, 'GATE_D_LOOP');
-    await runGateDLoopStep(s.id, '闸D PR 复审');
+    await runGateDLoopStep(s.id, 'gate_d_pr_review');
     return;
   }
 
-  // PR 对抗循环续跑：每-tick 上限后下个 tick / tick 中断后 poller 自愈拾起（信封+轮次+双侧会话已持久化）。
+  // Continuing the PR adversarial loop: on the next tick after the per-tick cap, or picked up by the poller's
+  // self-healing after a tick was interrupted (the envelope, the round counter and both sides' sessions are
+  // persisted).
   if (s.state === 'GATE_D_LOOP') {
-    await runGateDLoopStep(s.id, '闸D PR 复审');
+    await runGateDLoopStep(s.id, 'gate_d_pr_review');
     return;
   }
 
-  // 续修：M 答复 PR 复审升级问题后，resume 续修 → 回循环再审。
-  // 回 loop 前清补强标记：任何从「补强/合并就绪」退回对抗续修的路径，都不能让陈旧 harden_round/绿态/已验证 sha 残留，
-  // 否则下次失败 planRetry 会据旧 harden_round 误回 HARDENING、跳过 PR 对抗续修（Codex M4 SF）。正常 loop 续修时这些本就 null，清=no-op。
+  // Continuing the revision: after the owner answers the escalated PR-review questions, resume the revision ->
+  // back into the loop for another review.
+  // The hardening markers are cleared before returning to the loop: any path that falls back from hardening or
+  // merge-ready into an adversarial revision must not leave a stale harden_round, green sha or verified sha
+  // behind, or the next failure would have planRetry read the old harden_round and wrongly return to HARDENING,
+  // skipping the PR adversarial revision (Codex SF). On a normal loop revision these are already null, so
+  // clearing them is a no-op.
   if (s.state === 'GATE_D_REVISION_REQUESTED') {
     await sessions.patch(s.id, { gate_d_harden_round: null, gate_d_green_sha: null, gate_d_harden_verified_sha: null, merge_readiness_path: null });
     await enterRunning(s.id, 'GATE_D_LOOP');
-    await runGateDLoopStep(s.id, '闸D 续修');
+    await runGateDLoopStep(s.id, 'gate_d_revision');
     return;
   }
 
-  // 测试补强：codex LGTM 后补内环测试 + CI 绿 + 出 merge-readiness → 合并就绪（poller 驱动，tick 中断下个 tick 幂等重入）。
+  // Test hardening: after codex says LGTM, add the inner-loop tests, get CI green and produce merge-readiness ->
+  // merge-ready (poller-driven; if a tick is interrupted the next one re-enters idempotently).
   if (s.state === 'GATE_D_HARDENING') {
-    await runGateDHardenStep(s.id, '闸D 测试补强');
+    await runGateDHardenStep(s.id, 'gate_d_hardening');
     return;
   }
 }
 
-// ── tick 锁：防 launchd 定时器重叠触发（闸A 可跑数分钟，新 tick 不能撞进来）──
-// FORGE_LOCK 可覆盖锁路径（对齐 root.ts 的 FORGE_HEARTBEAT/FORGE_WATCHDOG_STATE 测试隔离约定）：
-// tick.lock 是 STATE_DIR 下的**磁盘文件**、不随 FORGE_DB=:memory: 隔离，故并行测试进程会共享同一锁文件
-// 而互相误判「已有 tick 在跑」。调 tick() 的测试设一个独立 FORGE_LOCK 即可彻底脱离共享。
+// -- The tick lock: it stops the scheduler firing overlapping ticks (Gate A can run for minutes, and a new
+//    tick must not barge in). --
+// FORGE_LOCK can override the lock path (matching root.ts's FORGE_HEARTBEAT / FORGE_WATCHDOG_STATE test
+// isolation convention): tick.lock is a **file on disk** under STATE_DIR and is not isolated by
+// FORGE_DB=':memory:', so parallel test processes would share one lock file and each wrongly conclude "a tick
+// is already running". A test that calls tick() only needs to set its own FORGE_LOCK to be fully independent.
 const LOCK = process.env.FORGE_LOCK || resolve(STATE_DIR, 'tick.lock');
 
 function pidAlive(pid: number): boolean {
@@ -519,41 +585,55 @@ function pidAlive(pid: number): boolean {
     process.kill(pid, 0);
     return true;
   } catch (e) {
-    return (e as NodeJS.ErrnoException).code === 'EPERM'; // 存在但无权限 = 仍活着
+    return (e as NodeJS.ErrnoException).code === 'EPERM'; // it exists but we lack permission = still alive
   }
 }
 
-// tick 锁陈旧判定（P2-I）：锁记 `pid\nts`。进程已死 → 失效；进程活着但持锁超 maxHoldMs（疑似卡死的
-// 手动 tick——daemon 卡死由看门狗 SIGKILL→pid 死兜底，此处补手动 tick 挂死永久占锁的洞）→ 视为陈旧可接管。
+// Deciding whether a tick lock is stale: the lock records `pid\nts`. If the process is dead the lock is void;
+// if the process is alive but has held the lock for longer than maxHoldMs (a manual tick that appears to have
+// hung - a hung daemon is covered by the watchdog's SIGKILL making the pid die, and this closes the remaining
+// hole where a hung manual tick would hold the lock forever) it is treated as stale and may be taken over.
 export function lockActive(raw: string, now: number, maxHoldMs: number, alive: (pid: number) => boolean): boolean {
   const [pidStr, tsStr] = raw.trim().split(/\s+/);
   const pid = Number(pidStr);
-  if (!pid || !alive(pid)) return false; // 进程已死 → 锁失效
-  const ts = Number(tsStr) || now; // 老格式无时间戳 → 视为此刻（保守：算仍活）
-  return now - ts < maxHoldMs; // 仍在 max-hold 内 → 活锁（跳过本次 tick）；超期 → 视为卡死可接管
+  if (!pid || !alive(pid)) return false; // the process is dead -> the lock is void
+  const ts = Number(tsStr) || now; // the old format carried no timestamp -> treat it as now (conservatively: still alive)
+  return now - ts < maxHoldMs; // still within max-hold -> a live lock (skip this tick); past it -> presumed hung and may be taken over
 }
 
-// max-hold 取「单 tick 最长合法时长」的宽松上界，避免误判正常长 tick 卡死、又不让真卡死的锁永久霸占。
-// 上游闸（审文档）：claude_timeout × 6。下游闸C/D（隔离 worktree 实现/改方 + 本地 CI）一个 tick 可跑很久——
-// 必须把它真正的最长合法时长估全，否则长下游 tick 超过宽限会被误判卡死、被下一个 tick 接管 → 同一 worktree
-// 双跑（烧钱 + 互踩 git）。取上游/下游较大值，且不少于 1h。
-// （注：daemon 真卡死由看门狗 SIGKILL→pid 死兜底；本上界只为「手动 tick 挂死却未退」留接管口，宁松勿紧。）
+// max-hold is a generous upper bound on "the longest a single tick may legitimately take", so that a normal
+// long tick is not mistaken for a hang while a genuinely hung lock cannot squat forever.
+// Upstream gates (reviewing documents): claude_timeout × 6. The downstream Gates C and D (implementing and
+// revising in an isolated worktree plus the local CI) can run for a very long time in one tick - their real
+// maximum legitimate duration has to be estimated in full, or a long downstream tick would exceed the grace
+// period, be mistaken for a hang, and be taken over by the next tick -> the same worktree runs twice (burning
+// money and both sides fighting over git). It takes the larger of the two, and never less than an hour.
+// (A genuinely hung daemon is covered by the watchdog's SIGKILL making the pid die; this bound exists only to
+// leave a takeover path for "a manual tick hung without exiting", so it errs generous.)
 //
-// 下游单 tick 最坏路径，逐一数清 drv.fix / drv.review 调用（N = 有效 per-tick 轮数 = min(max_rounds, max_rounds_per_tick)）：
-//   · 续答预修(reviewFixLoop 顶部)：1 个 fix 块；主循环至多 N 轮、且 for(;;) 至少跑一轮 ⇒ fix 块/review 各 ≤ N+1
-//   · 每个 fix 块 = parseFixWithRepair：1 次 drv.fix + parse-repair 至多 P 次 ⇒ (1+P) 次 drv.fix；review 同理 (1+P) 次
-//   · 每次 drv.fix（闸D 内含 CI 自修循环）≤ (claude+CI) × (1 + MAX_CI_FIX_ATTEMPTS=K)；每次 review ≤ (claude+CI)
-//   合计 = (N+1)·(1+P)·(claude+CI)·(K+2)。P=parse_repair_retries。两闸取各自较大量。纯函数，导出供单测。
+// The worst-case downstream path for one tick, counting every drv.fix / drv.review call (N = the effective
+// per-tick rounds = min(max_rounds, max_rounds_per_tick)):
+//   - the fix-first step at the top of reviewFixLoop is one fix block; the main loop runs at most N rounds and
+//     for(;;) runs at least once => at most N+1 fix blocks and N+1 reviews
+//   - each fix block is parseFixWithRepair: 1 drv.fix plus at most P parse repairs => (1+P) drv.fix calls; a
+//     review is (1+P) the same way
+//   - each drv.fix (which in Gate D contains the CI self-fix loop) is at most (claude+CI) × (1 +
+//     MAX_CI_FIX_ATTEMPTS = K); each review is at most (claude+CI)
+//   Total = (N+1)·(1+P)·(claude+CI)·(K+2), where P = parse_repair_retries. The larger of the two gates wins.
+//   A pure function, exported for unit tests.
 export function lockMaxHoldSec(rt: RuntimeConfig): number {
   const upstream = rt.claude_timeout_sec * 6;
-  // 仅当配置了下游闸时才把下游预算纳入（未配下游 → 不会有下游 tick，无需放宽接管窗）。
+  // The downstream budget only counts when a downstream gate is configured (with none configured there are no
+  // downstream ticks, so the takeover window need not be widened).
   let downstream = 0;
   if (rt.gate_c || rt.gate_d) {
     const dsClaude = Math.max(rt.gate_c?.claude_timeout_sec ?? rt.claude_timeout_sec, rt.gate_d?.claude_timeout_sec ?? rt.claude_timeout_sec);
     const dsCi = Math.max(rt.gate_c?.ci_timeout_sec ?? 1800, rt.gate_d?.ci_timeout_sec ?? 1800);
-    const p = Math.max(0, rt.parse_repair_retries ?? 2); // 每次 fix/review 解析失败回喂重出上限
-    // 有效 per-tick 轮数（口径同 gateC/DLoop：min(max_rounds, max_rounds_per_tick ?? 1)）；两闸取大。
-    // 调大下游 max_rounds_per_tick 会让单 tick 跑更多轮，此处随配置同步放大上界，绝不再回到固定 1 的低估。
+    const p = Math.max(0, rt.parse_repair_retries ?? 2); // the cap on re-emit attempts when a fix or review output fails to parse
+    // The effective per-tick rounds (the same rule gateCLoop and gateDLoop use: min(max_rounds,
+    // max_rounds_per_tick ?? 1)), taking the larger of the two gates.
+    // Raising a downstream max_rounds_per_tick makes a single tick run more rounds, and this bound scales with
+    // the configuration accordingly - it never falls back to the fixed-1 underestimate.
     const perTickOf = (g: { max_rounds?: number; max_rounds_per_tick?: number } | undefined, defMax: number): number =>
       g ? Math.max(1, Math.min(Math.max(1, g.max_rounds ?? defMax), g.max_rounds_per_tick ?? 1)) : 0;
     const perTick = Math.max(perTickOf(rt.gate_c, 4), perTickOf(rt.gate_d, 3));
@@ -565,21 +645,26 @@ function lockMaxHoldMs(): number {
   return lockMaxHoldSec(loadConfig().runtime) * 1000;
 }
 
-// 接管 claim 若超此久未清 = 上次接管中途崩溃残留（接管本身是 write+unlink 亚毫秒级，崩在中间极罕见）→ 回收。
+// A takeover claim left uncleaned for longer than this is residue from a previous takeover that crashed midway
+// (the takeover itself is a sub-millisecond write plus unlink, so crashing inside it is very rare) -> reclaim it.
 const CLAIM_STALE_MS = 30_000;
 
-// 拿 tick 锁。原子性是关键（防两个进程同时跑 step → 双花钱 + 同一 worktree 互踩 git）：
-//  1) 常态——原子独占创建（`wx`）：锁不存在时一步拿下，杜绝旧版「existsSync→writeFileSync」之间两个 fresh
-//     acquire 都判「不存在」而都写入的竞态。
-//  2) 锁已存在且活锁（持有者活着且未超 maxHold）→ 让路。
-//  3) 陈旧/卡死（持有者已死，或超 maxHold 上界）→ 接管，但接管必须原子：旧版「读-判陈旧-直接覆写」会让两个
-//     进程同判陈旧而都覆写、都继续。改用独占 `wx` 的 .claim 文件做接管权仲裁——只有抢到 claim 的进程能替换锁。
-// 参数化锁路径供单测（默认 LOCK）。
+// Acquire the tick lock. Atomicity is the whole point (it stops two processes running step at once -> paying
+// twice and both fighting over git in the same worktree):
+//  1) the normal case - an atomic exclusive create (`wx`): when the lock does not exist it is taken in one
+//     step, ruling out the old race where two fresh acquires both saw "it does not exist" between an
+//     existsSync and a writeFileSync and both wrote.
+//  2) the lock exists and is live (its holder is alive and within maxHold) -> stand aside.
+//  3) it is stale or hung (the holder is dead, or it is past the maxHold bound) -> take it over, but the
+//     takeover itself must be atomic: the old "read, judge it stale, overwrite" let two processes both judge it
+//     stale, both overwrite and both continue. Instead an exclusively created (`wx`) .claim file arbitrates the
+//     right to take over - only the process that wins the claim may replace the lock.
+// The lock path is a parameter so it can be unit-tested (defaulting to LOCK).
 export function acquireLock(lockPath: string = LOCK): boolean {
   mkdirSync(dirname(lockPath), { recursive: true });
   const stamp = (): string => `${process.pid}\n${Date.now()}`;
   try {
-    writeFileSync(lockPath, stamp(), { flag: 'wx' }); // 原子独占创建
+    writeFileSync(lockPath, stamp(), { flag: 'wx' }); // an atomic exclusive create
     return true;
   } catch (e) {
     if ((e as NodeJS.ErrnoException).code !== 'EEXIST') throw e;
@@ -588,14 +673,14 @@ export function acquireLock(lockPath: string = LOCK): boolean {
   try {
     raw = readFileSync(lockPath, 'utf8');
   } catch {
-    /* 刚被释放/读不到 → 按陈旧处理，走 claim 仲裁 */
+    /* just released, or unreadable -> treat it as stale and go through the claim arbitration */
   }
-  if (raw && lockActive(raw, Date.now(), lockMaxHoldMs(), pidAlive)) return false; // 活锁让路
+  if (raw && lockActive(raw, Date.now(), lockMaxHoldMs(), pidAlive)) return false; // a live lock -> stand aside
   const claim = `${lockPath}.claim`;
-  if (!acquireClaim(claim)) return false; // 没抢到接管权（另一个进程正接管）→ 让路
+  if (!acquireClaim(claim)) return false; // the right to take over went to someone else -> stand aside
   try {
-    log.warn(`发现陈旧/卡死 tick 锁（${raw.trim().replace(/\s+/g, ' ') || '空/已释放'}），接管`);
-    writeFileSync(lockPath, stamp()); // 持 claim 期间安全替换
+    log.warn(`Found a stale or hung tick lock (${raw.trim().replace(/\s+/g, ' ') || 'empty or already released'}); taking it over`);
+    writeFileSync(lockPath, stamp()); // safe to replace while holding the claim
     return true;
   } finally {
     try {
@@ -606,7 +691,9 @@ export function acquireLock(lockPath: string = LOCK): boolean {
   }
 }
 
-// 独占抢「接管权」：`wx` 创建成功=抢到；已存在且新鲜=别人正接管，让路；已存在但陈旧（上次接管崩溃残留）→ 回收后再抢一次。导出供单测。
+// Exclusively claim "the right to take over": a successful `wx` create means it is ours; an existing, fresh
+// claim means someone else is taking over, so stand aside; an existing but stale one (residue from a takeover
+// that crashed) is reclaimed and then claimed again. Exported for unit tests.
 export function acquireClaim(claim: string): boolean {
   try {
     writeFileSync(claim, `${process.pid}\n${Date.now()}`, { flag: 'wx' });
@@ -618,61 +705,70 @@ export function acquireClaim(claim: string): boolean {
   try {
     ts = Number(readFileSync(claim, 'utf8').trim().split(/\s+/)[1]) || 0;
   } catch {
-    /* 竞争者已删 → 当陈旧回收 */
+    /* a competitor already deleted it -> treat it as stale and reclaim */
   }
-  if (ts && Date.now() - ts <= CLAIM_STALE_MS) return false; // 别人正接管，让路
+  if (ts && Date.now() - ts <= CLAIM_STALE_MS) return false; // someone else is taking over -> stand aside
   try {
-    unlinkSync(claim); // 回收崩溃残留的陈旧 claim
+    unlinkSync(claim); // reclaim the stale claim left by a crash
     writeFileSync(claim, `${process.pid}\n${Date.now()}`, { flag: 'wx' });
     return true;
   } catch {
-    return false; // 回收/再创建被别人抢先 → 让路
+    return false; // someone else won the reclaim or the re-create -> stand aside
   }
 }
 
 export function releaseLock(lockPath: string = LOCK): void {
   try {
     if (!existsSync(lockPath)) return;
-    const pid = Number(readFileSync(lockPath, 'utf8').trim().split(/\s+/)[0]); // 容忍 `pid\nts` 新格式
+    const pid = Number(readFileSync(lockPath, 'utf8').trim().split(/\s+/)[0]); // tolerates the newer `pid\nts` format
     if (pid === process.pid) unlinkSync(lockPath);
   } catch {
     /* ignore */
   }
 }
 
-// 孤儿态自愈：持锁后，仍卡在瞬态 RUNNING 的 session = 上一个 tick 中途死了 → 顺合法边复位重跑。
-// 注：ADVERSARIAL_LOOP / GATE_B_REVISION_REQUESTED 已是 poller 驱动态，tick 中断后由正常 poller 拾起原地续跑
-// （draft+轮次+会话每轮持久化，最多丢一轮），无需在此 reclaim——否则每次「每-tick 暂停」都误报 recovered。
+// Orphan self-healing: once the lock is held, a session still stuck in a transient RUNNING state means the
+// previous tick died midway -> reset it along a legal edge and re-run.
+// Note: ADVERSARIAL_LOOP and GATE_B_REVISION_REQUESTED are already poller-driven states, and after an
+// interrupted tick the normal poller picks them up and continues in place (the draft, round counter and
+// sessions are persisted every round, so at most one round is lost). They must not be reclaimed here -
+// otherwise every ordinary "paused at the per-tick cap" would be misreported as a recovery.
 const RECLAIM: { from: State; fail: State; back: State }[] = [
-  { from: 'GATE_B_RUNNING', fail: 'GATE_B_FAILED', back: 'GATE_B_REQUESTED' }, // 初稿中途死，无 draft → 干净重跑
+  { from: 'GATE_B_RUNNING', fail: 'GATE_B_FAILED', back: 'GATE_B_REQUESTED' }, // the first draft died midway, so there is no draft -> a clean re-run
 ];
 
-// 复位一个孤儿：累加 reclaim_count；达上限/已死信 → 判毒丸转死信（不再复活，告警交人工），否则正常复位重跑。
+// Reset one orphan: increment reclaim_count; at the cap, or already dead-lettered, judge it a poison pill and
+// move it to the dead-letter queue (no more revivals - alert and hand it to a human); otherwise reset and re-run
+// normally.
 async function reclaimOne(s: Session, from: State, fail: State, back: State): Promise<void> {
   const rc = (s.reclaim_count ?? 0) + 1;
   if (s.dead_letter || rc > maxReclaims()) {
-    // 毒丸：反复跑 gate 中途死（疑似确定性崩溃 daemon）→ 死信停泊，斩断崩溃-重启-烧 token 无限环。
-    await sessions.transition(s.id, fail, { error: `孤儿复位 ${rc - 1} 次仍中途死，疑似毒丸 → 转死信待人工`, dead_letter: 1, next_retry_at: null });
+    // A poison pill: running the gate repeatedly keeps dying midway (a deterministic crash that takes the
+    // daemon with it) -> park it in the dead-letter queue, cutting the crash-restart-burn-tokens loop.
+    await sessions.transition(s.id, fail, { error: `still dying midway after ${rc - 1} orphan resets; presumed a poison pill -> moved to the dead-letter queue for a human`, dead_letter: 1, next_retry_at: null });
     await sessions.appendEvent(s.id, 'dead_letter', { from, reason: 'max_reclaims', reclaim_count: rc - 1 });
-    log.err(`${s.slug}: 孤儿态 ${from} 复位达上限(${maxReclaims()}) → 死信（疑似毒丸），停泊待人工 retry`);
-    await notify('failed', (await sessions.get(s.id))!, { stage: '孤儿复位', error: `复位 ${rc - 1} 次仍中途死，疑似毒丸，已转死信（人工 retry 清）` });
+    log.err(`${s.slug}: the orphaned ${from} state hit the reset cap (${maxReclaims()}) -> dead letter (presumed a poison pill), parked until a human retries`);
+    await notify('failed', (await sessions.get(s.id))!, { stage: 'orphan reset', error: `still dying midway after ${rc - 1} resets; presumed a poison pill and moved to the dead-letter queue (a manual retry clears it)` });
     return;
   }
-  await sessions.transition(s.id, fail, { error: 'orphaned RUNNING reclaimed（tick 中断残留）', reclaim_count: rc });
+  await sessions.transition(s.id, fail, { error: 'orphaned RUNNING reclaimed (residue from an interrupted tick)', reclaim_count: rc });
   await sessions.transition(s.id, back, { error: null });
   await sessions.appendEvent(s.id, 'recover', { from, to: back, reclaim_count: rc });
-  log.warn(`${s.slug}: 孤儿态 ${from} → ${back}（自愈第${rc}次，将重跑）`);
+  log.warn(`${s.slug}: orphaned ${from} -> ${back} (self-healing attempt ${rc}; it will re-run)`);
   await notify('recovered', (await sessions.get(s.id))!, { from, to: back });
 }
 
 async function reclaimOrphans(): Promise<void> {
-  // 闸A RUNNING 孤儿：复评中途死（仍有 pending_input）→ 回复评点不丢轮次；否则首轮孤儿 → 回 INTAKE 重跑。
+  // An orphaned Gate A RUNNING state: a re-review that died midway (pending_input is still set) returns to the
+  // re-review point without losing the rounds; otherwise a first-round orphan returns to INTAKE to re-run.
   for (const s of await sessions.listByStates(['GATE_A_RUNNING'])) {
     const back: State = s.gate_a_pending_input ? 'GATE_A_REVISION_REQUESTED' : 'INTAKE';
     await reclaimOne(s, 'GATE_A_RUNNING', 'GATE_A_FAILED', back);
   }
-  // 闸C 建树（GATE_C_RUNNING，非 poller 驱动的瞬态）孤儿：已建树 → 续跑实现循环；未建树 → 干净重 setup。
-  // GATE_C_LOOP 是 poller 驱动态，tick 中断由正常 poller 拾起原地续跑（信封+轮次+会话已持久化），不在此 reclaim。
+  // An orphaned Gate C worktree setup (GATE_C_RUNNING, a transient state that is not poller-driven): with a
+  // worktree it continues into the implementation loop; without one it re-runs setup cleanly.
+  // GATE_C_LOOP is poller-driven, and after an interrupted tick the normal poller continues it in place (the
+  // envelope, round counter and session are persisted), so it is not reclaimed here.
   for (const s of await sessions.listByStates(['GATE_C_RUNNING'])) {
     const back: State = s.worktree_path ? 'GATE_C_LOOP' : 'GATE_C_REQUESTED';
     await reclaimOne(s, 'GATE_C_RUNNING', 'GATE_C_FAILED', back);
@@ -684,70 +780,82 @@ async function reclaimOrphans(): Promise<void> {
   }
 }
 
-const SWEEP_MIN_AGE_MS = 60 * 60 * 1000; // 年龄保护窗 1h：绝不清可能正在建（worktree_path 尚未落库）的 worktree
+const SWEEP_MIN_AGE_MS = 60 * 60 * 1000; // a one-hour age guard: never sweep a worktree that may still be being created (its worktree_path not yet persisted)
 
-// 孤儿 worktree 清扫：删 SHIPPED 终态遗留（ackMerged 清理失败/漏跑）+ 无 owner 的 forge 命名孤儿，年龄过保护窗才清。
-// 此前 cleanup 全压在 ackMerged best-effort 上、注释假设有「孤儿清扫」却没人实现——长跑 daemon 下隔离 worktree
-// （各带整套 node_modules）会无界堆积。决策纯函数 planWorktreeSweep 守安全（在用/太新/非 forge 一律不碰）。
-// best-effort：任何失败只告警、绝不打断 gate 推进。清理用裸 git worktree remove（移除不需项目脚本/pnpm）。
+// Sweeping orphaned worktrees: it removes what a SHIPPED session left behind (when ackMerged's cleanup failed
+// or never ran) plus forge-named orphans with no owner, and only once they are older than the guard window.
+// Cleanup used to rest entirely on ackMerged's best-effort path, with comments assuming an "orphan sweep" that
+// nobody had implemented - so under a long-running daemon the isolated worktrees (each carrying a full
+// dependency tree) piled up without bound. The pure decision function planWorktreeSweep keeps it safe (anything
+// in use, too new, or not forge-created is never touched).
+// Best-effort: any failure only warns and must never interrupt a gate. The removal uses a plain
+// `git worktree remove`, which needs no project script or package manager.
 async function sweepOrphanWorktrees(): Promise<void> {
   try {
-    // 多仓：一个 session 的 worktree 散在各 leg（+ 兼容旧 session 级 worktree_path）。全收齐再分桶，绝不漏保护非 primary leg 的活树。
+    // Multi-repo: a session's worktrees are spread across its legs (plus the older session-level worktree_path,
+    // for compatibility). They are all gathered before being bucketed, so a live tree on a non-primary leg is
+    // never left unprotected.
     const pathsOf = (s: Session): string[] => [s.worktree_path, ...getLegs(s).map((l) => l.worktree_path)].filter((p): p is string => !!p);
     const withWt = (await sessions.listAll()).filter((s) => pathsOf(s).length > 0);
     const shippedPaths = new Set(withWt.filter((s) => s.state === 'SHIPPED').flatMap(pathsOf));
     const livePaths = new Set(withWt.filter((s) => s.state !== 'SHIPPED').flatMap(pathsOf));
-    // 要扫的主仓集：所有有 worktree 的 session 各自项目主仓 + 默认项目主仓（兜「无 session 的孤儿」）。
+    // The set of repos to sweep: the repos of every project that has a session with a worktree, plus the default
+    // project's (which covers orphans belonging to no session at all).
     const repoDirs = new Set<string>();
     const addRepo = (p: ReturnType<typeof project>): void => {
-      for (const r of p.repos) repoDirs.add(p.repoPath(r)); // 遍历全 repos：worktree 锚在各自目标仓，孤儿可能在任一仓下（非只 repos[0]）
+      for (const r of p.repos) repoDirs.add(p.repoPath(r)); // walk every repo: worktrees are anchored to their own target repo, so an orphan may sit under any of them, not only repos[0]
     };
     try {
       addRepo(project(defaultProjectId()));
     } catch {
-      /* 默认项目缺省 → 跳过 */
+      /* no default project configured -> skip */
     }
     for (const s of withWt) {
       try {
         addRepo(projectForSession(s));
       } catch {
-        /* 项目缺失 → 跳过 */
+        /* the project is missing -> skip */
       }
     }
     const now = Date.now();
     for (const repoDir of repoDirs) {
       const main = resolve(repoDir);
       const onDisk = listWorktrees(repoDir)
-        .filter((p) => resolve(p) !== main) // 绝不碰主 checkout
+        .filter((p) => resolve(p) !== main) // never touch the main checkout
         .map((p) => {
-          let ageMs = Number.POSITIVE_INFINITY; // 路径已不在（登记残留）→ 视为很老，可清登记
+          let ageMs = Number.POSITIVE_INFINITY; // the path is already gone (a stale registration) -> treat it as very old so the registration can be cleaned
           try {
             ageMs = now - statSync(p).mtimeMs;
           } catch {
-            /* 目录已没 → 留 Infinity */
+            /* the directory is gone -> leave it at Infinity */
           }
           return { path: p, ageMs };
         });
       const toSweep = planWorktreeSweep({ onDisk, shippedPaths, livePaths, minAgeMs: SWEEP_MIN_AGE_MS });
       for (const path of toSweep) {
-        const rm = await removeWorktree({ repoDir, path }); // 裸 git worktree remove --force + prune
+        const rm = await removeWorktree({ repoDir, path }); // a plain `git worktree remove --force` plus a prune
         const owner = withWt.find((s) => pathsOf(s).includes(path));
-        // 删残留 forge/<...> 分支：legs 各仓同名分支（基于 id 哈希），取 owner 任一已知分支名即可（同名）。
+        // Delete the leftover forge/<...> branch: every leg's repo uses the same branch name (derived from the
+        // id hash), so any branch name the owner knows will do.
         const branch = owner?.impl_branch ?? getLegs(owner ?? ({} as Session)).find((l) => l.impl_branch)?.impl_branch ?? null;
         if (branch) deleteBranch(repoDir, branch);
-        log.warn(`孤儿清扫：移除 worktree ${path}（${rm.ok ? 'ok' : `fail: ${rm.output.slice(0, 80)}`}）`);
+        log.warn(`Orphan sweep: removed the worktree ${path} (${rm.ok ? 'ok' : `failed: ${rm.output.slice(0, 80)}`})`);
       }
     }
   } catch (e) {
-    log.warn(`孤儿 worktree 清扫本轮异常（不影响 gate 推进）：${String(e).slice(0, 140)}`);
+    log.warn(`The orphaned-worktree sweep threw this round (this does not affect the gates): ${String(e).slice(0, 140)}`);
   }
 }
 
-// 退避到点的瞬时失败 → 自动翻回可重跑态（与 forge retry 同口径），同 tick 被下面 ready 扫描拾起重跑。
-// 死信 / 未到点 / 无重试路径(如 WRITE_FAILED) 跳过。retry_count 不清——耗尽时 parkFailure 会转死信。
+// A transient failure whose backoff has expired -> flip it automatically back into a runnable state (the same
+// rule `forge retry` uses), and the ready scan below picks it up in the same tick.
+// Dead-lettered sessions, ones whose backoff has not expired, and states with no retry path (WRITE_FAILED, for
+// instance) are skipped. retry_count is not cleared - parkFailure moves it to the dead-letter queue once it is
+// exhausted.
 async function reconcileRetries(now: number): Promise<void> {
-  // 所有有自动重试路径的 *_FAILED 都纳入扫描：parkFailure 排 next_retry_at + planRetry 支持，
-  // 漏扫就会「排了重试却永不触发」= 静默卡死（Codex Should-Fix#1）。
+  // Every *_FAILED state with an automatic retry path is scanned: parkFailure schedules next_retry_at and
+  // planRetry supports it, so missing one from the scan would mean "a retry was scheduled but never fires" - a
+  // silent stall (Codex should-fix #1).
   for (const s of await sessions.listByStates(['GATE_A_FAILED', 'GATE_B_FAILED', 'GATE_C_FAILED', 'GATE_D_FAILED'])) {
     if (s.dead_letter) continue;
     if (s.next_retry_at == null || now < s.next_retry_at) continue;
@@ -755,15 +863,18 @@ async function reconcileRetries(now: number): Promise<void> {
     if (!plan) continue;
     await sessions.transition(s.id, plan.to, { ...plan.fields, next_retry_at: null });
     await sessions.appendEvent(s.id, 'auto_retry', { from: s.state, to: plan.to, attempt: s.retry_count ?? 0 });
-    log.warn(`${s.slug}: 退避窗已过 → 自动重试（已第${s.retry_count ?? 0}次）${s.state} → ${plan.to}`);
+    log.warn(`${s.slug}: the backoff window has passed -> retrying automatically (attempt ${s.retry_count ?? 0} so far) ${s.state} -> ${plan.to}`);
   }
 }
 
-// 停泊态业务对账（P2-F）：停在「等人处理」态过久 + 近期没提醒过 → 重发一次对应卡片，去抖。
-// 补「单张失败/裁决卡若那一刻飞书挂了就永久没人知道」的洞——看门狗管进程存活，这里管业务存活。
-const STUCK_AFTER_MS = hours(6); // 停泊超 6h 未动 → 视为可能被遗忘
-const REMIND_EVERY_MS = hours(12); // 同一 session 最多每 12h 提醒一次（去抖）
-// 等人处理的停泊态 → 重发哪类卡（与首次通知同卡，含可点按钮/CLI 提示）。
+// Business-level reconciliation of parked sessions: one that has sat in a "waiting on a human" state for too
+// long and has not been reminded recently gets its card re-sent, debounced.
+// This closes the hole where a single failure or arbitration card sent while the IM was down would mean nobody
+// ever finds out - the watchdog covers process liveness, and this covers business liveness.
+const STUCK_AFTER_MS = hours(6); // parked and untouched for over 6h -> treat it as possibly forgotten
+const REMIND_EVERY_MS = hours(12); // at most one reminder per session every 12h (the debounce)
+// Which card each "waiting on a human" parked state re-sends (the same card as the first notification,
+// including its buttons and CLI hints).
 const STUCK_KIND: Partial<Record<State, NotifyKind>> = {
   GATE_A_FAILED: 'failed',
   GATE_B_FAILED: 'failed',
@@ -779,19 +890,21 @@ export async function remindStuck(now: number): Promise<void> {
   const states = Object.keys(STUCK_KIND) as State[];
   for (const s of await sessions.listByStates(states)) {
     if (now - s.updated_at < STUCK_AFTER_MS) continue;
-    // *_FAILED 若已排程自动重试（未死信且 next_retry_at 在）→ 不是「等人」，不提醒。
+    // A *_FAILED state with an automatic retry already scheduled (not dead-lettered, and next_retry_at is set)
+    // is not waiting on a human, so it is not reminded.
     if (s.state.endsWith('FAILED') && !s.dead_letter && s.next_retry_at != null) continue;
     const last = await sessions.lastEventTs(s.id, 'stuck_reminded');
     if (last != null && now - last < REMIND_EVERY_MS) continue;
     const kind = STUCK_KIND[s.state];
     if (!kind) continue;
     await sessions.appendEvent(s.id, 'stuck_reminded', { state: s.state, idle_h: Math.round((now - s.updated_at) / 3600000), dead_letter: s.dead_letter ?? 0 });
-    log.warn(`${s.slug}: 停泊 ${s.state} 已 ${Math.round((now - s.updated_at) / 3600000)}h 未处理 → 重发提醒`);
-    await notify(kind, (await sessions.get(s.id))!, { stage: '停泊提醒', error: s.error ?? undefined });
+    log.warn(`${s.slug}: parked at ${s.state} and untouched for ${Math.round((now - s.updated_at) / 3600000)}h -> re-sending the reminder`);
+    await notify(kind, (await sessions.get(s.id))!, { stage: 'parked reminder', error: s.error ?? undefined });
   }
 }
 
-// 把某个自治动作派到对应 action（绝不带 --force：lint/指派/确定性闸不过 → action 自身 !ok，session 老实留停泊）。
+// Dispatch an autonomy action to its matching action (never with --force: if lint, assignment or a
+// deterministic gate does not pass, the action itself returns !ok and the session honestly stays parked).
 function runAutoAction(idOrSlug: string, action: AutoAction, by: string): Promise<ActionResult> {
   switch (action) {
     case 'requestGateB':
@@ -805,89 +918,116 @@ function runAutoAction(idOrSlug: string, action: AutoAction, by: string): Promis
   }
 }
 
-// 渐进自治：停泊在「纯授权停泊点」（CONFIRMED/AWAITING_GO/DONE/AWAITING_GATE_D）的 session，若其**项目**自治等级允许，
-// 自动触发对应动作（as 配置 actor，落审计事件）。默认 level 0 → 全跳过（零行为变更）。动作内部的权限/确定性闸
-// （go 的 lint+指派、never-merge、CI 绿前置）仍是最后防线——未过即返回 !ok，留人工。永不自动触发 *_STALLED/*_INPUT/merge。
+// Progressive autonomy: a session parked at a purely-authorisation resting point (CONFIRMED / AWAITING_GO /
+// DONE / AWAITING_GATE_D) has its matching action triggered automatically, if its **project's** autonomy level
+// allows it (acting as the configured actor, and recording an audit event). The default level is 0, so
+// everything is skipped and behaviour is unchanged. The permission and deterministic gates inside each action
+// (go's lint and assignment checks, never-merge, the CI-green precondition) remain the last line of defence -
+// if one does not pass the action returns !ok and it is left to a human. It never automatically triggers a
+// *_STALLED or *_INPUT state, and never a merge.
 export async function applyAutonomy(): Promise<void> {
   for (const s of await sessions.listByStates([...AUTONOMY_GATES])) {
-    // 单 session 全流程（含项目解析）都包进 try：某条解析/动作抛错只记该条、继续下一条，绝不中断整个 pass（Codex SF）。
+    // The whole flow for one session (including resolving its project) is wrapped in a try: if resolving or
+    // acting on one throws, that one is recorded and the pass continues with the next - it must never abort the
+    // whole pass (Codex SF).
     try {
       const { level, actor } = projectForSession(s).autonomy;
       if (level <= 0 || !actor) continue;
       const action = autoActionFor(s.state, level);
       if (!action) continue;
-      // 去抖：同一停泊态只尝试一次——上次尝试后 session 未变（updated_at ≤ 上次尝试 ts；appendEvent 不 bump updated_at）则跳过，
-      // 免 !ok（权限/lint/指派不过）留停泊时每 tick 重试刷事件。人改了 session（patch/transition bump updated_at）才重试（Codex SF）。
+      // Debounce: one attempt per parked state - if the session has not changed since the last attempt
+      // (updated_at <= the last attempt's ts; appendEvent does not bump updated_at) it is skipped, so a session
+      // left parked by an !ok (a permission, lint or assignment check not passing) does not retry and spam
+      // events every tick. It retries only once a human has changed the session (a patch or transition bumps
+      // updated_at) (Codex SF).
       const lastTry = await sessions.lastEventTs(s.id, 'autonomy_auto_triggered');
       if (lastTry != null && s.updated_at <= lastTry) continue;
-      // 审计**先于**副作用：auto-GO 的 go() 可能已建 Epic/子 issue、发方案后才在 label/approve 失败（→WRITE_FAILED）返回 !ok，
-      // 这条真外向写绝不能无痕——故先落「已尝试」，再调动作，调完追记结果（Codex Blocker）。
+      // The audit record comes **before** the side effect: an auto-GO's go() may already have created the epic
+      // and child issues and published the design before failing at the label or approve step (-> WRITE_FAILED)
+      // and returning !ok. A real outward write like that must never happen without a trace - so "attempted" is
+      // recorded first, then the action runs, and the result is appended afterwards (a Codex blocker).
       await sessions.appendEvent(s.id, 'autonomy_auto_triggered', { level, action, from: s.state, by: actor });
       const r = await runAutoAction(s.id, action, actor);
       const to = (await sessions.get(s.id))?.state ?? s.state;
       await sessions.appendEvent(s.id, 'autonomy_auto_result', { action, ok: r.ok, to, msg: r.ok ? undefined : r.msg.slice(0, 160) });
-      if (r.ok) log.ok(`${s.slug}: 自治 L${level} 自动 ${action}（${s.state}→${to}，as ${actor}）`);
-      else log.info(`${s.slug}: 自治 L${level} ${action} 未过 → 留人工（${r.msg.slice(0, 120)}）`);
+      if (r.ok) log.ok(`${s.slug}: autonomy L${level} automatically ran ${action} (${s.state} -> ${to}, as ${actor})`);
+      else log.info(`${s.slug}: autonomy L${level} ${action} did not pass -> left to a human (${r.msg.slice(0, 120)})`);
     } catch (e) {
       await sessions.appendEvent(s.id, 'autonomy_auto_result', { ok: false, error: String(e).slice(0, 160) });
-      log.warn(`${s.slug}: 自治自动触发异常（不影响其它 session）：${String(e).slice(0, 140)}`);
+      log.warn(`${s.slug}: the autonomy trigger threw (this does not affect other sessions): ${String(e).slice(0, 140)}`);
     }
   }
 }
 
-// 跑一轮：拾取所有 ready session，按并发上限推进。持 tick 锁，先自愈孤儿态、拾起退避到点的瞬时失败、提醒久停泊。
+// Run one round: pick up every ready session and advance them up to the concurrency cap. It holds the tick
+// lock, and first self-heals orphaned states, picks up transient failures whose backoff has expired, and
+// reminds about long-parked sessions.
 export async function tick(): Promise<number> {
   if (!acquireLock()) {
-    log.info('tick：已有一个 tick 在跑，跳过本次');
+    log.info('tick: another tick is already running, so this one is skipped');
     return 0;
   }
-  // 扩展钩子（onTickStart/onTickEnd）：只在**真正拿到锁的这一轮**发，跳过的那次不发——
-  // 否则下游按 tick 事件对账时会把「被别的 tick 挤掉」误算成一轮空转。
+  // The extension hooks (onTickStart / onTickEnd) fire only on **the round that actually took the lock**, never
+  // on a skipped one - otherwise anything downstream reconciling against tick events would count "squeezed out
+  // by another tick" as an idle round.
   let processed = 0;
   let ok = false;
   try {
     await fireTickStart({ at: Date.now() });
     const cfg = loadConfig();
     const now = Date.now();
-    // ── 控制面编排策略（reclaim/retry/autonomy/remind/sweep/drift）：**只在控制面 / all-in-one 跑** ──
-    // 纯 runner（设了 FORGE_CONTROL_URL）**跳过**：否则多 runner 各自 tick 会并发跑这些控制面写动作（孤儿复位/退避
-    // 重试/自治触发/停泊提醒/worktree 清扫/漂移对账），而 lease 只护 job loop、管不到它们——多 runner 下会重复触发
-    // （重复 retry/重复自治建 issue/重复清扫互踩）。这些是「控制面」职责：分离部署里由控制面进程跑，runner 只跑 job。
-    // 默认（未设 FORGE_CONTROL_URL）= all-in-one，全跑，**行为零变更**。
+    // -- The control-plane orchestration policies (reclaim / retry / autonomy / remind / sweep / drift) run
+    //    **only on the control plane, or in all-in-one mode** --
+    // A pure runner (one with FORGE_CONTROL_URL set) **skips** them: otherwise several runners would each tick
+    // and run these control-plane writes concurrently (orphan resets, backoff retries, autonomy triggers,
+    // parked reminders, worktree sweeps, drift reconciliation), while the lease only protects the job loop and
+    // reaches none of them - so with several runners they would fire repeatedly (duplicate retries, duplicate
+    // autonomy-created issues, sweeps fighting each other). These are the control plane's job: in a split
+    // deployment the control-plane process runs them and a runner only runs jobs.
+    // By default (FORGE_CONTROL_URL unset) this is all-in-one, everything runs, and **behaviour is unchanged**.
     const pureRunner = !!process.env.FORGE_CONTROL_URL;
     if (!pureRunner) {
       await reclaimOrphans();
       await reconcileRetries(now);
-      // 渐进自治先于 remindStuck：自治覆盖的授权点（CONFIRMED/AWAITING_GO 等）本就要自动推进，别先催人「请处理」又同 tick 自动走掉（Codex Nit）。
-      // 转入的 poller 态本 tick 即被下面 claimDueJobs 拾起；默认 L0 全跳过（零行为变更）。
+      // Progressive autonomy runs before remindStuck: the authorisation points autonomy covers (CONFIRMED,
+      // AWAITING_GO and so on) are meant to advance automatically, so it must not nag a human to "please handle
+      // this" and then advance on its own in the same tick (a Codex nit).
+      // The poller states it moves sessions into are picked up by claimDueJobs below in this same tick; at the
+      // default level 0 everything is skipped and behaviour is unchanged.
       await applyAutonomy();
       await remindStuck(now);
-      await sweepOrphanWorktrees(); // 孤儿 worktree 清扫（best-effort，自带 try/catch；不打断 gate）
-      // 立项后漂移闭环（opt-in，默认关）：DONE 需求 issue 全合并后对账实现 vs 验收契约，漂移私聊告警 M。
-      // 独立子系统，包 try/catch——任何异常绝不打断核心 gate 推进。
+      await sweepOrphanWorktrees(); // sweep orphaned worktrees (best-effort, with its own try/catch; it never interrupts a gate)
+      // The post-kickoff drift loop (opt-in, off by default): once a DONE requirement's issues are all merged,
+      // it reconciles the implementation against the acceptance contract and direct-messages the owner about any
+      // drift.
+      // It is a separate subsystem wrapped in a try/catch - no exception from it may ever interrupt the core
+      // gates.
       if (cfg.runtime.drift?.enabled) {
         try {
           await reconcileDrift(now);
         } catch (e) {
-          log.warn(`漂移闭环本轮异常（不影响 gate 推进）：${String(e).slice(0, 160)}`);
+          log.warn(`The drift loop threw this round (this does not affect the gates): ${String(e).slice(0, 160)}`);
         }
       }
     }
-    // ── runner job 循环：经 JobSource 接缝**原子认领**至多 max_parallel 条到期 job（lease 防多 runner 重领）→ 对每个跑 step。
-    // 认领量 = 本轮并发容量：只领这一轮就开跑的量，绝不一次占租整个 backlog（见 store leaseClaim：防排队 job 倒 TTL 被重领双跑）。
+    // -- The runner job loop: **atomically claim** at most max_parallel due jobs through the JobSource seam (the
+    //    lease stops several runners claiming the same one) -> run step for each.
+    // The claim size is this round's concurrency capacity: only what will actually start running this round, and
+    // never the whole backlog at once (see store leaseClaim: that would have queued jobs count down their TTL
+    // and be re-claimed, so the same job runs twice).
     const ready = await jobSource.claimDueJobs(cfg.runtime.max_parallel);
     if (ready.length === 0) {
-      log.info('tick：无待处理 session');
+      log.info('tick: no sessions to process');
       ok = true;
       return 0;
     }
-    log.info(`tick：${ready.length} 个待处理（并发上限 ${cfg.runtime.max_parallel}）`);
+    log.info(`tick: ${ready.length} session(s) to process (concurrency cap ${cfg.runtime.max_parallel})`);
     await runLimited(ready, cfg.runtime.max_parallel, step);
     processed = ready.length;
     ok = true;
     return processed;
   } finally {
-    releaseLock(); // 先放锁再发钩子：钩子最多拖 HOOK_TIMEOUT_MS，不能让它把下一轮 tick 挡在门外
+    releaseLock(); // release the lock before firing the hooks: a hook can take up to HOOK_TIMEOUT_MS, and it must not keep the next tick waiting at the door
     await fireTickEnd({ at: Date.now(), processed, ok });
   }
 }

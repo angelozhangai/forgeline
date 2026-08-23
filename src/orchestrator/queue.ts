@@ -1,4 +1,4 @@
-// 有界并发执行器（限制同时跑的 claude/codex 进程数）。
+// A bounded-concurrency executor (it caps how many claude/codex processes run at once).
 export async function runLimited<T>(
   items: T[],
   limit: number,
