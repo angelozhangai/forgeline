@@ -4,7 +4,8 @@ import { loadConfig } from '../config.ts';
 import { log } from '../util/log.ts';
 import { assertClaudeEnvelope } from './contract.ts';
 
-// 轻量裸调：不载主仓 CLAUDE.md/skills、无工具、零 MCP。用于起 slug 这类小工具活，便宜快。
+// A lightweight bare call: no CLAUDE.md or skills from the main repo, no tools, no MCP. Used for small
+// utility work such as producing a slug — cheap and fast.
 export async function runClaudeBare(prompt: string): Promise<string | null> {
   const cfg = loadConfig();
   const r = await run(
@@ -22,14 +23,15 @@ export async function runClaudeBare(prompt: string): Promise<string | null> {
 
 export interface ClaudeResult {
   ok: boolean;
-  result: string; // 助手文本（含我们要的 JSON 块）
+  result: string; // the assistant's text (containing the JSON block we want)
   sessionId: string | null;
   costUsd: number | null;
   raw: string;
   error?: string;
 }
 
-// 把一次 tool_use 压成一行人能看懂的进度（"在读哪个文件/grep 什么"）。
+// Compress one tool_use into a line of human-readable progress ("which file is it reading / what is it
+// grepping for").
 function summarizeTool(name: string, input: Record<string, unknown> | undefined): string {
   const s = (v: unknown): string => (typeof v === 'string' ? v : '');
   if (!input) return name;
@@ -47,10 +49,13 @@ function summarizeTool(name: string, input: Record<string, unknown> | undefined)
   }
 }
 
-// 以 cwd=$ROOT 跑本机 claude -p（加载 CLAUDE.md + skills）；prompt 走 stdin（避免 argv 体积限制）。
-// 用 stream-json 实时上报进度（否则 headless 全程无回显，像卡死）。
-// opts.sessionId：用 --session-id 钉死会话号（首轮，便于后续 resume）；
-// opts.resume：用 --resume 续接既有会话（闸A 多轮复评，省 token——上轮 PRD/代码上下文已在会话里）。
+// Run the local claude -p with cwd=$ROOT (loading CLAUDE.md and skills); the prompt goes through stdin
+// (avoiding argv size limits).
+// stream-json is used to report progress live (otherwise a headless run echoes nothing at all and looks
+// hung).
+// opts.sessionId: pin the session id with --session-id (the first round, so it can be resumed later);
+// opts.resume: continue an existing session with --resume (Gate A's multi-round re-reviews, saving tokens —
+// the previous round's PRD and code context is already in the session).
 export async function runClaude(
   prompt: string,
   opts: { label?: string; sessionId?: string; resume?: string; timeoutSec?: number; cwd?: string } = {},
@@ -65,16 +70,18 @@ export async function runClaude(
     '-p',
     '--output-format',
     'stream-json',
-    '--verbose', // stream-json + -p 要求 --verbose
-    '--strict-mcp-config', // 不带 --mcp-config → 零 MCP 加载（闸A/B 只需 Read/Grep/Glob/Bash，省 token+启动）
+    '--verbose', // stream-json with -p requires --verbose
+    '--strict-mcp-config', // no --mcp-config -> nothing MCP is loaded (Gate A/B only need Read/Grep/Glob/Bash, saving tokens and startup time)
     '--allowedTools',
     cfg.runtime.claude_allowed_tools,
   ];
-  // resume 与 session-id 互斥：续接既有会话用 resume；新会话用自钉的 session-id。
+  // resume and session-id are mutually exclusive: continuing an existing session uses resume, a new session
+  // uses the self-pinned session-id.
   if (opts.resume) args.push('--resume', opts.resume);
   else if (opts.sessionId) args.push('--session-id', opts.sessionId);
 
-  // 从流里提取的最终结果（result 事件）。用对象累加，规避 TS「闭包内赋值不窄化」坑。
+  // The final result extracted from the stream (the result event). Accumulated in an object to sidestep
+  // TypeScript's "assignment inside a closure does not narrow" trap.
   const acc: {
     finalResult: string | null;
     sessionId: string | null;
@@ -88,7 +95,7 @@ export async function runClaude(
     try {
       ev = JSON.parse(line) as Record<string, unknown>;
     } catch {
-      return; // 非 JSON 行忽略
+      return; // ignore non-JSON lines
     }
     const type = ev.type as string | undefined;
     if (type === 'assistant') {
@@ -109,21 +116,27 @@ export async function runClaude(
   };
 
   const r = await run(cfg.runtime.claude_bin, args, {
-    cwd: opts.cwd ?? ROOT, // 目标项目根（多项目：调用方传 project(s.project_id).root）
+    cwd: opts.cwd ?? ROOT, // the target project root (multi-project: the caller passes project(s.project_id).root)
     env,
     input: prompt,
-    // 分级超时：解析自愈这类「重出 JSON」的轻调用可传更短 timeoutSec，避免挂死调用霸占 tick 锁（默认走全局）。
+    // Tiered timeout: light calls such as a parse-repair re-emit can pass a shorter timeoutSec, so a hung
+    // call cannot hold the tick lock (the default uses the global value).
     timeoutMs: (opts.timeoutSec ?? cfg.runtime.claude_timeout_sec) * 1000,
     onStdoutLine,
   });
 
   if (r.timedOut) {
-    return { ok: false, result: '', sessionId: null, costUsd: null, raw: r.stdout, error: 'claude 超时' };
+    // The wording "timed out" matters: it is what lets orchestrator/retry.ts classify this as transient and
+    // retry it rather than parking the session permanently.
+    return { ok: false, result: '', sessionId: null, costUsd: null, raw: r.stdout, error: 'claude timed out' };
   }
   if (r.code !== 0) {
-    // claude CLI 把 API 层错误（socket 断开/限流/overloaded 等）塞进 stream-json 的 result(is_error:true)，
-    // 退码却是 1、stderr 常为空。只回「退出码 1」会丢掉网络线索 → classifyError 误判 permanent 不重试。
-    // 故优先用 stderr，否则把已捕获的 result 文本并进 error，让分类器看得见真实原因。
+    // The claude CLI stuffs API-layer errors (a dropped socket, rate limiting, overloaded and so on) into
+    // stream-json's result(is_error:true) while exiting 1 with an often-empty stderr. Reporting only "exit
+    // code 1" would throw away the network evidence, and classifyError would then wrongly call it permanent
+    // and not retry.
+    // So stderr is preferred, and otherwise the captured result text is folded into the error so the
+    // classifier can see the real cause.
     const detail = (r.stderr || '').trim() || (acc.finalResult || '').trim();
     return {
       ok: false,
@@ -131,14 +144,14 @@ export async function runClaude(
       sessionId: null,
       costUsd: null,
       raw: r.stdout + r.stderr,
-      error: `claude 退出码 ${r.code}: ${detail.slice(0, 600)}`,
+      error: `claude exited ${r.code}: ${detail.slice(0, 600)}`,
     };
   }
 
   if (acc.finalResult !== null) {
     if (acc.tools)
       log.info(
-        `  ${tag}✓ 分析完成（${acc.tools} 次工具调用${acc.costUsd != null ? `，$${acc.costUsd.toFixed(4)}` : ''}）`,
+        `  ${tag}✓ analysis complete (${acc.tools} tool calls${acc.costUsd != null ? `, $${acc.costUsd.toFixed(4)}` : ''})`,
       );
     return {
       ok: !acc.isError,
@@ -146,11 +159,12 @@ export async function runClaude(
       sessionId: acc.sessionId,
       costUsd: acc.costUsd,
       raw: r.stdout,
-      error: acc.isError ? 'claude 返回 is_error' : undefined,
+      error: acc.isError ? 'claude returned is_error' : undefined,
     };
   }
 
-  // 没拿到 result 事件：降级——尝试逐行找含 result 字段的对象（stream-json 框架变了但对象还在的情况）。
+  // No result event arrived: degrade by scanning the lines for an object carrying a result field (covering
+  // the case where the stream-json framing changed but the object is still there).
   for (const line of r.stdout.split('\n').reverse()) {
     if (!line.trim()) continue;
     try {
@@ -162,8 +176,10 @@ export async function runClaude(
       /* continue */
     }
   }
-  // 既无 result 事件、也反扫不到 result 形状对象 → 契约漂移（claude CLI 升级疑似改了 stream-json schema）。
-  // 失败不静默：绝不把整段 stdout 当「分析结果」静默放过（旧行为 ok:true），停泊待人核对 → 改 contract.ts。
+  // Neither a result event nor a result-shaped object found by scanning backwards -> contract drift (a
+  // claude CLI upgrade probably changed the stream-json schema).
+  // The failure is never silent: never quietly accept the whole stdout as "the analysis result" (the old
+  // ok:true behaviour). Park it for a human to check -> then edit contract.ts.
   return {
     ok: false,
     result: '',

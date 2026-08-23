@@ -1,5 +1,7 @@
-// 评审锚定校验：claude 读活 checkout，若不在锚定 sha/脏树 → warn 披露给模型 / block 停泊。
-// 守的是「绝不对非锚定代码下结论」这条评审正确性。mock util/proc 的 runSync 模拟各仓 HEAD/脏态。
+// The review anchoring check: claude reads the live checkout, so if it is not on the anchored sha or the tree
+// is dirty -> warn (disclose it to the model) or block (park).
+// What this guards is the review-correctness rule "never draw conclusions against unanchored code". runSync
+// from util/proc is mocked to simulate each repo's HEAD and dirtiness.
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 
@@ -25,7 +27,7 @@ function reset(): void {
   dirty = false;
 }
 
-test('reposOffRef：HEAD==sha 且干净 → 对齐（空）；不符/脏 → 列出', () => {
+test('reposOffRef: HEAD == sha and clean -> aligned (empty); mismatched or dirty -> listed', () => {
   reset();
   assert.deepEqual(reposOffRef(proj, { demo: 'abc123' }), []);
   headSha = 'OTHER';
@@ -35,30 +37,30 @@ test('reposOffRef：HEAD==sha 且干净 → 对齐（空）；不符/脏 → 列
   assert.deepEqual(reposOffRef(proj, { demo: 'abc123' }), ['demo']);
 });
 
-test('anchorCheck 对齐 → 空披露，不抛（warn / block 都照常）', () => {
+test('anchorCheck aligned -> empty disclosure, no throw (both warn and block behave normally)', () => {
   reset();
   assert.deepEqual(anchorCheck(proj, fresh, 'warn'), { off: [], disclosure: '' });
   assert.deepEqual(anchorCheck(proj, fresh, 'block'), { off: [], disclosure: '' });
 });
 
-test('anchorCheck warn + 偏移 → 返回披露文本（含仓名 + origin/branch + 不要当既有事实）', () => {
+test('anchorCheck warn + off-anchor -> returns the disclosure text (naming the repo, origin/branch, and "do not take it as existing fact")', () => {
   reset();
-  headSha = 'STALE'; // HEAD ≠ 锚定 sha
+  headSha = 'STALE'; // HEAD differs from the anchored sha
   const r = anchorCheck(proj, fresh, 'warn');
   assert.deepEqual(r.off, ['demo']);
-  assert.match(r.disclosure, /checkout 未锚定/);
+  assert.match(r.disclosure, /Checkout not anchored/);
   assert.match(r.disclosure, /demo/);
   assert.match(r.disclosure, /origin\/main/);
-  assert.match(r.disclosure, /不要把未上线/);
+  assert.match(r.disclosure, /do not take unshipped or local changes as existing fact/);
 });
 
-test('anchorCheck block + 偏移 → 抛（停泊，绝不对非锚定代码下结论）', () => {
+test('anchorCheck block + off-anchor -> throws (park; never draw conclusions against unanchored code)', () => {
   reset();
-  dirty = true; // 脏树也算偏移
-  assert.throws(() => anchorCheck(proj, fresh, 'block'), /未锚定 origin\/main/);
+  dirty = true; // a dirty tree also counts as off-anchor
+  assert.throws(() => anchorCheck(proj, fresh, 'block'), /not anchored to origin\/main/);
 });
 
-test('anchorCheck warn + 脏树 → 披露但不抛（保可用，告知模型）', () => {
+test('anchorCheck warn + dirty tree -> discloses but does not throw (stay usable, and tell the model)', () => {
   reset();
   dirty = true;
   const r = anchorCheck(proj, fresh, 'warn');

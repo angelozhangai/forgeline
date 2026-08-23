@@ -141,9 +141,9 @@ test('PM 只点逐条下拉：复评输入和 PRD 留痕都保留第 6-8 条业�
 
   const s = (await sessions.get(id))!;
   assert.equal(s.state, 'GATE_A_REVISION_REQUESTED');
-  assert.match(s.gate_a_pending_input ?? '', /H1（第1个业务决定？）：推荐答案1/);
-  assert.match(s.gate_a_pending_input ?? '', /H6（第6个业务决定？）：推荐答案6/);
-  assert.match(s.gate_a_pending_input ?? '', /H8（第8个业务决定？）：备选答案8/);
+  assert.match(s.gate_a_pending_input ?? '', /H1 \(第1个业务决定？\): 推荐答案1/);
+  assert.match(s.gate_a_pending_input ?? '', /H6 \(第6个业务决定？\): 推荐答案6/);
+  assert.match(s.gate_a_pending_input ?? '', /H8 \(第8个业务决定？\): 备选答案8/);
   assert.match(s.confirmed_notes ?? '', /第2轮答复/);
   assert.match(s.confirmed_notes ?? '', /备选答案8/);
   assert.equal(tickCalls, 1);
@@ -152,8 +152,8 @@ test('PM 只点逐条下拉：复评输入和 PRD 留痕都保留第 6-8 条业�
   assert.equal(comments[0].token, `doc-${id}`);
   assert.match(comments[0].text, /【PM确认 · 第2轮】/);
   assert.match(comments[0].text, /选择：采纳建议，确认通过/);
-  assert.match(comments[0].text, /批注：H1（第1个业务决定？）：推荐答案1/);
-  assert.match(comments[0].text, /H8（第8个业务决定？）：备选答案8/);
+  assert.match(comments[0].text, /批注：H1 \(第1个业务决定？\): 推荐答案1/);
+  assert.match(comments[0].text, /H8 \(第8个业务决定？\): 备选答案8/);
   assert.doesNotMatch(comments[0].text, /批注：（无）/);
 });
 
@@ -173,8 +173,8 @@ test('PM 选其他但未补充：不会伪造选项答案，复评明确收到�
 
   const s = (await sessions.get(id))!;
   assert.equal(s.state, 'GATE_A_REVISION_REQUESTED');
-  assert.equal(s.gate_a_pending_input, '部分采纳');
-  assert.match(s.confirmed_notes ?? '', /部分采纳/);
+  assert.equal(s.gate_a_pending_input, 'Partially accepted');
+  assert.match(s.confirmed_notes ?? '', /Partially accepted/);
   assert.equal(comments.length, 1);
   assert.match(comments[0].text, /选择：部分采纳/);
   assert.match(comments[0].text, /批注：（无）/);

@@ -1,6 +1,8 @@
-// 下游闸C/闸D 的「确定性 CI 闸」+ worktree git 读写助手。
-// CI 是 reviewFixLoop 里替代 codex 的 reviewer：跑目标项目委托的 CI 脚本（forge-ci.sh），
-// 绿=LGTM、红=CHANGES。CI 绝不在 forge 重造、绝不裸 nx——没配 scripts.ci 即视为「跑不起来」交人工。
+// The **deterministic CI gate** for downstream Gate C / Gate D, plus worktree git read/write helpers.
+// CI is the reviewer that replaces codex inside reviewFixLoop: it runs the CI script the target project
+// delegates (forge-ci.sh), where green = LGTM and red = CHANGES.
+// CI is never rebuilt inside forge and never invoked as a bare nx — with no scripts.ci configured, it counts
+// as "cannot run" and goes to a human.
 import { run, runSync } from '../util/proc.ts';
 import { interp } from '../util/worktree.ts';
 
@@ -10,33 +12,35 @@ function tail(s: string, n = 4000): string {
 }
 
 export interface CiResult {
-  ok: boolean; // 退出码 0（全绿）
-  ran: boolean; // 脚本真跑起来了（false=spawn 失败/超时/未配置 → 调用方 park，不当成红）
-  summary: string; // 截断的 stdout+stderr（红时喂 claude 续修；绿时留痕）
+  ok: boolean; // exit code 0 (fully green)
+  ran: boolean; // the script actually started (false = spawn failure / timeout / not configured -> the caller parks rather than treating it as red)
+  summary: string; // truncated stdout+stderr (fed to claude for the fix when red; kept as a record when green)
 }
 
-// 在 worktree 跑委托 CI 脚本（cwd=worktree，脚本据自身位置定位仓根 = 该 worktree）。
-// ciScriptAbs 缺省（项目未配 scripts.ci）→ ran:false（绝不回退裸 nx；下游必须委托项目 CI）。
+// Run the delegated CI script in the worktree (cwd = the worktree, so the script locates the repo root — that
+// worktree — from its own position).
+// ciScriptAbs missing (the project has no scripts.ci) -> ran:false (never fall back to a bare nx; downstream
+// must delegate to the project's CI).
 export async function runCi(
   worktreePath: string,
   ciScriptAbs: string | undefined,
   opts: { timeoutMs?: number; base?: string } = {},
 ): Promise<CiResult> {
   if (!ciScriptAbs) {
-    return { ok: false, ran: false, summary: '目标项目未配置 scripts.ci——下游必须委托项目本地 CI 脚本（绝不在 forge 重造/裸 nx）' };
+    return { ok: false, ran: false, summary: 'The target project has no scripts.ci configured — downstream must delegate to the project\'s own local CI script (never rebuild it in forge or run a bare nx)' };
   }
   const timeoutMs = opts.timeoutMs ?? 1_800_000;
   const baseArgs = opts.base ? ['--base', opts.base] : [];
   const [bin, args] = interp(ciScriptAbs, ['affected', ...baseArgs]);
   const r = await run(bin, args, { cwd: worktreePath, timeoutMs });
-  if (r.code === null) return { ok: false, ran: false, summary: `CI 脚本无法启动：${tail(r.stderr)}` };
-  if (r.timedOut) return { ok: false, ran: false, summary: `CI 超时（${Math.round(timeoutMs / 1000)}s）` };
+  if (r.code === null) return { ok: false, ran: false, summary: `The CI script could not start: ${tail(r.stderr)}` };
+  if (r.timedOut) return { ok: false, ran: false, summary: `CI timed out (${Math.round(timeoutMs / 1000)}s)` };
   return { ok: r.code === 0, ran: true, summary: tail(r.stdout + r.stderr) };
 }
 
-// ── worktree git 读写助手（同步小命令；失败降级不抛，绝不冒进）──────────────────
+// -- Worktree git helpers (small synchronous commands; they degrade rather than throw, and never press ahead) --
 
-// base..HEAD 是否有提交（=是否已实现并落 commit）。
+// Whether base..HEAD has commits (i.e. whether the implementation has landed as a commit).
 export function hasCommitsSince(worktreePath: string, baseSha: string): boolean {
   try {
     return runSync('git', ['-C', worktreePath, 'rev-list', '--count', `${baseSha}..HEAD`]).trim() !== '0';
@@ -45,7 +49,7 @@ export function hasCommitsSince(worktreePath: string, baseSha: string): boolean 
   }
 }
 
-// base..HEAD 的 --stat 摘要（落 ImplEnvelope 展示）。
+// The --stat summary of base..HEAD (persisted into ImplEnvelope for display).
 export function diffStatSince(worktreePath: string, baseSha: string): string {
   try {
     return tail(runSync('git', ['-C', worktreePath, 'diff', '--stat', `${baseSha}..HEAD`]).trim(), 2000);
@@ -54,7 +58,7 @@ export function diffStatSince(worktreePath: string, baseSha: string): string {
   }
 }
 
-// base..HEAD 改动文件清单。
+// The list of files changed in base..HEAD.
 export function changedFilesSince(worktreePath: string, baseSha: string): string[] {
   try {
     return runSync('git', ['-C', worktreePath, 'diff', '--name-only', `${baseSha}..HEAD`])
@@ -66,8 +70,9 @@ export function changedFilesSince(worktreePath: string, baseSha: string): string
   }
 }
 
-// 推 worktree 当前分支到 origin（闸D：CI 绿后更新 PR 分支）。upstream 已由开 PR 的 push -u 设好。
-// 失败返回 ok:false（调用方据此停泊，绝不假装推成功）。
+// Push the worktree's current branch to origin (Gate D: update the PR branch once CI is green). The upstream
+// was already set by the `push -u` that opened the PR.
+// On failure it returns ok:false (the caller parks on that; never pretend the push succeeded).
 export function pushWorktree(worktreePath: string): { ok: boolean; output: string } {
   try {
     const out = runSync('git', ['-C', worktreePath, 'push']);
@@ -77,8 +82,10 @@ export function pushWorktree(worktreePath: string): { ok: boolean; output: strin
   }
 }
 
-// worktree 是否干净（无未提交改动）。CI/push 前据此确认：CI 验的、push 的，都是 HEAD 那个提交，
-// 而非脏 working tree（否则 CI 绿证明不了被 push 的提交）。查不了 → 保守判脏（false），逼调用方停泊。
+// Whether the worktree is clean (no uncommitted changes). Confirmed before CI and before a push: what CI
+// verified and what gets pushed must both be the commit at HEAD rather than a dirty working tree (otherwise a
+// green CI proves nothing about the pushed commit). If it cannot be determined, conservatively call it dirty
+// (false), forcing the caller to park.
 export function worktreeClean(worktreePath: string): boolean {
   try {
     return runSync('git', ['-C', worktreePath, 'status', '--porcelain']).trim() === '';
@@ -87,35 +94,44 @@ export function worktreeClean(worktreePath: string): boolean {
   }
 }
 
-// 回滚 worktree 到指定提交并清未跟踪文件（reset --hard + clean -fd；-fd 不碰 .gitignore，故 node_modules 等保留）。
-// 闸D 改方未达「CI 绿并推」时复位——绝不把红/未验证的 commit 留在 HEAD，被下个 tick 的 codex review-first 直接 LGTM
-// 推进而绕过 CI 绿前置（Codex 闸D Blocker）。
-// reset/clean 退 0 ≠ 真干净：clean -fd 跳过嵌套 git repo/submodule 残留仍退 0（Codex SF）。故复位后**再验一次** porcelain，
-// 非空即 ok:false——「复位成功」必须意味着「树确已干净在 sha」，否则调用方会据此放行一个仍脏的树进 review。
-// 失败返回 ok:false，调用方据此升级停泊（不能假装复位成功）。
+// Roll the worktree back to a given commit and clear untracked files (reset --hard + clean -fd; -fd leaves
+// .gitignore'd paths alone, so node_modules and friends survive).
+// Used when a Gate D revision did not reach "CI green and pushed" — never leave a red or unverified commit at
+// HEAD, where the next tick's review-first codex pass could LGTM it straight through and bypass the
+// CI-green precondition.
+// A zero exit from reset/clean does **not** mean genuinely clean: clean -fd skips nested git repos and
+// submodule leftovers and still exits 0. So the porcelain status is **checked again** after the reset, and a
+// non-empty result is ok:false — "the reset succeeded" must mean "the tree really is clean at that sha", or
+// the caller would let a still-dirty tree through into review.
+// On failure it returns ok:false and the caller escalates to a parked state (it must not pretend the reset
+// worked).
 export function resetWorktree(worktreePath: string, sha: string): { ok: boolean; output: string } {
   try {
     runSync('git', ['-C', worktreePath, 'reset', '--hard', sha]);
     runSync('git', ['-C', worktreePath, 'clean', '-fd']);
     const dirty = runSync('git', ['-C', worktreePath, 'status', '--porcelain']).trim();
-    if (dirty) return { ok: false, output: `复位后 worktree 仍非 clean（嵌套 repo/submodule 残留？）：${dirty.slice(0, 200)}` };
+    if (dirty) return { ok: false, output: `The worktree is still not clean after the reset (nested repo / submodule leftovers?): ${dirty.slice(0, 200)}` };
     return { ok: true, output: '' };
   } catch (e) {
     return { ok: false, output: String(e).slice(0, 300) };
   }
 }
 
-// 把 claude 这轮在 worktree 的全部改动落一个提交（forge 拥有 git，claude 只管写码）。
-// --no-verify 跳过目标项目 husky（这是 WIP 提交；真闸是 forge-ci.sh）；显式 author 防 worktree 缺 user 配置。
-// 返回 ok/committed 二维区分三态（关键——绝不能把「提交失败」和「无改动」混为一谈，见 Codex 闸D Blocker）：
-//  · ok:false              提交失败（git 异常；此时 add -A 可能已把改动留在 index → worktree 脏）→ 调用方必须停泊。
-//  · ok:true, committed:false  无改动（worktree 本就 clean，没东西可提交）。
-//  · ok:true, committed:true   正常落了一个提交（提交后 worktree clean）。
+// Land everything claude changed in the worktree this round as one commit (forge owns git; claude only writes
+// code).
+// --no-verify skips the target project's husky hooks (this is a WIP commit; the real gate is forge-ci.sh), and
+// an explicit author guards against a worktree with no user configuration.
+// The two dimensions ok/committed distinguish three states — crucially, "the commit failed" must never be
+// conflated with "there was nothing to commit":
+//  · ok:false                 the commit failed (a git error; `add -A` may already have staged the changes, so
+//                             the worktree is dirty) -> the caller must park.
+//  · ok:true, committed:false nothing changed (the worktree was already clean, with nothing to commit).
+//  · ok:true, committed:true  a commit landed normally (and the worktree is clean afterwards).
 export function commitWorktree(worktreePath: string, message: string): { ok: boolean; committed: boolean; output: string } {
   try {
     runSync('git', ['-C', worktreePath, 'add', '-A']);
     const status = runSync('git', ['-C', worktreePath, 'status', '--porcelain']).trim();
-    if (!status) return { ok: true, committed: false, output: '无改动，跳过提交' };
+    if (!status) return { ok: true, committed: false, output: 'nothing changed, commit skipped' };
     const out = runSync('git', [
       '-C', worktreePath,
       '-c', 'user.name=forge',
