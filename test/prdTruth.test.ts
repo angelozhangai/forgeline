@@ -1,5 +1,7 @@
-// 单测：PRD 真源机械合成纯函数 buildPrdTruth（原文 + 闸A 评审定稿 + PM 确认 → 单一 markdown）。
-// 纯函数、无 IO、无时间量——快照式断言结构 + 插值 + 边界（空原文/空备注/收口后空 open_questions）。
+// Unit tests: buildPrdTruth, the pure function that synthesises the PRD source of truth mechanically
+// (source text + the Gate A review final draft + the PM confirmations -> a single markdown document).
+// It is pure, does no IO and reads no clock, so the assertions are snapshot-shaped: structure + interpolation
+// + the edge cases (empty source text, empty notes, and open_questions being empty after the review closed).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { writeFileSync, mkdtempSync } from 'node:fs';
@@ -12,114 +14,129 @@ import type { Session } from '../src/types.ts';
 
 function env(over: Partial<GateAEnvelope> = {}): GateAEnvelope {
   return GateASchema.parse({
-    summary: '给退款加余额通道',
+    summary: 'add a store-credit channel to refunds',
     repos_touched: ['demo', 'example-web'],
     size: 'M',
-    size_reason: '跨两仓但无 DB 迁移',
+    size_reason: 'spans two repos but needs no DB migration',
     open_questions: [],
-    risks: [{ area: '计费', detail: '余额与原路并存需对账', evidence: 'demo src/pay.ts:42' }],
+    risks: [{ area: 'billing', detail: 'store credit and the original route coexist, so they must reconcile', evidence: 'demo src/pay.ts:42' }],
     confidence: 0.8,
     ...over,
   });
 }
 
-test('buildPrdTruth：三段齐全 + 关键内容插值 + 收口后 open_questions 标已澄清', () => {
-  const md = buildPrdTruth('用户要能退到余额', env(), 'H1：退到余额\nM 批注：本期只做余额');
-  // 三段结构
-  assert.match(md, /# PRD 真源（已多轮评审）/);
-  assert.match(md, /## 一、PRD 原文/);
-  assert.match(md, /## 二、闸A 评审定稿/);
-  assert.match(md, /## 三、PM 确认定稿/);
-  // 插值
-  assert.match(md, /用户要能退到余额/); // PRD 原文
-  assert.match(md, /给退款加余额通道/); // summary
+test('buildPrdTruth: all three sections present + the key content interpolated + open_questions marked clarified once closed', () => {
+  const md = buildPrdTruth('users must be able to get a refund as store credit', env(), 'H1: refund as store credit\nM note: only store credit this cycle');
+  // The three-section structure
+  assert.match(md, /# PRD source of truth \(reviewed over several rounds\)/);
+  assert.match(md, /## 1\. PRD source text/);
+  assert.match(md, /## 2\. Gate A review, final draft/);
+  assert.match(md, /## 3\. PM confirmations/);
+  // Interpolation
+  assert.match(md, /users must be able to get a refund as store credit/); // the PRD source text
+  assert.match(md, /add a store-credit channel to refunds/); // summary
   assert.match(md, /demo \/ example-web/); // repos_touched
-  assert.match(md, /跨两仓但无 DB 迁移/); // size_reason
-  assert.match(md, /\[计费\] 余额与原路并存需对账（证据：demo src\/pay\.ts:42）/); // risk 带证据
-  assert.match(md, /H1：退到余额/); // confirmed_notes
-  assert.match(md, /M 批注：本期只做余额/);
-  // 收口后无开放问题
-  assert.match(md, /已全部澄清/);
+  assert.match(md, /spans two repos but needs no DB migration/); // size_reason
+  assert.match(md, /\[billing\] store credit and the original route coexist, so they must reconcile \(evidence: demo src\/pay\.ts:42\)/); // a risk carrying its evidence
+  assert.match(md, /H1: refund as store credit/); // confirmed_notes
+  assert.match(md, /M note: only store credit this cycle/);
+  // No open questions once the review closed
+  assert.match(md, /everything is clarified/);
 });
 
-test('buildPrdTruth：残留 open_questions（M 强制放行）逐条列出，带严重度与倾向', () => {
+test('buildPrdTruth: residual open_questions (an M forced the gate open) are listed one by one, with severity and leaning', () => {
   const md = buildPrdTruth(
     'prd',
-    env({ open_questions: [{ q: '退款时限多久？', suggestion: '7 天', severity: 'high', options: [] }] }),
-    'M 强制放行',
+    env({ open_questions: [{ q: 'how long is the refund window?', suggestion: '7 days', severity: 'high', options: [] }] }),
+    'M forced it open',
   );
-  assert.match(md, /1\. \[high\] 退款时限多久？/);
-  assert.match(md, /倾向：7 天/);
-  assert.doesNotMatch(md, /已全部澄清/); // 有残留 → 不应显示已澄清
+  assert.match(md, /1\. \[high\] how long is the refund window\?/);
+  assert.match(md, /Leaning: 7 days/);
+  assert.doesNotMatch(md, /everything is clarified/); // there is residue -> it must not claim everything is clarified
 });
 
-test('buildPrdTruth：空原文 / 空备注 → 占位文案，不漏段', () => {
+test('buildPrdTruth: empty source text / empty notes -> placeholder copy, and no section is dropped', () => {
   const md = buildPrdTruth('   ', env({ risks: [] }), '');
-  assert.match(md, /（未提供 PRD 正文）/);
-  assert.match(md, /（无额外备注）/);
-  assert.match(md, /### 风险 \/ 冲突\n- （无）/); // 空 risks → （无）
+  assert.match(md, /\(no PRD body was provided\)/);
+  assert.match(md, /\(no additional notes\)/);
+  assert.match(md, /### Risks \/ conflicts\n- \(none\)/); // no risks -> (none)
 });
 
-test('buildPrdTruth：确定性可复现（同输入两次完全一致，无时间量/随机量）', () => {
+test('buildPrdTruth: deterministic and reproducible (the same input twice is byte-identical; no clock, no randomness)', () => {
   const a = buildPrdTruth('prd', env(), 'notes');
   const b = buildPrdTruth('prd', env(), 'notes');
   assert.equal(a, b);
 });
 
-test('loadPrdTruth：封口文档缺 → 从 session 三源即时合成兜底（闸B 永不拿空需求）', () => {
+// The source of this repository is English, but the requirement documents it processes are data and may be
+// written in any language. This pins that: non-English PRD text, summaries, risks and PM notes must survive
+// synthesis byte-for-byte. The fixtures are built from code points rather than written as literal characters
+// so that this file itself stays within the English-only rule (see test/english-only.test.ts).
+test('buildPrdTruth: non-English requirement input passes through untouched (source is English, input is not)', () => {
+  const prd = String.fromCodePoint(0x9000, 0x6b3e, 0x8981, 0x80fd, 0x9000, 0x5230, 0x4f59, 0x989d); // a Chinese requirement sentence
+  const summary = String.fromCodePoint(0x4f59, 0x989d, 0x9000, 0x6b3e);
+  const notes = String.fromCodePoint(0x53ea, 0x505a, 0x4f59, 0x989d);
+  const md = buildPrdTruth(prd, env({ summary, risks: [] }), notes);
+  assert.ok(md.includes(prd), 'the PRD source text must be carried through verbatim');
+  assert.ok(md.includes(summary), 'the Gate A summary must be carried through verbatim');
+  assert.ok(md.includes(notes), 'the PM confirmations must be carried through verbatim');
+});
+
+test('loadPrdTruth: the sealed document is missing -> synthesise from the session\'s three sources on the spot (Gate B never gets an empty requirement)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'forge-prdtruth-'));
   const gaPath = join(dir, 'gate-a.json');
   const prdPath = join(dir, 'prd.txt');
-  writeFileSync(gaPath, JSON.stringify(GateASchema.parse({ summary: '加余额退款', repos_touched: ['demo'], size: 'S' })));
-  writeFileSync(prdPath, '退款要能退到余额');
-  // 唯一 slug → 交付目录 <deliveryDir>/<slug> 不存在 → loadPrdTruth 不写盘，但仍返回即时合成内容。
+  writeFileSync(gaPath, JSON.stringify(GateASchema.parse({ summary: 'refund as store credit', repos_touched: ['demo'], size: 'S' })));
+  writeFileSync(prdPath, 'refunds must be payable as store credit');
+  // A unique slug -> <deliveryDir>/<slug> does not exist -> loadPrdTruth writes nothing but still returns the
+  // freshly synthesised content.
   const s = {
     slug: `prdtruth-unit-${process.pid}-${gaPath.length}`,
     prd_text_path: prdPath,
     gate_a_output_path: gaPath,
-    confirmed_notes: 'H1：退到余额',
+    confirmed_notes: 'H1: refund as store credit',
   } as unknown as Session;
   const md = loadPrdTruth(s);
-  assert.match(md, /退款要能退到余额/); // PRD 原文（读自 prd_text_path）
-  assert.match(md, /加余额退款/); // summary（读自 gate-a.json）
-  assert.match(md, /H1：退到余额/); // confirmed_notes
+  assert.match(md, /refunds must be payable as store credit/); // the PRD source text (read from prd_text_path)
+  assert.match(md, /refund as store credit/); // summary (read from gate-a.json)
+  assert.match(md, /H1: refund as store credit/); // confirmed_notes
 });
 
-test('loadPrdTruth：闸A 信封路径在但 JSON 坏（截断/写坏）→ 显性抛错，绝不静默降级成空壳', () => {
+test('loadPrdTruth: the Gate A envelope path exists but the JSON is broken (truncated or written badly) -> throw explicitly, never silently degrade to an empty shell', () => {
   const dir = mkdtempSync(join(tmpdir(), 'forge-prdtruth-bad-'));
   const gaPath = join(dir, 'gate-a.json');
-  writeFileSync(gaPath, '{"summary": "x", "repos_'); // 截断的坏 JSON
+  writeFileSync(gaPath, '{"summary": "x", "repos_'); // truncated, broken JSON
   const s = {
     slug: `prdtruth-bad-${process.pid}-${gaPath.length}`,
     gate_a_output_path: gaPath,
     confirmed_notes: '',
   } as unknown as Session;
-  assert.throws(() => loadPrdTruth(s), /闸A 信封.*(JSON 解析失败|读不出|不合约)/);
+  assert.throws(() => loadPrdTruth(s), /Gate A envelope.*(failed to parse as JSON|could not be read|off-contract)/);
 });
 
-test('loadPrdTruth：闸A 信封不合约（迁移后类型漂移）→ 显性抛错', () => {
+test('loadPrdTruth: the Gate A envelope is off-contract (type drift after a migration) -> throw explicitly', () => {
   const dir = mkdtempSync(join(tmpdir(), 'forge-prdtruth-schema-'));
   const gaPath = join(dir, 'gate-a.json');
-  writeFileSync(gaPath, JSON.stringify({ summary: 'x', repos_touched: 'demo' })); // repos_touched 应是数组
+  writeFileSync(gaPath, JSON.stringify({ summary: 'x', repos_touched: 'demo' })); // repos_touched should be an array
   const s = {
     slug: `prdtruth-schema-${process.pid}-${gaPath.length}`,
     gate_a_output_path: gaPath,
     confirmed_notes: '',
   } as unknown as Session;
-  assert.throws(() => loadPrdTruth(s), /不合约/);
+  assert.throws(() => loadPrdTruth(s), /off-contract/);
 });
 
-test('loadPrdTruth：老 session 无 gate_a_output_path → legacy 兜底（PRD原文/PM确认仍承载，不抛）', () => {
+test('loadPrdTruth: an old session with no gate_a_output_path -> legacy fallback (the PRD text and PM confirmations still carry it; no throw)', () => {
   const dir = mkdtempSync(join(tmpdir(), 'forge-prdtruth-legacy-'));
   const prdPath = join(dir, 'prd.txt');
-  writeFileSync(prdPath, '老需求原文');
+  writeFileSync(prdPath, 'the old requirement text');
   const s = {
     slug: `prdtruth-legacy-${process.pid}-${prdPath.length}`,
     prd_text_path: prdPath,
     gate_a_output_path: null,
-    confirmed_notes: 'PM：就这么做',
+    confirmed_notes: 'PM: do it this way',
   } as unknown as Session;
-  const md = loadPrdTruth(s); // 不抛
-  assert.match(md, /老需求原文/);
-  assert.match(md, /PM：就这么做/);
+  const md = loadPrdTruth(s); // does not throw
+  assert.match(md, /the old requirement text/);
+  assert.match(md, /PM: do it this way/);
 });
