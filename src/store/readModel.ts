@@ -1,6 +1,9 @@
-// Session 上 JSON 文本列的「读模型」解析：把 routing / 残留 / 评分维度等 TEXT 列解成结构。
-// 单一真源——之前散在 notify.ts（私有）与 index.ts（内联）各解一份。坏/缺 JSON 一律返回空骨架/null
-// （展示层尽力而为，不抛——真源失败的停泊在写入侧已落实「失败不静默」，这里只是渲染读取）。
+// The "read model" for the JSON text columns on a session: it parses the routing, residue and score-dimension
+// TEXT columns into structures.
+// One source of truth - this used to be duplicated between notify.ts (privately) and index.ts (inline). Broken
+// or missing JSON always yields an empty skeleton or null (the display layer is best-effort and never throws;
+// the no-silent-failures discipline is enforced on the write side, where a genuine failure parks the session -
+// this is only reading for rendering).
 import type { Session, Routing } from '../types.ts';
 import type { ScoreDims } from '../util/scoring.ts';
 
@@ -12,7 +15,8 @@ export function routingOf(s: Session): Routing | null {
   }
 }
 
-// PRD 评分四维（清晰/完整/可行/可测，各 0-25）。坏/缺 → null（徽章降级）。
+// The four PRD score dimensions (clarity, completeness, feasibility, testability; each 0-25). Broken or
+// missing -> null (the badge degrades).
 export function parseDims(json: string | null): ScoreDims | null {
   if (!json) return null;
   try {
@@ -22,7 +26,8 @@ export function parseDims(json: string | null): ScoreDims | null {
   }
 }
 
-// 一条残留 finding（对抗复审/闸B 未消解意见）。evidence 仅 CLI 详情展示，卡片侧不读（多带无害）。
+// One residual finding (an adversarial-review or Gate B finding that was never resolved). `evidence` is only
+// shown in the CLI detail view and is not read by the cards (carrying it along is harmless).
 export interface ResidualFinding {
   severity?: string;
   issue: string;
@@ -31,10 +36,11 @@ export interface ResidualFinding {
   evidence?: string;
 }
 
-// 闸A 残留（gate_a_residual）：PM 多轮开放问题 或 codex 对抗未消解 findings（source 区分）。
+// The Gate A residue (gate_a_residual): either the PM's still-open questions across rounds, or codex's
+// unresolved adversarial findings (`source` tells them apart).
 export interface ResidualRead {
   round: number;
-  source?: string; // 'codex'=对抗复审未消解的 findings；缺省=PM 多轮开放问题
+  source?: string; // 'codex' = unresolved adversarial-review findings; absent = the PM's still-open questions
   open_questions: { q: string; suggestion?: string; severity?: string }[];
   findings: ResidualFinding[];
 }
@@ -54,7 +60,8 @@ export function readResidual(json: string | null): ResidualRead {
   }
 }
 
-// 闸B 对抗残留（adversarial_residual）：到上限仍未消解的 findings + 轮次 + 用了哪个 reviewer。
+// The Gate B adversarial residue (adversarial_residual): the findings still unresolved at the cap, the round
+// number, and which reviewer produced them.
 export interface GateBResidualRead {
   round: number;
   used: string;
@@ -71,7 +78,8 @@ export function readGateBResidual(json: string | null): GateBResidualRead {
   }
 }
 
-// 对抗残留里待裁决意见条数（GO 卡 / CLI 显「N 条待裁决」）。坏/缺 → 0。
+// How many findings in the adversarial residue await arbitration (the GO card and the CLI show "N awaiting
+// arbitration"). Broken or missing -> 0.
 export function residualCount(json: string | null): number {
   return readGateBResidual(json).findings.length;
 }

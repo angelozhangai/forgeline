@@ -1,20 +1,30 @@
-// remoteApi——runner 经 HTTP 读写**控制面**状态（GitHub-runner 模式：状态在中心、runner 远程读写）。
-// 与 localSqliteStore（store/sessions.ts）实现同一 `SessionStore` 接口；选择点（store/index.ts）按
-// FORGE_CONTROL_URL 切（设了=纯 runner，经 HTTP；未设=all-in-one 现状）。照 jobs/remote.ts 的 client/server
-// wire 共用范式。
+// remoteApi - a runner reads and writes **control-plane** state over HTTP (the GitHub-runner model: the state
+// lives centrally and runners read and write it remotely).
+// It implements the same `SessionStore` interface as localSqliteStore (store/sessions.ts); the selection point
+// (store/index.ts) switches on FORGE_CONTROL_URL (set = a pure runner going over HTTP; unset = the all-in-one
+// status quo). It follows the same client/server wire pattern as jobs/remote.ts.
 //
-// wire 契约：单一 RPC 信封 `POST <base>/store` body `{method, args}` → `{ok:true,result}` | `{ok:false,error}`。
-//   · 选 RPC 信封而非逐资源 REST：SessionStore 是**内部 control/runner RPC 接口**（19 方法、非公开资源模型），
-//     一个分发点保证 client/server 严格锁步、零路由漂移；新增/改方法只动接口一处，无需手摆一串 endpoint。
-//   · 2xx 一律「server 处理过」(result 或业务错误都进信封)；非 2xx 才是真传输/server 崩。故业务错误（非法
-//     转移 / UNIQUE 撞索引）走 `ok:false` + 原始 message，**不**用 HTTP 4xx——让 client 重建 Error 后纯谓词仍能分类。
+// The wire contract: a single RPC envelope, `POST <base>/store` with body `{method, args}`, returning
+// `{ok:true,result}` or `{ok:false,error}`.
+//   - An RPC envelope rather than per-resource REST: SessionStore is an **internal control/runner RPC
+//     interface** (nineteen methods, not a public resource model), and one dispatch point keeps client and
+//     server in strict lockstep with no routing drift; adding or changing a method touches the interface in one
+//     place instead of hand-wiring another endpoint.
+//   - Any 2xx means "the server processed it" (both a result and a business error travel inside the envelope);
+//     only a non-2xx is a genuine transport failure or a server crash. So business errors (an illegal
+//     transition, a UNIQUE index collision) come back as `ok:false` plus the original message, **not** as an
+//     HTTP 4xx - which is what lets the client rebuild the Error and still classify it with a pure predicate.
 //
-// 失败不静默：网络/HTTP 非2xx/坏JSON/非法信封/server 报错 → **抛**（runner 据此知「读写控制面失败」，绝不
-// 把失败静默当「无状态」继续）。**保留原始 error message**：故 isDuplicate*Error 这类纯谓词在 client 侧对
-// rejected error 仍可分类（只看 message 正则、无 IO）——它们不过网，client 本地跑。
+// No silent failures: a network error, a non-2xx, broken JSON, a malformed envelope, or a server-side error all
+// **throw** (so the runner knows "reading or writing the control plane failed" and never silently continues as
+// though there were no state). The **original error message is preserved**, which is what lets pure predicates
+// like isDuplicate*Error still classify a rejected error on the client side (they only run a regex over the
+// message and do no IO) - they never go over the wire and run locally on the client.
 //
-// ⚠️ 鉴权/网络暴露属**部署侧**（后续）：本切片是 client + 可挂载的 handler + 往返测试，默认路径（未设
-// FORGE_CONTROL_URL）零变更。挂进生产控制面 server + 鉴权见 docs/architecture-control-plane-split.md Phase 2。
+// Authentication and network exposure are a **deployment concern** handled separately: this slice is the
+// client, a mountable handler, and the round-trip tests, and the default path (FORGE_CONTROL_URL unset) is
+// unchanged. Mounting it into a production control-plane server with authentication is covered in
+// docs/architecture-control-plane-split.md.
 import type { Session } from '../types.ts';
 import type { State } from '../statemachine/states.ts';
 import type { SessionStore, NewSession, EventRow } from './port.ts';
@@ -22,7 +32,9 @@ import { isDuplicateDocRefError, isDuplicateIssueRefError } from './sessions.ts'
 
 const TIMEOUT_MS = 30_000;
 
-// 可经网络分发的 IO 方法白名单（server 侧据此拒绝任意 method 注入；纯谓词 isDuplicate*Error 不过网 → 不在内）。
+// The allowlist of IO methods that may be dispatched over the network (the server rejects any other method,
+// which is what stops arbitrary-method injection; the pure predicates isDuplicate*Error never go over the wire,
+// so they are not listed).
 export const REMOTE_METHODS = [
   'create', 'findByIssueRef',
   'get', 'getBySlug', 'findByPrdUrl', 'findByDocRef', 'resolve',
@@ -37,7 +49,8 @@ interface Envelope {
   error?: string;
 }
 
-// runner 客户端：发一个 RPC 调用，回 result（或抛——失败不静默 + 保留原 message）。
+// The runner client: send one RPC call and return its result (or throw - no silent failures, and the original
+// message is preserved).
 async function call(base: string, headers: Record<string, string>, method: string, args: unknown[]): Promise<unknown> {
   const res = await fetch(`${base}/store`, {
     method: 'POST',
@@ -45,21 +58,22 @@ async function call(base: string, headers: Record<string, string>, method: strin
     body: JSON.stringify({ method, args }),
     signal: AbortSignal.timeout(TIMEOUT_MS),
   });
-  if (!res.ok) throw new Error(`控制面 /store HTTP ${res.status}`);
+  if (!res.ok) throw new Error(`control plane /store returned HTTP ${res.status}`);
   let env: Envelope;
   try {
     env = JSON.parse(await res.text()) as Envelope;
   } catch {
-    throw new Error('控制面 /store 返回非法 JSON');
+    throw new Error('control plane /store returned invalid JSON');
   }
-  if (!env || typeof env !== 'object') throw new Error('控制面 /store 返回非法信封');
-  if (env.ok === false) throw new Error(env.error ?? '控制面 /store 未知错误');
-  if (env.ok !== true) throw new Error('控制面 /store 返回非法信封（缺 ok）');
+  if (!env || typeof env !== 'object') throw new Error('control plane /store returned an invalid envelope');
+  if (env.ok === false) throw new Error(env.error ?? 'control plane /store reported an unknown error');
+  if (env.ok !== true) throw new Error('control plane /store returned an invalid envelope (no ok field)');
   return env.result;
 }
 
-// runner 客户端工厂：baseUrl 末尾斜杠归一（避免 `//store`）。token 给定则带 `Authorization: Bearer <token>`
-// （控制面鉴权边界，shared secret）。
+// The runner client factory: trailing slashes on baseUrl are normalised away (so it never builds `//store`).
+// When a token is given it sends `Authorization: Bearer <token>` (the control plane's authentication boundary,
+// a shared secret).
 export function makeRemoteStore(baseUrl: string, token?: string): SessionStore {
   const base = baseUrl.replace(/\/+$/, '');
   const headers: Record<string, string> = { 'Content-Type': 'application/json' };
@@ -68,7 +82,7 @@ export function makeRemoteStore(baseUrl: string, token?: string): SessionStore {
   return {
     create: (s: NewSession) => rpc<Session>('create', s),
     findByIssueRef: (ref: string) => rpc<Session | null>('findByIssueRef', ref),
-    isDuplicateDocRefError, // 纯谓词：对 rejected error 跑 message 正则，client 本地（不过网）。
+    isDuplicateDocRefError, // a pure predicate: it runs a regex over a rejected error's message, locally on the client (never over the wire).
     isDuplicateIssueRefError,
     get: (id: string) => rpc<Session | null>('get', id),
     getBySlug: (slug: string) => rpc<Session | null>('getBySlug', slug),
@@ -89,28 +103,31 @@ export function makeRemoteStore(baseUrl: string, token?: string): SessionStore {
   };
 }
 
-// 控制面侧：把一个 store RPC 调用分发到本地实现 `impl`，出 wire 信封 JSON（始终 2xx——业务错误也进信封）。
-// 绝不信任外部输入：JSON 必须可解析；method 必须在白名单（否则任意方法/原型链注入）；args 必须是数组。
+// The control-plane side: dispatch one store RPC call to the local implementation `impl` and emit the wire
+// envelope as JSON (always 2xx - business errors travel inside the envelope too).
+// External input is never trusted: the JSON must parse; the method must be on the allowlist (otherwise this is
+// arbitrary-method and prototype-chain injection); and args must be an array.
 export async function handleStoreCall(impl: SessionStore, body: string): Promise<string> {
   let req: { method?: unknown; args?: unknown };
   try {
     req = (JSON.parse(body) ?? {}) as { method?: unknown; args?: unknown };
   } catch {
-    return JSON.stringify({ ok: false, error: '控制面 /store 收到非法 JSON' });
+    return JSON.stringify({ ok: false, error: 'control plane /store received invalid JSON' });
   }
   const { method, args } = req;
   if (typeof method !== 'string' || !(REMOTE_METHODS as readonly string[]).includes(method)) {
-    return JSON.stringify({ ok: false, error: `控制面 /store 非法 method: ${String(method)}` });
+    return JSON.stringify({ ok: false, error: `control plane /store received an invalid method: ${String(method)}` });
   }
   if (!Array.isArray(args)) {
-    return JSON.stringify({ ok: false, error: '控制面 /store args 非数组' });
+    return JSON.stringify({ ok: false, error: 'control plane /store received args that are not an array' });
   }
   try {
     const fn = impl[method as keyof SessionStore] as unknown as (...a: unknown[]) => unknown;
     const result = await fn(...args);
     return JSON.stringify({ ok: true, result });
   } catch (e) {
-    // 业务错误（非法转移 / UNIQUE 撞索引）原样回传 message → client 重建 Error 后 isDuplicate*Error 仍可分类。
+    // Business errors (an illegal transition, a UNIQUE index collision) return their message verbatim, so the
+    // client can rebuild the Error and isDuplicate*Error can still classify it.
     return JSON.stringify({ ok: false, error: e instanceof Error ? e.message : String(e) });
   }
 }

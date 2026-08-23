@@ -1,5 +1,6 @@
-// 单点无备份 = 数据丢了就没了。用 node:sqlite 原生在线 backup API（daemon 持有连接时安全，
-// 不必停服、不依赖 sqlite3 CLI）。daemon 周期循环里 throttle 到每小时一份，留最近 N 份。
+// A single copy with no backup means the data is gone the moment it is lost. This uses node:sqlite's native
+// online backup API (safe while the daemon holds the connection, so it needs no downtime and no sqlite3 CLI).
+// The daemon's periodic loop throttles it to one backup an hour and keeps the most recent N.
 import { backup, DatabaseSync } from 'node:sqlite';
 import { mkdirSync, readdirSync, statSync, unlinkSync } from 'node:fs';
 import { resolve } from 'node:path';
@@ -8,9 +9,9 @@ import { STATE_DIR, DB_PATH } from '../root.ts';
 import { log } from '../util/log.ts';
 import { hours } from '../util/time.ts';
 
-const BACKUP_DIR = resolve(STATE_DIR, 'backups'); // state/ 已 gitignore
+const BACKUP_DIR = resolve(STATE_DIR, 'backups'); // state/ is already gitignored
 const KEEP = 14;
-const MIN_INTERVAL_MS = hours(1); // 最多每小时一份
+const MIN_INTERVAL_MS = hours(1); // at most one backup per hour
 let lastBackupMs = 0;
 
 function stamp(ms: number): string {
@@ -27,12 +28,13 @@ function prune(): void {
       .sort((a, b) => b.t - a.t);
     for (const { f } of files.slice(KEEP)) unlinkSync(resolve(BACKUP_DIR, f));
   } catch {
-    /* prune 尽力而为 */
+    /* pruning is best-effort */
   }
 }
 
-// 备份完整性校验：用只读连接对备份文件跑 PRAGMA integrity_check，确认它真能打开、未损坏——
-// 否则备份是「只写不验」，真要恢复时才发现是坏的就晚了。导出供单测。
+// Backup integrity verification: open the backup file on a read-only connection and run PRAGMA
+// integrity_check, confirming it really opens and is not corrupt - otherwise the backup is written but never
+// verified, and discovering it is broken at restore time is far too late. Exported for unit tests.
 export function verifyBackup(dest: string): boolean {
   let conn: DatabaseSync | null = null;
   try {
@@ -40,7 +42,7 @@ export function verifyBackup(dest: string): boolean {
     const row = conn.prepare('PRAGMA integrity_check').get() as { integrity_check?: string } | undefined;
     return row?.integrity_check === 'ok';
   } catch {
-    return false; // 打不开/解析失败 = 坏备份
+    return false; // it will not open or fails to parse = a broken backup
   } finally {
     try {
       conn?.close();
@@ -50,28 +52,29 @@ export function verifyBackup(dest: string): boolean {
   }
 }
 
-// throttle 到每小时一次的在线备份。nowMs 由调用方传入（daemon 用 Date.now()）。
+// The hourly-throttled online backup. nowMs is supplied by the caller (the daemon passes Date.now()).
 export async function maybeBackup(nowMs: number): Promise<void> {
-  if (DB_PATH === ':memory:') return; // 测试内存库不备份
+  if (DB_PATH === ':memory:') return; // an in-memory test database is never backed up
   if (nowMs - lastBackupMs < MIN_INTERVAL_MS) return;
   lastBackupMs = nowMs;
   try {
     mkdirSync(BACKUP_DIR, { recursive: true });
     const dest = resolve(BACKUP_DIR, `service-${stamp(nowMs)}.db`);
     await backup(db(), dest);
-    // 立即验完整性：坏备份当即删掉，不让它顶掉一份好备份的留存位（也不静默留个不可恢复的文件）。
+    // Verify integrity immediately: a broken backup is deleted at once, so it neither takes a retention slot
+    // from a good one nor silently leaves an unrecoverable file behind.
     if (!verifyBackup(dest)) {
       try {
         unlinkSync(dest);
       } catch {
         /* ignore */
       }
-      log.warn(`⚠️ 备份完整性校验失败（integrity_check≠ok），已删除疑似损坏的 ${dest.split('/').pop()}；下个周期重试`);
+      log.warn(`⚠️ The backup failed its integrity check (integrity_check was not ok); the likely-corrupt ${dest.split('/').pop()} has been deleted and it will retry next cycle`);
       return;
     }
     prune();
-    log.info(`🗄  已备份 service.db → state/backups/${dest.split('/').pop()}（完整性 ok）`);
+    log.info(`🗄  Backed up service.db -> state/backups/${dest.split('/').pop()} (integrity ok)`);
   } catch (e) {
-    log.warn(`备份失败（不影响主流程）：${String(e).slice(0, 160)}`);
+    log.warn(`The backup failed (this does not affect the main flow): ${String(e).slice(0, 160)}`);
   }
 }

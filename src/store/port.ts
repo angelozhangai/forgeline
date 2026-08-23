@@ -1,25 +1,34 @@
-// 状态层薄缝——**SessionStore**：核心与具体存储后端（本地 sqlite / 未来控制面 HTTP）之间的唯一接口。
-// 照 MessagingPort 范式：接口（本文件）+ 单一选择点（store/index.ts `store`）+ adapter（localSqlite=sessions.ts）。
-// 核心永不直接 import store/sessions.ts；只 `import { store } from './store/index.ts'`，要换后端在选择点一处换。
+// The thin seam over the state layer - **SessionStore**: the single interface between the core and a concrete
+// storage backend (local sqlite today, a control-plane HTTP API later).
+// It follows the MessagingPort pattern: the interface (this file) + a single selection point (`store` in
+// store/index.ts) + an adapter (localSqlite = sessions.ts).
+// Core code never imports store/sessions.ts directly; it only does `import { store } from './store/index.ts'`,
+// so swapping the backend is a one-line change at the selection point.
 //
-// 当前唯一实现是本地 sqlite（store/sessions.ts 的 `localSqliteStore`）。控制/Runner 分离后会有 `remoteApi`
-// 实现（runner 经 HTTP 读写控制面状态）。
+// The only implementation today is local sqlite (`localSqliteStore` in store/sessions.ts). Once the control
+// plane and the runner are separated there will be a `remoteApi` implementation (a runner reading and writing
+// control-plane state over HTTP).
 //
-// **异步契约（Phase 2 深水）**：IO 方法（读写/查询/事件）返回 Promise——为 remoteApi（HTTP 天然异步）就绪。
-// localSqlite 底层 node:sqlite 同步，包成 async（无副作用、语义不变）；消费方一律 `await store.*`。
-// 例外：`isDuplicate*Error` 是**纯谓词**（分类一个 error 对象，无 IO）→ 保持同步（remoteApi 分类 HTTP 409 同样无 IO）。
-// 注：Phase 1 曾以**同步**接口先立接缝（行为零变更）；本阶段兑现 async 化（见 docs/architecture-control-plane-split.md Phase 2）。
+// **The async contract**: the IO methods (reads, writes, queries, events) return Promises - which is what makes
+// a remoteApi (inherently asynchronous over HTTP) possible later. The local sqlite implementation is
+// synchronous underneath (node:sqlite) and is simply wrapped as async (no side effects, identical semantics);
+// every consumer writes `await store.*`.
+// The exception: `isDuplicate*Error` are **pure predicates** (they classify an error object and do no IO), so
+// they stay synchronous - classifying an HTTP 409 in remoteApi does no IO either.
+// Note: the seam was first introduced with a **synchronous** interface (zero behaviour change); this is the
+// stage that made it async (see docs/architecture-control-plane-split.md).
 import type { Session } from '../types.ts';
 import type { State } from '../statemachine/states.ts';
 
-// create() 入参：建一条 session 的最小必填 + 可选初始字段（其余字段建后经 patch/transition 落）。
+// The create() argument: the minimum required to create a session plus the optional initial fields (everything
+// else is written afterwards through patch / transition).
 export interface NewSession {
   id: string;
   slug: string;
   title: string;
-  project_id?: string; // 目标项目 id（缺省 'demo'，迁移期/旧测试免传）
+  project_id?: string; // the target project id (defaults to 'demo', so migrations and older tests need not pass it)
   branch: string;
-  state?: State; // 起始态（缺省 INTAKE；standalone 裸 issue 直起 GATE_C_REQUESTED）
+  state?: State; // the starting state (defaults to INTAKE; a standalone bare issue starts directly at GATE_C_REQUESTED)
   prd_url?: string | null;
   prd_text_path?: string | null;
   chat_id?: string | null;
@@ -27,7 +36,7 @@ export interface NewSession {
   poster_id?: string | null;
   intake_msg_id?: string | null;
   source_kind?: string | null; // 'prd' | 'issue'
-  issue_ref?: string | null; // standalone 去重键
+  issue_ref?: string | null; // the standalone deduplication key
 }
 
 export interface EventRow {
@@ -36,40 +45,44 @@ export interface EventRow {
   detail: string | null;
 }
 
-// 会话状态读写面（get/create/patch/transition/event/聚合查询）。localSqlite 是现状实现，远端 HTTP 是将来。
+// The session-state read/write surface (get / create / patch / transition / events / aggregate queries).
+// localSqlite is the implementation today; a remote HTTP one comes later.
 export interface SessionStore {
-  // ── 建 / 去重 ──
+  // -- Create / deduplicate --
   create(s: NewSession): Promise<Session>;
-  findByIssueRef(ref: string): Promise<Session | null>; // standalone 实现任务去重键
-  isDuplicateDocRefError(e: unknown): boolean; // create 撞 doc_ref 唯一索引（并发竞态）→ 回退去重【纯谓词·同步】
-  isDuplicateIssueRefError(e: unknown): boolean; // create 撞 issue_ref 唯一索引（并发竞态）→ 回退去重【纯谓词·同步】
+  findByIssueRef(ref: string): Promise<Session | null>; // the deduplication key for standalone implementation tasks
+  isDuplicateDocRefError(e: unknown): boolean; // create hit the doc_ref unique index (a concurrent race) -> fall back to deduplication [a pure, synchronous predicate]
+  isDuplicateIssueRefError(e: unknown): boolean; // create hit the issue_ref unique index (a concurrent race) -> fall back to deduplication [a pure, synchronous predicate]
 
-  // ── 读 ──
+  // -- Reads --
   get(id: string): Promise<Session | null>;
   getBySlug(slug: string): Promise<Session | null>;
   findByPrdUrl(url: string): Promise<Session | null>;
-  findByDocRef(ref: string): Promise<Session | null>; // PRD 级去重真源（'<source>:<token>'，URL 各变体已归一）
-  resolve(idOrSlug: string): Promise<Session | null>; // CLI 用 id 或 slug 操作
+  findByDocRef(ref: string): Promise<Session | null>; // the source of truth for PRD-level deduplication ('<source>:<token>', with URL variants already normalised)
+  resolve(idOrSlug: string): Promise<Session | null>; // the CLI addresses sessions by id or slug
 
-  // ── 列表 / 聚合 ──
+  // -- Lists / aggregates --
   listByStates(states: State[]): Promise<Session[]>;
-  // 全量列表。projectId 给定 → 仅该项目（查询隔离）；缺省 → 全库（**红线**：daemon 全局动作绝不传 projectId）。
+  // The full list. With projectId given it returns only that project (query isolation); without it, the whole
+  // database (**a red line**: the daemon's global actions must never pass a projectId).
   listAll(projectId?: string): Promise<Session[]>;
-  distinctProjects(): Promise<string[]>; // 库内出现过的项目 id（面板/CLI 过滤下拉）
+  distinctProjects(): Promise<string[]>; // the project ids that appear in the database (for the panel and CLI filter dropdowns)
   countByState(): Promise<Record<string, number>>;
   countByStates(states: State[]): Promise<number>;
 
-  // ── 写 / 状态机 ──
+  // -- Writes / state machine --
   patch(id: string, fields: Partial<Session>): Promise<Session>;
-  transition(id: string, to: State, fields?: Partial<Session>): Promise<Session>; // 非法转移抛错（状态机守门）
+  transition(id: string, to: State, fields?: Partial<Session>): Promise<Session>; // an illegal transition throws (the state machine is the gate)
 
-  // ── 事件日志 ──
+  // -- Event log --
   appendEvent(id: string, kind: string, detail?: unknown): Promise<void>;
   events(id: string): Promise<EventRow[]>;
-  lastEventTs(id: string, kind: string): Promise<number | null>; // 某类事件最近一次时刻（去抖/对账），无则 null
+  lastEventTs(id: string, kind: string): Promise<number | null>; // when an event of this kind last happened (for debouncing and reconciliation); null if never
 
-  // ── 租约（多 runner 防重领）──
-  // 原子领取：状态 ∈ states ∩（无主/过期/自持）的到期 job，FIFO 取至多 limit 条、占租 ttlMs 后返回。
-  // limit = 本 runner 本轮并发容量（绝不一次占租整个 backlog——见 sessions.ts leaseClaim 说明）。别 runner 未过期的租约不在内。
+  // -- Leases (so several runners cannot claim the same job) --
+  // An atomic claim: jobs whose state is in `states` and that are unowned, expired, or already held by this
+  // runner, taken FIFO up to `limit`, leased for ttlMs, and returned.
+  // `limit` is this runner's concurrency capacity for this round - it must never lease the whole backlog at
+  // once (see the leaseClaim notes in sessions.ts). Leases another runner still holds are excluded.
   leaseClaim(states: State[], runnerId: string, ttlMs: number, limit: number): Promise<Session[]>;
 }
