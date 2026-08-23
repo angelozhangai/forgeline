@@ -1,4 +1,5 @@
-// 集成：operator 用真实 CLI 查看待拍板项时，新旧选项形态都必须是可读业务语言。
+// Integration: when an operator lists the open questions through the real CLI, both the old and the new
+// option shapes have to read as plain business language.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
@@ -9,19 +10,19 @@ process.env.FORGE_DB = resolve(tmpdir(), `forge-show-${process.pid}.db`);
 
 const sessions = await import('../src/store/sessions.ts');
 
-test('./forge show：闸B 待拍板项兼容旧 string[] 与新推荐/影响选项，不出现对象串', () => {
+test('./forge show: gate B\'s open questions handle both the old string[] and the newer recommended/impact options, and never print a stringified object', () => {
   const id = 'show-human-asks';
-  sessions.create({ id, slug: id, title: '退款去向', branch: 'main' });
+  sessions.create({ id, slug: id, title: 'where the refund goes', branch: 'main' });
   sessions.patch(id, {
     gate_b_round: 2,
     gate_b_human_asks: JSON.stringify([
-      { id: 'x', question: '退款退到哪里？', options: ['原路退回', '退到余额'], severity: 'high' },
+      { id: 'x', question: 'Where does the refund go?', options: ['back the original way', 'to the balance'], severity: 'high' },
       {
         id: 'dup',
-        question: '是否接受到账延迟？',
+        question: 'Is a delay in the money arriving acceptable?',
         options: [
-          { label: '接受延迟', recommended: true, impact: '对账最清晰' },
-          { label: '加急到账', recommended: false, impact: '实现成本更高' },
+          { label: 'accept the delay', recommended: true, impact: 'the cleanest to reconcile' },
+          { label: 'expedite it', recommended: false, impact: 'costs more to build' },
         ],
         severity: 'med',
       },
@@ -35,15 +36,15 @@ test('./forge show：闸B 待拍板项兼容旧 string[] 与新推荐/影响选�
   });
 
   assert.match(text, /Gate B's revision escalated, waiting on the maintainer/);
-  assert.match(text, /\u9000\u6b3e\u9000\u5230\u54ea\u91cc\uff1f \(options: \u539f\u8def\u9000\u56de \/ \u9000\u5230\u4f59\u989d\)/);
-  assert.match(text, /\u662f\u5426\u63a5\u53d7\u5230\u8d26\u5ef6\u8fdf\uff1f \(options: \u2605\u63a5\u53d7\u5ef6\u8fdf \/ \u52a0\u6025\u5230\u8d26\)/);
+  assert.match(text, /Where does the refund go\? \(options: back the original way \/ to the balance\)/);
+  assert.match(text, /Is a delay in the money arriving acceptable\? \(options: \u2605accept the delay \/ expedite it\)/);
   assert.doesNotMatch(text, /\[object Object\]/);
   assert.match(text, /forge gateb-answer show-human-asks/);
 });
 
-test('./forge show：operator 查看单条需求时，下游闸C/闸D成本必须进入可见总成本', () => {
+test('./forge show: when an operator looks at one requirement, the downstream gate C and gate D costs have to be part of the visible total', () => {
   const id = 'show-downstream-cost';
-  sessions.create({ id, slug: id, title: '下游实现成本可见', branch: 'main' });
+  sessions.create({ id, slug: id, title: 'downstream implementation cost is visible', branch: 'main' });
   sessions.patch(id, {
     gate_a_cost_usd: 0,
     gate_b_cost_usd: 0,
@@ -62,9 +63,9 @@ test('./forge show：operator 查看单条需求时，下游闸C/闸D成本必�
   assert.doesNotMatch(text, /cost:\s+\$0\.0000/);
 });
 
-test('./forge cost：管理看板从真实库读取并展示闸C/闸D分项，避免下游烧钱被藏起来', () => {
+test('./forge cost: the management view reads the real database and breaks out gate C and gate D, so downstream spending cannot stay hidden', () => {
   const id = 'cost-dashboard-downstream';
-  sessions.create({ id, slug: id, title: '下游成本看板', branch: 'main' });
+  sessions.create({ id, slug: id, title: 'the downstream cost view', branch: 'main' });
   sessions.patch(id, {
     gate_a_cost_usd: 1,
     gate_b_cost_usd: 2,

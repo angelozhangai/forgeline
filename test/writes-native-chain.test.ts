@@ -1,7 +1,10 @@
-// 回归：actions:native 项目走真实 GateB → doWrites → native adapter 的**生产链**（不只 adapter 单测）。
-// 守两条 review blocker：
-//  1) 单仓短码 C 必须经 repoMap 映射成真实仓名 → gh -R acme/your-monorepo（绝不 acme/C）。
-//  2) native 下 publish/approve 是 no-op，单仓 GO 能跑完（doWrites 返 ok，绝不 WRITE_FAILED）。
+// A regression test: an actions:native project through the **real production chain** gate B -> doWrites ->
+// the native adapter, rather than a unit test of the adapter alone.
+// It guards the two blockers a review found:
+//  1) the single-repo short code C has to be mapped through repoMap to the real repo name, so gh gets
+//     -R acme/your-monorepo and never acme/C;
+//  2) natively, publish and approve are no-ops, so a single-repo go still runs to completion -- doWrites
+//     returns ok and never parks as WRITE_FAILED.
 process.env.FORGE_DB = ':memory:';
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
@@ -18,13 +21,15 @@ mock.module('../src/util/proc.ts', {
   namedExports: {
     run: async (bin: string, args: string[]) => {
       calls.push({ bin, args });
-      // gh issue create → 回 issue URL（native 据此解 created issue）；gh issue edit 等忽略 stdout。
+      // gh issue create returns the issue URL, which is what native resolves the created issue from; gh issue
+      // edit and the rest ignore stdout.
       return { code: 0, stdout: 'https://github.com/acme/your-monorepo/issues/7\n', stderr: '', timedOut: false };
     },
   },
 });
 
-// actions:native 项目：repoMap C→your-monorepo，publish enabled（验 native publish no-op 不挡链）。
+// An actions:native project: repoMap maps C -> your-monorepo, with publish enabled, to prove that native's
+// no-op publish does not block the chain.
 const nativeProj = {
   id: 'comp',
   root: '/tmp/forge-native-x',
@@ -61,21 +66,22 @@ function draft(env: unknown): string {
   writeFileSync(p, JSON.stringify(env));
   return p;
 }
-// biome-ignore lint/suspicious/noExplicitAny: 测试夹具，构造部分 session
+// biome-ignore lint/suspicious/noExplicitAny: a test fixture building a partial session
 function sess(over: Record<string, unknown>): any {
   return { id: 'x', ref_num: 1, slug: 'feat-x', title: 'T', prd_url: null, size: 'M', created_issues: null, assignee: null, ...over };
 }
 
-test('actions:native 单仓短码 C → gh issue create -R acme/your-monorepo（已映射），publish/approve no-op，doWrites 返 ok', async () => {
+test('actions:native with the single-repo short code C: gh issue create gets -R acme/your-monorepo (mapped), publish and approve are no-ops, and doWrites returns ok', async () => {
   calls.length = 0;
   const r = await doWrites(sess({ gate_b_draft_path: draft({ issue_specs: [{ repo: 'C', title: 't' }], multi_repo: false }) }));
-  assert.equal(r.ok, true, 'native 单仓应跑完（非 WRITE_FAILED）');
-  // SF 回归：native publish 是 no-op → r.published=false。actions.go 的 DONE 文案据 r.published，
-  // 故 native 走「文档已落，请人工 review」分支，绝不谎称「技术方案已发布主仓…PR 已自动合」。
-  assert.equal(r.published, false, 'native 未真发布 → published:false');
+  assert.equal(r.ok, true, 'a native single-repo run should complete rather than parking as WRITE_FAILED');
+  // A regression guard: natively publish is a no-op, so r.published is false. actions.go's DONE copy reads
+  // r.published, so natively it takes the "the document is written, please review it by hand" branch and
+  // never claims the technical plan was published to the main repo and its PR merged automatically.
+  assert.equal(r.published, false, 'nothing was really published natively -> published:false');
   const create = calls.find((c) => c.bin === 'gh' && c.args[0] === 'issue' && c.args[1] === 'create');
-  assert.ok(create, '应有 gh issue create 调用');
-  assert.equal(create?.args[3], 'acme/your-monorepo', '短码 C 必须映射成真实仓名，不是 acme/C');
-  assert.ok(!calls.some((c) => c.args.includes('acme/C')), '绝不出现未映射的 acme/C');
+  assert.ok(create, 'there should be a gh issue create call');
+  assert.equal(create?.args[3], 'acme/your-monorepo', 'the short code C has to be mapped to the real repo name, not left as acme/C');
+  assert.ok(!calls.some((c) => c.args.includes('acme/C')), 'an unmapped acme/C must never appear');
   assert.deepEqual(r.issues, [{ repo: 'your-monorepo', number: 7, url: 'https://github.com/acme/your-monorepo/issues/7' }]);
 });

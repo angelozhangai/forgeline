@@ -1,11 +1,13 @@
-// 飞书 raw 层——**会话是群还是私聊**（src/feishu/history.ts chatIsGroup）。
+// The Feishu raw layer: **is this chat a group or a direct message** (chatIsGroup in src/feishu/history.ts).
 //
-// 为什么值得单独钉：这里有一个同名字段的陷阱，只靠注释守不住。飞书两个接口里都叫 chat_type，
-// 意思却不一样——
-//   · 事件 message.chat_type：'group' / 'p2p'        ← 会话形态（补拉要的是这个）
-//   · im/v1/chats 的 chat_type：'private' / 'public' ← 群的**可见性**
-// 拿后者当前者用，所有公开群都会被判成私聊、入口闸整个失效，而症状只是"群里随手分享的文档全被立项了"。
-// 所以判定必须走 chat_mode，且要有一条用例专门喂一个 chat_type='private' 的**群**。
+// Why this deserves its own file: there is a same-name field trap here that a comment alone cannot guard.
+// Two Feishu APIs both call a field chat_type, and they mean different things:
+//   * the message event's chat_type: 'group' / 'p2p'   <- the kind of chat, which is what backfill needs
+//   * im/v1/chats' chat_type:       'private' / 'public' <- a group's **visibility**
+// Use the second where the first is meant and every public group is judged a direct message, the intake gate
+// stops working entirely, and the only symptom is "every document casually shared in a channel got filed".
+// So the decision has to go through chat_mode, and one test has to feed it a **group** whose chat_type is
+// 'private'.
 process.env.FORGE_DB = ':memory:';
 import { test, mock, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -39,56 +41,56 @@ beforeEach(() => {
   boom = false;
 });
 
-test('chat_mode=p2p → 私聊（false）', async () => {
+test('chat_mode=p2p means a direct message (false)', async () => {
   reply = { code: 0, data: { chat_mode: 'p2p' } };
   assert.equal(await chatIsGroup('oc_dm'), false);
   assert.match(urls[0], /\/im\/v1\/chats\/oc_dm$/);
 });
 
-test('chat_mode=group → 群（true）', async () => {
+test('chat_mode=group means a group (true)', async () => {
   reply = { code: 0, data: { chat_mode: 'group' } };
   assert.equal(await chatIsGroup('oc_g'), true);
 });
 
-test('陌生的 chat_mode（如 topic 话题群）也算群——只有 p2p 才是私聊', async () => {
+test('an unfamiliar chat_mode, such as a topic thread, still counts as a group -- only p2p is a direct message', async () => {
   reply = { code: 0, data: { chat_mode: 'topic' } };
   assert.equal(await chatIsGroup('oc_t'), true);
 });
 
-test('⚠️ 响应里的 chat_type 是**可见性**，不是会话形态：private 的群仍然是群', async () => {
+test('the chat_type in the response is **visibility**, not the kind of chat: a private group is still a group', async () => {
   reply = { code: 0, chat_type: 'private', data: { chat_mode: 'group', chat_type: 'private' } };
-  assert.equal(await chatIsGroup('oc_private_group'), true, '看错字段的话这里会变成 false，入口闸就整个失效了');
+  assert.equal(await chatIsGroup('oc_private_group'), true, 'reading the wrong field turns this into false, and the intake gate stops working entirely');
 });
 
-test('接口报错（多半是没给 im:chat:readonly）→ null，让调用方自己决定兜底方向', async () => {
+test('the API returns an error, most often because im:chat:readonly was not granted -> null, leaving the caller to choose its own fallback', async () => {
   reply = { code: 99991672, msg: 'no permission' };
   assert.equal(await chatIsGroup('oc_x'), null);
 });
 
-test('信封里没有 chat_mode → null（认不出就是认不出，绝不猜一个）', async () => {
+test('the envelope carries no chat_mode -> null (unrecognised means unrecognised, never a guess)', async () => {
   reply = { code: 0, data: {} };
   assert.equal(await chatIsGroup('oc_x'), null);
 });
 
-test('网络异常 → null，不抛（补拉是 best-effort，不该拖垮周期循环）', async () => {
+test('a network error gives null rather than throwing (backfill is best effort and must not take the periodic loop down)', async () => {
   boom = true;
   assert.equal(await chatIsGroup('oc_x'), null);
 });
 
-test('取不到 token → null，且不打一发注定失败的请求', async () => {
+test('no token available -> null, without firing a request that is bound to fail', async () => {
   token = null;
   assert.equal(await chatIsGroup('oc_x'), null);
   assert.deepEqual(urls, []);
 });
 
-test('会话形态一辈子不变 → 记忆住，同一个会话只往返一次', async () => {
+test('the kind of a chat never changes, so it is remembered and one chat costs a single round trip', async () => {
   reply = { code: 0, data: { chat_mode: 'p2p' } };
   assert.equal(await chatIsGroup('oc_dm'), false);
   assert.equal(await chatIsGroup('oc_dm'), false);
   assert.equal(urls.length, 1);
 });
 
-test('失败**不**记忆：这次没权限，下次拿到权限就该问得出来', async () => {
+test('a failure is **not** remembered: no permission this time should still mean an answer once the permission is granted', async () => {
   reply = { code: 1, msg: 'nope' };
   assert.equal(await chatIsGroup('oc_x'), null);
   reply = { code: 0, data: { chat_mode: 'group' } };

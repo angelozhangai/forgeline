@@ -1,8 +1,11 @@
-// 集成：生产入口（需求文档 → session）。重点守住去重、群消息元数据、slug/branch 落库；
-// 不镜像 addPrd 内部步骤，只从"重复消息不能建两条需求"这个上线目标断言结果。
+// Integration: the production entry point, turning a requirement document into a session. What matters here
+// is deduplication, the channel-message metadata, and persisting the slug and branch. It does not mirror
+// addPrd's internal steps -- it asserts against the shipping goal that a repeated message must never create
+// two requirements.
 //
-// 只 stub 掉**读正文**那一步（它要联网/起子进程）；链接归一、源前缀、注册表解析全都跑真的——
-// PRD 级去重是红线，用假的归一去测等于没测。
+// Only **reading the body** is stubbed out (that needs the network and a subprocess). Normalising the link,
+// the source prefix and resolving through the registry all run for real: deduplicating at the PRD level is a
+// red line, and testing it against a fake normaliser would be testing nothing.
 process.env.FORGE_DB = ':memory:';
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
@@ -10,13 +13,17 @@ import { readFileSync } from 'node:fs';
 import type { DocRef } from '../src/docs/port.ts';
 
 let readCalls = 0;
-const prdText = '# 退款决策\n\nPM 希望补齐退款流。';
+// The requirement document is deliberately non-English, written as escapes. This repo's source is English;
+// the PRDs it ingests are not, and intake is exactly where that has to keep working.
+const prdText = '# \u9000\u6b3e\u51b3\u7b56\n\nPM \u5e0c\u671b\u8865\u9f50\u9000\u6b3e\u6d41\u3002';
 let prdOk = true;
 let slugProposal: string | null = 'refund-decision';
-// 读文档期间的抢跑者：非 null 时，read() 里先插一条同 doc_ref 的 session（模拟并发竞态）。
+// The racer that gets in first while the document is being read: when this is not null, read() inserts a
+// session with the same doc_ref before returning, simulating a concurrent race.
 let raceInsert: (() => Promise<void>) | null = null;
 
-// 保留真实的 claim/parseRef（token 归一 = 去重真源），只把 read 换成不联网的桩。
+// The real claim/parseRef are kept -- normalising the token is what deduplication actually rests on -- and
+// only read is replaced with a stub that does not touch the network.
 const realFeishu = await import('../src/docs/feishu.ts');
 mock.module('../src/docs/feishu.ts', {
   namedExports: {
@@ -30,13 +37,14 @@ mock.module('../src/docs/feishu.ts', {
           raceInsert = null;
           await r();
         }
-        return prdOk ? { ok: true, text: prdText } : { ok: false, text: '', error: '文档无权限' };
+        return prdOk ? { ok: true, text: prdText } : { ok: false, text: '', error: 'no permission for this document' };
       },
     },
   },
 });
 
-// 没给来源群时的兜底走 port.watchedChats()（Phase 4：不再写死 FEISHU_REVIEW_CHAT_ID）。
+// With no originating chat given, the fallback goes through port.watchedChats() -- Phase 4 stopped hard-coding
+// FEISHU_REVIEW_CHAT_ID.
 mock.module('../src/messaging/index.ts', { namedExports: { port: { id: 'fake', watchedChats: () => ['oc_default'] } } });
 
 mock.module('../src/llm/runClaude.ts', {
@@ -49,10 +57,11 @@ const sessions = await import('../src/store/sessions.ts');
 const { addPrd } = await import('../src/intake.ts');
 const { parseAnyRef } = await import('../src/docs/index.ts');
 
-// 测试里都从链接出发：跟生产一样先过注册表解析，绝不手搓 DocRef。
+// Every test starts from a link and resolves it through the registry exactly as production does -- a DocRef
+// is never hand-built here.
 const ref = (url: string): DocRef => parseAnyRef(url)!;
 
-test('addPrd：同一飞书 PRD 重复投递只复用已有 session，不重复读文档/建需求', async () => {
+test('addPrd: the same Feishu PRD delivered twice reuses the existing session, reading the document once and creating one requirement', async () => {
   readCalls = 0;
   prdOk = true;
   slugProposal = 'refund-decision';
@@ -66,7 +75,7 @@ test('addPrd：同一飞书 PRD 重复投递只复用已有 session，不重复�
   assert.equal(first.created, true);
   assert.equal(readCalls, 1);
   assert.equal(first.session?.slug, 'refund-decision');
-  assert.equal(first.session?.branch, 'main'); // 缺省锚 main（runtime.yaml default_branch: prod）
+  assert.equal(first.session?.branch, 'main'); // anchored to main by default (runtime.yaml has default_branch: prod)
   assert.equal(first.session?.chat_id, 'oc_group');
   assert.equal(first.session?.poster_id, 'ou_pm');
   assert.equal(first.session?.intake_msg_id, 'om_msg');
@@ -77,11 +86,11 @@ test('addPrd：同一飞书 PRD 重复投递只复用已有 session，不重复�
   assert.equal(second.duplicate, true);
   assert.equal(second.session?.id, first.session?.id);
   assert.equal(readCalls, 1);
-  assert.match(second.msg, /already been reviewed|will not start another review/); // 明确回复 PM「本次不再评审」
+  assert.match(second.msg, /already been reviewed|will not start another review/); // product is told plainly that this one will not be reviewed again
   assert.equal((await sessions.listAll()).filter((s) => s.prd_url === 'https://x.feishu.cn/docx/ABC').length, 1);
 });
 
-test('addPrd：同一 PRD 的 URL 变体（查询参数/末尾斜杠）按 doc_ref 去重，不建第二条', async () => {
+test('addPrd: URL variants of the same PRD (a query string, a trailing slash) deduplicate by doc_ref and create no second session', async () => {
   readCalls = 0;
   prdOk = true;
   slugProposal = 'points-expiry';
@@ -89,21 +98,22 @@ test('addPrd：同一 PRD 的 URL 变体（查询参数/末尾斜杠）按 doc_r
   assert.equal(a.created, true);
   assert.equal(readCalls, 1);
 
-  // 同一 doc 的不同链接形态（分享带 ?from=、末尾 /）→ 归一到同一 doc_ref → 命中去重，读文档前就挡（readCalls 不增）。
+  // Different link shapes for the same document (a share link's ?from=, a trailing /) normalise to the same
+  // doc_ref, so the duplicate is caught before the document is read and readCalls does not go up.
   for (const variant of ['https://x.feishu.cn/docx/XYZ?from=share_copy_link', 'https://x.feishu.cn/docx/XYZ/']) {
     const dup = await addPrd({ doc: ref(variant) });
     assert.equal(dup.created, false, variant);
     assert.equal(dup.duplicate, true, variant);
     assert.equal(dup.session?.id, a.session?.id, variant);
   }
-  assert.equal(readCalls, 1); // 变体都没触发二次读文档
-  assert.equal((await sessions.listAll()).filter((s) => s.doc_ref === 'feishu:XYZ').length, 1); // 只一条，且带源前缀
+  assert.equal(readCalls, 1); // no variant triggered a second read
+  assert.equal((await sessions.listAll()).filter((s) => s.doc_ref === 'feishu:XYZ').length, 1); // exactly one, and it carries the source prefix
 });
 
-test('addPrd：显式 slug/branch 优先，文档读取失败不创建 session', async () => {
+test('addPrd: an explicit slug and branch win, and a failed document read creates no session', async () => {
   readCalls = 0;
   prdOk = true;
-  const r = await addPrd({ doc: ref('https://x.feishu.cn/wiki/DEF'), slug: 'manual-refund', title: '中文标题', branch: 'prod' });
+  const r = await addPrd({ doc: ref('https://x.feishu.cn/wiki/DEF'), slug: 'manual-refund', title: '\u4e2d\u6587\u6807\u9898', branch: 'prod' });
   assert.equal(r.ok, true);
   assert.equal(r.created, true);
   assert.equal(r.session?.slug, 'manual-refund');
@@ -114,18 +124,18 @@ test('addPrd：显式 slug/branch 优先，文档读取失败不创建 session',
   const fail = await addPrd({ doc: ref('https://x.feishu.cn/docx/NOACCESS') });
   assert.equal(fail.ok, false);
   assert.match(fail.msg, /could not read the requirement document/);
-  assert.match(fail.msg, /文档无权限/); // 原始错因透传，不含糊
+  assert.match(fail.msg, /no permission for this document/); // the original cause is passed through, unhedged
   assert.equal((await sessions.listAll()).length, before);
 });
 
-test('addPrd：没给来源群 → 回落到当前 provider 的第一个观察群（不写死某一家的 env）', async () => {
+test('addPrd: with no originating chat it falls back to the current provider\'s first watched chat, rather than one vendor\'s hard-coded env var', async () => {
   prdOk = true;
   slugProposal = 'chat-fallback';
   const r = await addPrd({ doc: ref('https://x.feishu.cn/docx/CHATFALLBACK') });
   assert.equal(r.session?.chat_id, 'oc_default');
 });
 
-test('addPrd：未注册的文档源直接拒收（登记进去也读不出正文，只会变成一条永远停泊的需求）', async () => {
+test('addPrd: an unregistered document source is refused outright (registering it would produce a requirement whose body can never be read -- one parked forever)', async () => {
   prdOk = true;
   const before = (await sessions.listAll()).length;
   const r = await addPrd({ doc: { source: 'notion', token: 'p1' } });
@@ -134,30 +144,32 @@ test('addPrd：未注册的文档源直接拒收（登记进去也读不出正�
   assert.equal((await sessions.listAll()).length, before);
 });
 
-// ── 无文档服务也能立项（plaintext 兜底源，Phase 2 的 DoD）──────────────
-// 这里用的是**真的** plaintext 源的 read()：它从 ref.raw 取正文，不联网、不需要任何文档服务配置。
-// （认领那一步要不要开由 runtime.yaml 决定，见 docs-plaintext.test.ts；建档这一步与开关无关。）
-test('addPrd：一段 IM 文本就能建需求——正文经 raw 落到 prd.txt，prd_url 为空', async () => {
+// -- Filing a requirement with no document service at all (the plaintext fallback source, Phase 2's DoD) --
+// This uses the **real** plaintext source's read(): it takes the body from ref.raw, without the network and
+// without any document service configured.
+// (Whether the claim step is switched on at all is decided by runtime.yaml -- see docs-plaintext.test.ts.
+// Filing it, the step covered here, is independent of that switch.)
+test('addPrd: a passage of IM text is enough to file a requirement -- the body reaches prd.txt through raw, and prd_url is empty', async () => {
   slugProposal = 'refund-button-top';
-  const body = '把退款按钮挪到订单详情页顶部，并加一次二次确认弹窗';
+  const body = '\u628a\u9000\u6b3e\u6309\u94ae\u632a\u5230\u8ba2\u5355\u8be6\u60c5\u9875\u9876\u90e8\uff0c\u5e76\u52a0\u4e00\u6b21\u4e8c\u6b21\u786e\u8ba4\u5f39\u7a97'; // non-English again, as escapes -- see the note on prdText above
   const r = await addPrd({ doc: { source: 'plaintext', token: 'hash-abc', raw: body } });
   assert.equal(r.ok, true);
   assert.equal(r.created, true);
   assert.equal(r.session?.doc_ref, 'plaintext:hash-abc');
-  assert.equal(r.session?.prd_url, null, '一段话没有可点开的链接');
-  assert.equal(r.session?.title, body.slice(0, 80), '标题取正文首行');
-  assert.equal(readFileSync(r.session!.prd_text_path!, 'utf8'), body, '正文必须落盘——下游各闸只读 prd_text_path');
+  assert.equal(r.session?.prd_url, null, 'a passage of text has no link to open');
+  assert.equal(r.session?.title, body.slice(0, 80), 'the title comes from the first line of the body');
+  assert.equal(readFileSync(r.session!.prd_text_path!, 'utf8'), body, 'the body has to reach disk -- every downstream gate reads prd_text_path and nothing else');
 });
 
-test('addPrd：同一段文本再贴一遍 → 命中去重（内容即身份）', async () => {
-  const doc = { source: 'plaintext', token: 'hash-abc', raw: '把退款按钮挪到订单详情页顶部，并加一次二次确认弹窗' };
+test('addPrd: pasting the same passage again is caught as a duplicate (the content is the identity)', async () => {
+  const doc = { source: 'plaintext', token: 'hash-abc', raw: '\u628a\u9000\u6b3e\u6309\u94ae\u632a\u5230\u8ba2\u5355\u8be6\u60c5\u9875\u9876\u90e8\uff0c\u5e76\u52a0\u4e00\u6b21\u4e8c\u6b21\u786e\u8ba4\u5f39\u7a97' };
   const again = await addPrd({ doc });
   assert.equal(again.created, false);
   assert.equal(again.duplicate, true);
   assert.match(again.msg, /already been reviewed|will not start another review/);
 });
 
-test('addPrd：存量 plaintext ref 没有 raw → 如实报读不了，不建 session', async () => {
+test('addPrd: an existing plaintext ref with no raw says plainly that it cannot be read, and creates no session', async () => {
   const before = (await sessions.listAll()).length;
   const r = await addPrd({ doc: { source: 'plaintext', token: 'hash-stale' } });
   assert.equal(r.ok, false);
@@ -165,8 +177,8 @@ test('addPrd：存量 plaintext ref 没有 raw → 如实报读不了，不建 s
   assert.equal((await sessions.listAll()).length, before);
 });
 
-// ── 并发竞态最后一道闸：doc_ref 唯一索引 ──
-test('sessions：同一 doc_ref 第二次插入被唯一索引拒绝（isDuplicateDocRefError 命中）', async () => {
+// -- The last gate against a concurrent race: the unique index on doc_ref --
+test('sessions: a second insert with the same doc_ref is refused by the unique index, and isDuplicateDocRefError recognises it', async () => {
   await sessions.create({ id: 'race-a', slug: 'race-a', title: 'T', branch: 'dev', doc_ref: 'feishu:TOKDUP' });
   let err: unknown;
   try {
@@ -174,26 +186,27 @@ test('sessions：同一 doc_ref 第二次插入被唯一索引拒绝（isDuplica
   } catch (e) {
     err = e;
   }
-  assert.ok(err, '第二次插入应抛');
+  assert.ok(err, 'the second insert should throw');
   assert.equal(sessions.isDuplicateDocRefError(err), true);
   assert.equal((await sessions.listAll()).filter((s) => s.doc_ref === 'feishu:TOKDUP').length, 1);
 });
 
-test('addPrd：竞态——读文档期间被抢跑，建库撞唯一索引 → 回退复用，不建第二条', async () => {
+test('addPrd: the race -- somebody gets in first while the document is being read, the insert hits the unique index, and it falls back to reusing that session rather than creating a second', async () => {
   readCalls = 0;
   prdOk = true;
   slugProposal = 'race-win';
   const url = 'https://x.feishu.cn/docx/COLLIDE';
 
-  // 预检时库里还没有 → 放行进 readDoc；读的过程中另一条同 PRD 抢先插入 → create 撞唯一索引。
+  // At the pre-check the database has nothing, so it proceeds into readDoc; while that read is in flight
+  // another delivery of the same PRD inserts first, and create hits the unique index.
   raceInsert = async () => {
     await sessions.create({ id: 'race-winner', slug: 'race-winner', title: 'T', branch: 'dev', doc_ref: 'feishu:COLLIDE' });
   };
   const dup = await addPrd({ doc: ref(url) });
 
-  assert.equal(dup.created, false); // 没建第二条
+  assert.equal(dup.created, false); // no second session was created
   assert.equal(dup.duplicate, true);
-  assert.equal(dup.session?.id, 'race-winner'); // 复用抢先建好的那条
+  assert.equal(dup.session?.id, 'race-winner'); // it reuses the one that got in first
   assert.match(dup.msg, /already been reviewed|will not start another review/);
-  assert.equal((await sessions.listAll()).filter((s) => s.doc_ref === 'feishu:COLLIDE').length, 1); // 仍只一条
+  assert.equal((await sessions.listAll()).filter((s) => s.doc_ref === 'feishu:COLLIDE').length, 1); // still exactly one
 });

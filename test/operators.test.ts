@@ -1,21 +1,22 @@
-// resolveActor：入站 open_id → 短码，权限闸按真实点击人裁决。守两条安全/兼容铁律。
+// resolveActor: an inbound open_id becomes a short code, so the permission gate rules on whoever really
+// pressed the button. This guards two hard rules, one about safety and one about compatibility.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { resolveActor } from '../src/messaging/operators.ts';
 
-test('未配 operators（单人）→ 一律回退 M（沿用旧行为，零变化）', () => {
+test('with no operators configured (a single-person setup) everything falls back to M, exactly as before', () => {
   assert.equal(resolveActor('ou_anything', {}), 'M');
   assert.equal(resolveActor(undefined, {}), 'M');
 });
 
-test('配了 operators：已知 open_id → 映射短码', () => {
+test('with operators configured, a known open_id maps to its short code', () => {
   const ops = { ou_m: 'M', ou_jt: 'BD' };
   assert.equal(resolveActor('ou_m', ops), 'M');
   assert.equal(resolveActor('ou_jt', ops), 'BD');
 });
 
-test('配了 operators 但 open_id 陌生 → 返回原值（落不进允许名单 → 权限拒绝，绝不冒充 M）', () => {
+test('with operators configured but an unknown open_id, the value comes back unchanged -- it lands on no allow list, so the permission is refused and it never impersonates M', () => {
   const ops = { ou_m: 'M' };
   assert.equal(resolveActor('ou_stranger', ops), 'ou_stranger');
-  assert.equal(resolveActor(undefined, ops), 'unknown'); // 配了却无 open_id → 不提权
+  assert.equal(resolveActor(undefined, ops), 'unknown'); // configured but with no open_id -> no privilege is granted
 });

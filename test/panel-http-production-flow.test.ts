@@ -1,5 +1,8 @@
-// 集成：Web 面板从真实 HTTP POST 入口到 actions/state DB 的生产链路。
-// 禁止镜像测试：不复制状态/权限表，只验证用户从本机面板点击后的外部后果（HTTP 响应、状态推进、审计、写调用）。
+// Integration: the production chain from the web panel's real HTTP POST entry point through to actions and
+// the state database.
+// No mirror testing: it copies neither the state table nor the permission table, and checks only the outward
+// consequences of someone pressing a button on the local panel -- the HTTP response, the state moving, the
+// audit record, and whether a write was called.
 process.env.FORGE_DB = ':memory:';
 
 import { test, mock, before, after, beforeEach } from 'node:test';
@@ -138,7 +141,7 @@ async function postAction(body: unknown, origin = base): Promise<Response> {
   });
 }
 
-test('面板 HTTP 生产流：同源浏览器点击“出技术方案”推进真状态并留 panel/action 审计', async () => {
+test('the panel HTTP production flow: a same-origin browser pressing "produce the technical plan" moves the real state and leaves a panel/action audit record', async () => {
   await createAt('panel-gateb', 'CONFIRMED');
 
   const r = await postAction({ action: 'gateb', slug: 'panel-gateb' });
@@ -148,10 +151,10 @@ test('面板 HTTP 生产流：同源浏览器点击“出技术方案”推进�
   assert.equal(j.ok, true);
   assert.equal((await sessions.get('panel-gateb'))!.state, 'GATE_B_REQUESTED');
   assert.ok((await sessions.events('panel-gateb')).some((e) => e.kind === 'panel_action' && (e.detail ?? '').includes('"by":"M"')));
-  assert.equal(writeCalls, 0, '出技术方案只是授权进入闸B，不应直接触发写入');
+  assert.equal(writeCalls, 0, 'producing the technical plan only authorises entry to gate B and should trigger no write of its own');
 });
 
-test('面板 HTTP 安全闸：localhost 跨端口 Origin 被拒，真 action 不执行、无 panel 审计', async () => {
+test('the panel HTTP security gate: a localhost Origin on a different port is refused, the real action never runs, and no panel audit record is left', async () => {
   await createAt('panel-cross-port', 'CONFIRMED');
   const wrongPortOrigin = base.replace(/:\d+$/, ':9');
 
@@ -162,7 +165,7 @@ test('面板 HTTP 安全闸：localhost 跨端口 Origin 被拒，真 action 不
   assert.equal((await sessions.events('panel-cross-port')).some((e) => e.kind === 'panel_action'), false);
 });
 
-test('面板 HTTP 生产流：无权 web_actor 点 retry 不会重新点燃失败闸', async () => {
+test('the panel HTTP production flow: a web_actor without the permission pressing retry does not restart the failed gate', async () => {
   webActor = 'BD';
   await createAt('panel-retry-denied', 'GATE_C_FAILED', { worktree_path: '/tmp/forge-wt', error: 'ci red' });
 
@@ -177,7 +180,7 @@ test('面板 HTTP 生产流：无权 web_actor 点 retry 不会重新点燃失�
   assert.equal(writeCalls, 0);
 });
 
-test('面板 HTTP 生产流：WRITE_FAILED 的按钮走真 go 恢复 DONE，不走 retry 空转', async () => {
+test('the panel HTTP production flow: the button on a WRITE_FAILED session goes through the real go to reach DONE, rather than spinning on retry', async () => {
   await createAt('panel-write-retry', 'WRITE_FAILED', { assignee: 'M', error: 'label failed' });
 
   const r = await postAction({ action: 'go', slug: 'panel-write-retry' });

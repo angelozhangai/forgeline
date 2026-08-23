@@ -1,6 +1,12 @@
-// 单测（收 Codex 配置分化二审 Nit）：doWrites 的会话 DRI 短码→login 按**该 session 所属项目**的 reviewers 解析（SF1 回归）。
-// mock config(注册表 + 生产同款 resolveLogin) + workspace(捕获建 issue 的 assignee)；projects.ts **真**（configForSession 合并是被测逻辑）。
-// 固定：第二项目 acme 的 DRI 短码 EO → acme 自己的 login 'xw-login' → newReqSingle 收 'xw-login'；同短码在无覆盖的默认项目回退裸短码（证明确实按项目解析）。
+// Unit tests closing a nit from codex's second review of config divergence: doWrites resolves the session
+// DRI's short code to a login through **the reviewers of the project that session belongs to** (an SF1
+// regression).
+// config is mocked (the registry plus the same resolveLogin production uses) along with workspace (capturing
+// the assignee an issue is created with); projects.ts is **real**, because configForSession's merging is the
+// logic under test.
+// What is pinned: in the second project, acme, the DRI short code EO resolves to acme's own login
+// 'xw-login', which is what newReqSingle receives; the same short code in the default project, which
+// overrides nothing, falls back to the bare short code -- proving the resolution really is per project.
 process.env.FORGE_DB = ':memory:';
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
@@ -8,7 +14,8 @@ import { writeFileSync, mkdtempSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
 
-// 全局 reviewers 仅 M→ming；acme 覆盖 reviewers 加 EO→xw-login（map 合并保留全局）。生产同款短码→login 解析。
+// The global reviewers hold only M -> ming; acme's override adds EO -> xw-login, and the map merge keeps the
+// global entry. The short-code-to-login resolution is the same one production uses.
 function resolveLogin(cfg: { routing: { reviewers: Record<string, string> } }, code: string): string | null {
   const up = code.toUpperCase();
   for (const [k, v] of Object.entries(cfg.routing.reviewers)) if (k.toUpperCase() === up) return v;
@@ -17,7 +24,7 @@ function resolveLogin(cfg: { routing: { reviewers: Record<string, string> } }, c
 mock.module('../src/config.ts', {
   namedExports: {
     loadConfig: () => ({
-      runtime: { repos: ['demo'], scripts: {} }, // 无 tech_design_publish/delivery_doc_commit → 跳过发布/提交
+      runtime: { repos: ['demo'], scripts: {} }, // no tech_design_publish or delivery_doc_commit, so publishing and committing are skipped
       routing: { min_confidence: 0.7, sensitive_areas: [], reviewers: { M: 'ming' }, lead: 'M' },
       permissions: { gate_b_allowed: ['M'], go_approvers: ['M'] },
       assignment: { pool: ['M'], wip_limit: { default: 2 }, in_progress_statuses: [3] },
@@ -54,19 +61,19 @@ function singleDraft(): string {
   writeFileSync(p, JSON.stringify({ issue_specs: [{ repo: 'A', title: 't' }], multi_repo: false }));
   return p;
 }
-// biome-ignore lint/suspicious/noExplicitAny: 测试夹具，部分 session
+// biome-ignore lint/suspicious/noExplicitAny: a test fixture holding a partial session
 function sess(over: Record<string, unknown>): any {
   return { id: 'x', ref_num: 1, slug: 'feat-x', title: 'T', prd_url: null, size: 'M', created_issues: null, ...over };
 }
 
-test('会话 DRI 短码→login 按**项目级** reviewers 解析（acme EO→xw-login）→ newReqSingle 收项目 login', async () => {
+test('the session DRI\'s short code resolves to a login through the **project-level** reviewers (acme\'s EO -> xw-login), and newReqSingle receives that project login', async () => {
   lastSingleAssignee = undefined;
   await doWrites(sess({ project_id: 'acme', assignee: 'EO', gate_b_draft_path: singleDraft() }));
-  assert.equal(lastSingleAssignee, 'xw-login'); // 经 acme reviewers，绝非裸短码 'EO' / 全局解析失败
+  assert.equal(lastSingleAssignee, 'xw-login'); // resolved through acme's reviewers -- never the bare 'EO', and never a failed global lookup
 });
 
-test('同短码 EO 在默认项目 demo（无 reviewers 覆盖）→ 全局无该映射 → 回退裸短码（证明确实按项目分化）', async () => {
+test('the same short code EO in the default project demo, which overrides no reviewers, has no global mapping and falls back to the bare short code -- proving the resolution really does diverge per project', async () => {
   lastSingleAssignee = undefined;
   await doWrites(sess({ project_id: 'demo', assignee: 'EO', gate_b_draft_path: singleDraft() }));
-  assert.equal(lastSingleAssignee, 'EO'); // demo 无 EO 映射 → resolveLogin null → sessionDri 回退裸短码
+  assert.equal(lastSingleAssignee, 'EO'); // demo has no EO mapping, so resolveLogin returns null and sessionDri falls back to the bare short code
 });

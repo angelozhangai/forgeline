@@ -1,5 +1,6 @@
-// 集成：需求立项指派层的生产链路。
-// 只 mock LLM / GitHub / 主仓脚本边界；worker.step → autoAssignOnGo → actions.go → writes.doWrites 走真实代码。
+// Integration: the production chain of the assignment layer as a requirement is filed.
+// Only the LLM, GitHub and main-repo script boundaries are mocked; worker.step -> autoAssignOnGo ->
+// actions.go -> writes.doWrites all run for real.
 process.env.FORGE_DB = ':memory:';
 
 import { test, mock, beforeEach } from 'node:test';
@@ -20,14 +21,14 @@ function gateBDraftPath(slug: string): string {
   writeFileSync(
     p,
     JSON.stringify({
-      summary: '积分退款方案',
-      key_decisions: { owner: '自动指派 DRI' },
-      tech_design_markdown: '按既有积分流水扩展退款能力。',
+      summary: 'the plan for refunding points',
+      key_decisions: { owner: 'the DRI is assigned automatically' },
+      tech_design_markdown: 'extend the existing points ledger to support refunds.',
       acceptance: {
         contracts: [{ repo: 'A', surface: 'POST /admin/refund {order_id, idem_key} -> 200 {refund_id}' }],
-        scenarios: [{ id: 'AC1', repo: 'A', gherkin: 'Given 已支付订单\nWhen 以幂等键发起退款\nThen 返回 refund_id 且订单进入退款态' }],
+        scenarios: [{ id: 'AC1', repo: 'A', gherkin: 'Given a paid order\nWhen a refund is requested with an idempotency key\nThen a refund_id comes back and the order enters the refunding state' }],
       },
-      issue_specs: [{ repo: 'A', title: 'feat(pay): 支持积分退款', type: 'feat', prio: 'P1' }],
+      issue_specs: [{ repo: 'A', title: 'feat(pay): support refunding points', type: 'feat', prio: 'P1' }],
       confidence: 0.88,
     }),
   );
@@ -98,7 +99,7 @@ const worker = await import('../src/orchestrator/worker.ts');
 const actions = await import('../src/actions.ts');
 
 async function confirmedSession(slug: string): Promise<string> {
-  await sessions.create({ id: slug, slug, title: '积分退款方案', branch: 'dev' });
+  await sessions.create({ id: slug, slug, title: 'the plan for refunding points', branch: 'dev' });
   for (const st of ['GATE_A_RUNNING', 'AWAITING_PM_CONFIRM', 'CONFIRMED', 'GATE_B_REQUESTED']) {
     await sessions.transition(slug, st as never);
   }
@@ -112,7 +113,7 @@ beforeEach(() => {
   notifications.length = 0;
 });
 
-test('闸B通过→自动推荐DRI→一键GO：new-req 收到推荐人的 GitHub assignee', async () => {
+test('gate B passes -> a DRI is recommended automatically -> one press of go: new-req receives the recommended person as the GitHub assignee', async () => {
   loadRows = [
     { code: 'M', wip: 1, loadPoints: 8, ok: true },
     { code: 'EO', wip: 0, loadPoints: 1, ok: true },
@@ -136,7 +137,7 @@ test('闸B通过→自动推荐DRI→一键GO：new-req 收到推荐人的 GitHu
   assert.equal(lastSingleAssignee, 'erin-ops');
 });
 
-test('闸B通过但负载全探测失败：待GO可见，但不能创建无DRI需求', async () => {
+test('gate B passes but every load probe fails: it is visible as awaiting go, but a requirement with no DRI cannot be created', async () => {
   loadRows = [
     { code: 'M', wip: 0, loadPoints: 0, ok: false },
     { code: 'EO', wip: 0, loadPoints: 0, ok: false },

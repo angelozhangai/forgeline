@@ -1,6 +1,8 @@
-// 集成：多人卡片入口的真实操作者权限链路。
-// 只 mock IM/通知/写动作边界；listen → resolveActor → actions → session/events/回执走真实代码。
-// 禁止镜像测试：不检查内部分支，只验证真实点击人点卡后，生产上状态是否被推进、是否留审计、是否给对的回执。
+// Integration: the real operator-permission chain behind a card that several people can press.
+// Only the IM, notification and write-action boundaries are mocked; listen -> resolveActor -> actions ->
+// the session, the events and the receipt all run for real.
+// No mirror testing: it inspects no internal branch, only whether a real person pressing the card moves the
+// state in production, leaves an audit record, and gets the right receipt.
 process.env.FORGE_DB = ':memory:';
 
 import { test, mock } from 'node:test';
@@ -33,7 +35,8 @@ const cfg = {
     operators: { ou_m: 'M', ou_jt: 'BD' },
   },
   assignment: { pool: ['M', 'BD'], wip_limit: { default: 2 }, in_progress_statuses: [3] },
-  // 配置分化：acme 项目覆盖 gate_b_allowed=[EO] + 自己的 operators(ou_xw→EO)。operators 是身份映射 → map 合并保留全局 ou_m/ou_jt。
+  // Config divergence: the acme project overrides gate_b_allowed to [EO] and adds its own operators
+  // (ou_xw -> EO). operators is an identity map, so merging keeps the global ou_m and ou_jt.
   projects: { default_project: 'demo', projects: { acme: { root: '/tmp/acme', permissions: { gate_b_allowed: ['EO'], operators: { ou_xw: 'EO' } } } } },
   env: {},
 };
@@ -111,7 +114,7 @@ mock.module('../src/health/alert.ts', { namedExports: { sendHealthAlert: async (
 mock.module('../src/writes.ts', {
   namedExports: {
     doWrites: async () => {
-      throw new Error('本测试不应走真实写入');
+      throw new Error('this test should never reach a real write');
     },
   },
 });
@@ -136,7 +139,7 @@ function reset(): void {
 
 async function sessionAt(state: 'GATE_A_STALLED' | 'CONFIRMED' | 'AWAITING_GO'): Promise<string> {
   const id = `card-operator-${state.toLowerCase()}-${++seq}`;
-  await sessions.create({ id, slug: id, title: '多人权限验证', branch: 'main' });
+  await sessions.create({ id, slug: id, title: 'multi-person permission check', branch: 'main' });
   const path: Record<typeof state, string[]> = {
     GATE_A_STALLED: ['GATE_A_RUNNING', 'GATE_A_STALLED'],
     CONFIRMED: ['GATE_A_RUNNING', 'AWAITING_PM_CONFIRM', 'CONFIRMED'],
@@ -159,7 +162,7 @@ async function click(action: string, slug: string, operatorId: string, formValue
   await __handleCardActionForTest({ raw: { event: { operator: { open_id: operatorId } } } });
 }
 
-test('陌生人点击强制通过：不推进 CONFIRMED，留审计，并给失败回执', async () => {
+test('a stranger pressing force-through: it does not reach CONFIRMED, an audit record is left, and they get a refusal receipt', async () => {
   reset();
   const slug = await sessionAt('GATE_A_STALLED');
 
@@ -167,11 +170,11 @@ test('陌生人点击强制通过：不推进 CONFIRMED，留审计，并给失�
 
   assert.equal((await sessions.get(slug))!.state, 'GATE_A_STALLED');
   assert.ok((await sessions.events(slug)).some((e) => e.kind === 'permission_denied' && (e.detail ?? '').includes('confirm')));
-  assert.equal(notifyCalls.length, 0, '越权强制通过不应发 needs_gateb，让团队误以为已确认');
+  assert.equal(notifyCalls.length, 0, 'an unauthorised force-through must not send needs_gateb and let the team believe it was confirmed');
   assert.match(dmTexts.at(-1)?.lines.join('\n') ?? '', /may not confirm/);
 });
 
-test('授权 M 点击强制通过：真实卡片链路推进 CONFIRMED 并通知出闸B', async () => {
+test('the authorised maintainer pressing force-through: the real card chain reaches CONFIRMED and notifies that gate B is due', async () => {
   reset();
   const slug = await sessionAt('GATE_A_STALLED');
 
@@ -182,17 +185,17 @@ test('授权 M 点击强制通过：真实卡片链路推进 CONFIRMED 并通知
   assert.equal(s.confirmed_by, 'M');
   assert.ok((await sessions.events(slug)).some((e) => e.kind === 'pm_confirm'));
   assert.deepEqual(notifyCalls.map((n) => n.kind), ['needs_gateb']);
-  assert.equal(dmTexts.length, 0, '成功强制通过不应额外发失败回执');
+  assert.equal(dmTexts.length, 0, 'a successful force-through should not also send a refusal receipt');
 });
 
-test('BD 可出技术方案但不能 GO：同一真实点击人在不同产品动作上得到不同权限后果', async () => {
+test('BD may produce the technical plan but may not give the go-ahead: the same real person gets different permission outcomes on different product actions', async () => {
   reset();
   const gatebSlug = await sessionAt('CONFIRMED');
   await click('gateb', gatebSlug, 'ou_jt');
 
   assert.equal((await sessions.get(gatebSlug))!.state, 'GATE_B_REQUESTED');
   assert.equal((await sessions.get(gatebSlug))!.gate_b_requested_by, 'BD');
-  assert.equal(tickCalls, 1, '授权触发闸B后应立即推进 worker');
+  assert.equal(tickCalls, 1, 'an authorised gate B trigger should push the worker forward immediately');
 
   reset();
   const goSlug = await sessionAt('AWAITING_GO');
@@ -203,28 +206,28 @@ test('BD 可出技术方案但不能 GO：同一真实点击人在不同产品�
   assert.match(dmTexts.at(-1)?.lines.join('\n') ?? '', /may not GO/);
 });
 
-test('项目级 operators（配置分化·Blocker）：acme 卡 ou_xw→EO 过 acme 自己的 gate_b_allowed；map 合并保留的全局 ou_m→M 不在 acme 名单被拒', async () => {
+test('project-level operators (config divergence, the blocker): on an acme card ou_xw resolves to EO and passes acme\'s own gate_b_allowed, while the global ou_m -> M that merging preserved is refused because M is not on acme\'s list', async () => {
   reset();
-  // acme 项目的 CONFIRMED session
+  // A CONFIRMED session belonging to the acme project.
   const slug = `card-operator-acme-${++seq}`;
-  await sessions.create({ id: slug, slug, title: '项目级 operators', branch: 'main', project_id: 'acme' } as never);
+  await sessions.create({ id: slug, slug, title: 'project-level operators', branch: 'main', project_id: 'acme' } as never);
   for (const next of ['GATE_A_RUNNING', 'AWAITING_PM_CONFIRM', 'CONFIRMED']) await sessions.transition(slug, next as never);
 
-  await click('gateb', slug, 'ou_xw'); // acme operators 解析 ou_xw→EO；acme gate_b_allowed=[EO] → 过（绝非回退全局/单人 M）
+  await click('gateb', slug, 'ou_xw'); // acme's operators resolve ou_xw -> EO, and acme's gate_b_allowed=[EO] lets it through -- never by falling back to the global list or to M alone
   assert.equal((await sessions.get(slug))!.state, 'GATE_B_REQUESTED');
   assert.equal((await sessions.get(slug))!.gate_b_requested_by, 'EO');
 
   reset();
   const slug2 = `card-operator-acme-${++seq}`;
-  await sessions.create({ id: slug2, slug: slug2, title: '继承全局 operator', branch: 'main', project_id: 'acme' } as never);
+  await sessions.create({ id: slug2, slug: slug2, title: 'an inherited global operator', branch: 'main', project_id: 'acme' } as never);
   for (const next of ['GATE_A_RUNNING', 'AWAITING_PM_CONFIRM', 'CONFIRMED']) await sessions.transition(slug2, next as never);
 
-  await click('gateb', slug2, 'ou_m'); // map 合并保留全局 ou_m→M（身份不丢）；但 M 不在 acme gate_b_allowed=[EO] → 拒
+  await click('gateb', slug2, 'ou_m'); // merging kept the global ou_m -> M, so the identity is not lost, but M is not in acme's gate_b_allowed=[EO] -> refused
   assert.equal((await sessions.get(slug2))!.state, 'CONFIRMED');
   assert.ok((await sessions.events(slug2)).some((e) => e.kind === 'permission_denied' && (e.detail ?? '').includes('gateb')));
 });
 
-test('陌生人点击打回：不进入 GO_DENIED；授权 M 点击才真正打回', async () => {
+test('a stranger pressing deny does not reach GO_DENIED; only the authorised maintainer really sends it back', async () => {
   reset();
   const strangerSlug = await sessionAt('AWAITING_GO');
   await click('deny', strangerSlug, 'ou_stranger');

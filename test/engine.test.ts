@@ -2,8 +2,9 @@ import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { canTransition } from '../src/statemachine/engine.ts';
 
-// 闸生命周期 FSM 是核心业务：合法跃迁放行、非法跃迁拒绝、停泊态可重跑。
-test('正常推进链路合法', () => {
+// The gate-lifecycle FSM is core business: legal transitions pass, illegal ones are refused, and parked
+// states can be re-run.
+test('the ordinary forward path is legal', () => {
   for (const [a, b] of [
     ['INTAKE', 'GATE_A_RUNNING'],
     ['GATE_A_RUNNING', 'AWAITING_PM_CONFIRM'],
@@ -15,84 +16,86 @@ test('正常推进链路合法', () => {
     ['AWAITING_GO', 'WRITING'],
     ['WRITING', 'DONE'],
   ] as const) {
-    assert.ok(canTransition(a, b), `${a}→${b} 应合法`);
+    assert.ok(canTransition(a, b), `${a}->${b} should be legal`);
   }
 });
 
-test('闸A PM 多轮循环跃迁合法', () => {
+test('gate A: the multi-round product loop is legal', () => {
   for (const [a, b] of [
-    ['AWAITING_PM_CONFIRM', 'GATE_A_REVISION_REQUESTED'], // PM 答复→复评
-    ['GATE_A_REVISION_REQUESTED', 'GATE_A_RUNNING'], // worker 起复评
-    ['GATE_A_RUNNING', 'AWAITING_PM_CONFIRM'], // 还有问题→下一轮
-    ['GATE_A_RUNNING', 'CONFIRMED'], // 无剩余→评审完毕
-    ['GATE_A_RUNNING', 'GATE_A_STALLED'], // 到上限→停泊
-    ['GATE_A_STALLED', 'CONFIRMED'], // M 强制结束
-    ['GATE_A_STALLED', 'GATE_A_REVISION_REQUESTED'], // M 补输入再跑一轮
-    ['GATE_A_REVISION_REQUESTED', 'GATE_A_FAILED'], // 复评失败停泊
-    ['GATE_A_FAILED', 'GATE_A_REVISION_REQUESTED'], // retry 回复评点不丢轮次
+    ['AWAITING_PM_CONFIRM', 'GATE_A_REVISION_REQUESTED'], // product answered -> re-review
+    ['GATE_A_REVISION_REQUESTED', 'GATE_A_RUNNING'], // the worker starts the re-review
+    ['GATE_A_RUNNING', 'AWAITING_PM_CONFIRM'], // still open questions -> next round
+    ['GATE_A_RUNNING', 'CONFIRMED'], // nothing left open -> review finished
+    ['GATE_A_RUNNING', 'GATE_A_STALLED'], // round limit reached -> park
+    ['GATE_A_STALLED', 'CONFIRMED'], // the maintainer forces it closed
+    ['GATE_A_STALLED', 'GATE_A_REVISION_REQUESTED'], // the maintainer adds input and runs another round
+    ['GATE_A_REVISION_REQUESTED', 'GATE_A_FAILED'], // the re-review itself failed -> park
+    ['GATE_A_FAILED', 'GATE_A_REVISION_REQUESTED'], // retry returns to the re-review point without losing the round
   ] as const) {
-    assert.ok(canTransition(a, b), `${a}→${b} 应合法`);
+    assert.ok(canTransition(a, b), `${a}->${b} should be legal`);
   }
 });
 
-test('闸A codex 对抗复审跃迁合法（claude 复评无开放问题→对抗→确认）', () => {
+test('gate A: the codex adversarial pass is legal (claude re-review has no open questions -> adversarial -> confirmed)', () => {
   for (const [a, b] of [
-    ['GATE_A_RUNNING', 'GATE_A_ADVERSARIAL'], // 无剩余开放问题→进对抗（不再直接 CONFIRMED）
-    ['GATE_A_ADVERSARIAL', 'GATE_A_ADVERSARIAL'], // 每-tick 上限→自转移续跑
-    ['GATE_A_ADVERSARIAL', 'CONFIRMED'], // codex LGTM→确认进闸B
-    ['GATE_A_ADVERSARIAL', 'GATE_A_STALLED'], // 到上限→停泊交 M 裁决
-    ['GATE_A_ADVERSARIAL', 'GATE_A_FAILED'], // 调用失败→停泊
-    ['GATE_A_FAILED', 'GATE_A_ADVERSARIAL'], // 孤儿复位→原地续跑对抗
-    ['GATE_A_ADVERSARIAL', 'AWAITING_PM_CONFIRM'], // 对抗补出 PM 未答漏问→弹回 PM 答复（不自动确认）
+    ['GATE_A_RUNNING', 'GATE_A_ADVERSARIAL'], // no open questions left -> adversarial (no longer straight to CONFIRMED)
+    ['GATE_A_ADVERSARIAL', 'GATE_A_ADVERSARIAL'], // per-tick limit -> self-transition to carry on
+    ['GATE_A_ADVERSARIAL', 'CONFIRMED'], // codex says LGTM -> confirmed, on to gate B
+    ['GATE_A_ADVERSARIAL', 'GATE_A_STALLED'], // limit reached -> park for the maintainer to rule on
+    ['GATE_A_ADVERSARIAL', 'GATE_A_FAILED'], // the call failed -> park
+    ['GATE_A_FAILED', 'GATE_A_ADVERSARIAL'], // orphan recovery -> resume the adversarial pass in place
+    ['GATE_A_ADVERSARIAL', 'AWAITING_PM_CONFIRM'], // the pass found a question product never answered -> back to product (never auto-confirm)
   ] as const) {
-    assert.ok(canTransition(a, b), `${a}→${b} 应合法`);
+    assert.ok(canTransition(a, b), `${a}->${b} should be legal`);
   }
-  // 闸A 对抗不升级人在环（PRD 拿不准走 PM loop），故无 →AWAITING_GATE_B_INPUT 边（漏问走 →AWAITING_PM_CONFIRM）。
+  // Gate A's adversarial pass does not escalate to a human in the loop (an unclear PRD goes round the product
+  // loop), so there is no ->AWAITING_GATE_B_INPUT edge: a missed question goes ->AWAITING_PM_CONFIRM.
   assert.equal(canTransition('GATE_A_ADVERSARIAL', 'AWAITING_GATE_B_INPUT'), false);
-  assert.equal(canTransition('GATE_A_ADVERSARIAL', 'GATE_B_REQUESTED'), false); // 必须经 CONFIRMED
+  assert.equal(canTransition('GATE_A_ADVERSARIAL', 'GATE_B_REQUESTED'), false); // must go through CONFIRMED
 });
 
-test('闸B codex审⇄claude改 多轮人在环循环跃迁合法', () => {
+test('gate B: the multi-round codex-reviews/claude-revises human-in-the-loop cycle is legal', () => {
   for (const [a, b] of [
-    ['ADVERSARIAL_LOOP', 'ADVERSARIAL_LOOP'], // 每-tick 上限→自转移续跑
-    ['ADVERSARIAL_LOOP', 'AWAITING_GO'], // codex clean→放行
-    ['ADVERSARIAL_LOOP', 'AWAITING_GATE_B_INPUT'], // claude 升级→等 M 答复
-    ['ADVERSARIAL_LOOP', 'GATE_B_STALLED'], // 到上限→停泊裁决
-    ['AWAITING_GATE_B_INPUT', 'GATE_B_REVISION_REQUESTED'], // M 答复→续修
-    ['GATE_B_REVISION_REQUESTED', 'ADVERSARIAL_LOOP'], // resume 续修→回循环
-    ['GATE_B_REVISION_REQUESTED', 'GATE_B_FAILED'], // 续修失败停泊
-    ['GATE_B_STALLED', 'AWAITING_GO'], // M 强制立项
-    ['GATE_B_STALLED', 'GATE_B_REVISION_REQUESTED'], // M 再修一轮
+    ['ADVERSARIAL_LOOP', 'ADVERSARIAL_LOOP'], // per-tick limit -> self-transition to carry on
+    ['ADVERSARIAL_LOOP', 'AWAITING_GO'], // codex is clean -> release
+    ['ADVERSARIAL_LOOP', 'AWAITING_GATE_B_INPUT'], // claude escalates -> wait for the maintainer
+    ['ADVERSARIAL_LOOP', 'GATE_B_STALLED'], // limit reached -> park for a ruling
+    ['AWAITING_GATE_B_INPUT', 'GATE_B_REVISION_REQUESTED'], // the maintainer answered -> keep revising
+    ['GATE_B_REVISION_REQUESTED', 'ADVERSARIAL_LOOP'], // resume revising -> back into the loop
+    ['GATE_B_REVISION_REQUESTED', 'GATE_B_FAILED'], // the revision itself failed -> park
+    ['GATE_B_STALLED', 'AWAITING_GO'], // the maintainer forces the project through
+    ['GATE_B_STALLED', 'GATE_B_REVISION_REQUESTED'], // the maintainer asks for one more round
   ] as const) {
-    assert.ok(canTransition(a, b), `${a}→${b} 应合法`);
+    assert.ok(canTransition(a, b), `${a}->${b} should be legal`);
   }
 });
 
-test('闸B 孤儿复位两跳合法：FAILED→原地复位点', () => {
-  assert.ok(canTransition('GATE_B_FAILED', 'ADVERSARIAL_LOOP')); // 有初稿→原地续跑
-  assert.ok(canTransition('GATE_B_FAILED', 'GATE_B_REVISION_REQUESTED')); // 有 pending_input→续修点
+test('gate B: orphan recovery has two legal hops -- FAILED back to where it stopped', () => {
+  assert.ok(canTransition('GATE_B_FAILED', 'ADVERSARIAL_LOOP')); // a draft exists -> carry on in place
+  assert.ok(canTransition('GATE_B_FAILED', 'GATE_B_REVISION_REQUESTED')); // pending_input exists -> the revision point
 });
 
-test('闸B 人在环停顿点不能跳步', () => {
-  assert.equal(canTransition('AWAITING_GATE_B_INPUT', 'AWAITING_GO'), false); // 必须经续修
+test('gate B: the human-in-the-loop pause points cannot be skipped', () => {
+  assert.equal(canTransition('AWAITING_GATE_B_INPUT', 'AWAITING_GO'), false); // must go through the revision
   assert.equal(canTransition('ADVERSARIAL_LOOP', 'DONE'), false);
   assert.equal(canTransition('GATE_B_STALLED', 'DONE'), false);
 });
 
-test('PM 无权直接定案：AWAITING_PM_CONFIRM→CONFIRMED 仅 M 走（FSM 允许，权限在 actions 层）', () => {
-  // FSM 层 AWAITING_PM_CONFIRM→CONFIRMED 合法（M 强制结束用）；但 PM 群卡走的是 →GATE_A_REVISION_REQUESTED。
+test('product cannot settle it alone: AWAITING_PM_CONFIRM->CONFIRMED is the maintainer only (the FSM allows it, the permission lives in actions)', () => {
+  // At the FSM layer AWAITING_PM_CONFIRM->CONFIRMED is legal (that is how the maintainer forces it closed),
+  // but the product card goes ->GATE_A_REVISION_REQUESTED.
   assert.ok(canTransition('AWAITING_PM_CONFIRM', 'CONFIRMED'));
-  assert.equal(canTransition('GATE_A_STALLED', 'GATE_B_REQUESTED'), false); // 停泊态不能跳过确认
+  assert.equal(canTransition('GATE_A_STALLED', 'GATE_B_REQUESTED'), false); // a parked state cannot skip the confirmation
 });
 
-test('跳步/乱跳非法', () => {
+test('skipping ahead, or jumping about, is illegal', () => {
   assert.equal(canTransition('INTAKE', 'DONE'), false);
   assert.equal(canTransition('INTAKE', 'AWAITING_GO'), false);
   assert.equal(canTransition('AWAITING_PM_CONFIRM', 'WRITING'), false);
-  assert.equal(canTransition('DONE', 'WRITING'), false); // 终态不可出
+  assert.equal(canTransition('DONE', 'WRITING'), false); // a terminal state has no way out
 });
 
-test('孤儿自愈用的合法两跳：RUNNING→FAILED→重跑点', () => {
+test('the legal two-hop used by orphan self-healing: RUNNING->FAILED->the re-run point', () => {
   assert.ok(canTransition('GATE_A_RUNNING', 'GATE_A_FAILED'));
   assert.ok(canTransition('GATE_A_FAILED', 'INTAKE'));
   assert.ok(canTransition('GATE_B_RUNNING', 'GATE_B_FAILED'));
@@ -100,72 +103,74 @@ test('孤儿自愈用的合法两跳：RUNNING→FAILED→重跑点', () => {
   assert.ok(canTransition('GATE_B_FAILED', 'GATE_B_REQUESTED'));
 });
 
-test('停泊态重跑边 + GO 拒绝回路', () => {
+test('the re-run edges out of parked states, plus the go-denied loop', () => {
   assert.ok(canTransition('GO_DENIED', 'AWAITING_GO'));
   assert.ok(canTransition('WRITE_FAILED', 'WRITING'));
   assert.ok(canTransition('AWAITING_GO', 'GO_DENIED'));
 });
 
-test('自转移放行（幂等 patch / 对抗循环自转）', () => {
+test('self-transitions are allowed (idempotent patches / the adversarial loop turning in place)', () => {
   assert.ok(canTransition('ADVERSARIAL_LOOP', 'ADVERSARIAL_LOOP'));
   assert.ok(canTransition('INTAKE', 'INTAKE'));
 });
 
-// ── 下游闸C：实现⇄CI 循环 ──
-test('闸C 实现⇄CI 循环跃迁合法', () => {
+// -- Downstream gate C: the implement/CI loop --
+test('gate C: the implement/CI loop is legal', () => {
   for (const [a, b] of [
-    ['DONE', 'GATE_C_REQUESTED'], // 链式入口（standalone 裸 issue 直接置 GATE_C_REQUESTED）
+    ['DONE', 'GATE_C_REQUESTED'], // the chained entry (a standalone bare issue starts straight at GATE_C_REQUESTED)
     ['GATE_C_REQUESTED', 'GATE_C_RUNNING'],
     ['GATE_C_RUNNING', 'GATE_C_LOOP'],
-    ['GATE_C_LOOP', 'GATE_C_LOOP'], // 每-tick 上限→自转续跑
-    ['GATE_C_LOOP', 'AWAITING_GATE_D'], // CI 绿→等开 PR
-    ['GATE_C_LOOP', 'AWAITING_GATE_C_INPUT'], // claude 升级 needs_human
-    ['GATE_C_LOOP', 'GATE_C_STALLED'], // 到上限仍未绿→裁决
-    ['AWAITING_GATE_C_INPUT', 'GATE_C_REVISION_REQUESTED'], // M 答复→续做
-    ['GATE_C_STALLED', 'GATE_C_REVISION_REQUESTED'], // M 给输入再修一轮（唯一出路）
+    ['GATE_C_LOOP', 'GATE_C_LOOP'], // per-tick limit -> self-transition to carry on
+    ['GATE_C_LOOP', 'AWAITING_GATE_D'], // CI green -> wait to open the PR
+    ['GATE_C_LOOP', 'AWAITING_GATE_C_INPUT'], // claude escalated needs_human
+    ['GATE_C_LOOP', 'GATE_C_STALLED'], // limit reached and still not green -> a ruling
+    ['AWAITING_GATE_C_INPUT', 'GATE_C_REVISION_REQUESTED'], // the maintainer answered -> carry on
+    ['GATE_C_STALLED', 'GATE_C_REVISION_REQUESTED'], // the maintainer supplies input for one more round (the only way out)
     ['GATE_C_REVISION_REQUESTED', 'GATE_C_LOOP'],
-    ['GATE_C_FAILED', 'GATE_C_LOOP'], // 孤儿/退避复位（有 worktree 续跑）
-    ['GATE_C_FAILED', 'GATE_C_REQUESTED'], // 干净重 setup
+    ['GATE_C_FAILED', 'GATE_C_LOOP'], // orphan / backoff recovery (a worktree exists, carry on)
+    ['GATE_C_FAILED', 'GATE_C_REQUESTED'], // a clean re-setup
   ] as const) {
-    assert.ok(canTransition(a, b), `${a}→${b} 应合法`);
+    assert.ok(canTransition(a, b), `${a}->${b} should be legal`);
   }
 });
 
-test('红线#3：闸C STALLED（确定性 CI 未绿）绝不能人工跳去开 PR / 跳过闸D', () => {
-  // 闸C stall = CI/验收未绿 = 确定性闸失败。只能回再修一轮，绝不许强推进开 PR（区别于闸D stall）。
+test('red line #3: a stalled gate C (deterministic CI not green) can never be pushed by hand into opening a PR or past gate D', () => {
+  // A gate C stall means CI or acceptance is not green -- a deterministic gate failed. The only way out is
+  // another round of revision; forcing it forward is never allowed (unlike a gate D stall).
   assert.equal(canTransition('GATE_C_STALLED', 'AWAITING_GATE_D'), false);
   assert.equal(canTransition('GATE_C_STALLED', 'GATE_D_REQUESTED'), false);
-  assert.equal(canTransition('GATE_C_LOOP', 'AWAITING_HUMAN_MERGE'), false); // 不能跳过闸D 直奔合并
-  assert.ok(canTransition('GATE_C_STALLED', 'GATE_C_REVISION_REQUESTED')); // 唯一合法出路
+  assert.equal(canTransition('GATE_C_LOOP', 'AWAITING_HUMAN_MERGE'), false); // cannot skip gate D and head straight for the merge
+  assert.ok(canTransition('GATE_C_STALLED', 'GATE_C_REVISION_REQUESTED')); // the one legal way out
 });
 
-// ── 下游闸D：PR 对抗 review + 测试补强 + 人工合并 ──
-test('闸D PR 对抗 review + harden + 人工合并 跃迁合法', () => {
+// -- Downstream gate D: adversarial PR review + test hardening + a human merge --
+test('gate D: adversarial PR review, hardening and the human merge are legal', () => {
   for (const [a, b] of [
-    ['AWAITING_GATE_D', 'GATE_D_REQUESTED'], // 权限人触发开 PR
+    ['AWAITING_GATE_D', 'GATE_D_REQUESTED'], // someone with the permission triggers the PR
     ['GATE_D_REQUESTED', 'GATE_D_LOOP'],
     ['GATE_D_LOOP', 'GATE_D_LOOP'],
-    ['GATE_D_LOOP', 'GATE_D_HARDENING'], // codex LGTM→补内环测试
+    ['GATE_D_LOOP', 'GATE_D_HARDENING'], // codex says LGTM -> add the inner-loop tests
     ['GATE_D_LOOP', 'AWAITING_GATE_D_INPUT'],
     ['GATE_D_LOOP', 'GATE_D_STALLED'],
     ['AWAITING_GATE_D_INPUT', 'GATE_D_REVISION_REQUESTED'],
     ['GATE_D_REVISION_REQUESTED', 'GATE_D_LOOP'],
     ['GATE_D_HARDENING', 'AWAITING_HUMAN_MERGE'],
-    ['AWAITING_HUMAN_MERGE', 'SHIPPED'], // forge merged（人工确认已合并）
-    ['AWAITING_HUMAN_MERGE', 'GATE_D_REVISION_REQUESTED'], // 合并前发现要改→回续修
+    ['AWAITING_HUMAN_MERGE', 'SHIPPED'], // forge merged (a human confirms it landed)
+    ['AWAITING_HUMAN_MERGE', 'GATE_D_REVISION_REQUESTED'], // something to fix turned up before the merge -> back to revising
   ] as const) {
-    assert.ok(canTransition(a, b), `${a}→${b} 应合法`);
+    assert.ok(canTransition(a, b), `${a}->${b} should be legal`);
   }
-  // 闸D 的 stall 是 codex 主观分歧、且闸C 已确保 CI 绿 → M 可强制前进到人工合并（与闸C 的确定性 stall 不同）。
+  // A gate D stall is codex disagreeing on judgement, and gate C has already established that CI is green,
+  // so the maintainer may force it forward to the human merge -- unlike gate C's deterministic stall.
   assert.ok(canTransition('GATE_D_STALLED', 'AWAITING_HUMAN_MERGE'));
   assert.ok(canTransition('GATE_D_STALLED', 'GATE_D_REVISION_REQUESTED'));
 });
 
-test('红线#2：绝不自动 merge / 跳过 harden；SHIPPED 终态不可出', () => {
-  assert.equal(canTransition('GATE_D_LOOP', 'AWAITING_HUMAN_MERGE'), false); // 必须经 harden
-  assert.equal(canTransition('GATE_D_LOOP', 'SHIPPED'), false); // 绝不自动合并
-  assert.equal(canTransition('GATE_D_HARDENING', 'SHIPPED'), false); // harden 后仍须人工合并
+test('red line #2: never merge automatically, never skip hardening; SHIPPED is terminal', () => {
+  assert.equal(canTransition('GATE_D_LOOP', 'AWAITING_HUMAN_MERGE'), false); // must go through hardening
+  assert.equal(canTransition('GATE_D_LOOP', 'SHIPPED'), false); // never merge automatically
+  assert.equal(canTransition('GATE_D_HARDENING', 'SHIPPED'), false); // even after hardening the merge is still a human's
   for (const t of ['GATE_C_REQUESTED', 'GATE_D_REQUESTED', 'DONE', 'AWAITING_HUMAN_MERGE'] as const) {
-    assert.equal(canTransition('SHIPPED', t), false, `SHIPPED→${t} 应非法（终态）`);
+    assert.equal(canTransition('SHIPPED', t), false, `SHIPPED->${t} should be illegal (terminal state)`);
   }
 });
