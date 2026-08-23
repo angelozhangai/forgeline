@@ -1,8 +1,12 @@
-// 单测：SessionStore 接缝（store/port.ts 接口 + store/index.ts 选择点 + localSqlite adapter）。
-// 守两条：① 选择点 `store` 就是 localSqlite 自由函数的 bundle（引用相等 → 零行为漂移），
-//            **例外只有 WRAPPED 里明确列名的那几个**（扩展钩子装饰器）；
-//         ② 经 `store.*` 走真实 sqlite 的 create/get/patch/transition/event 全链与直调一致。
-// 必须在导入前设 FORGE_DB（真 node:sqlite，:memory: 隔离）。
+// Unit tests: the SessionStore seam (the store/port.ts interface + the store/index.ts selection point + the
+// localSqlite adapter).
+// It holds two lines:
+//   1. the `store` at the selection point is exactly the bundle of localSqlite free functions (reference
+//      equality, so there is zero behavioural drift), **with the only exceptions being the ones named
+//      explicitly in WRAPPED** (the extension-hook decorator);
+//   2. going through `store.*` against real sqlite, the create / get / patch / transition / event chain behaves
+//      identically to calling the free functions directly.
+// FORGE_DB must be set before the imports (real node:sqlite, isolated with :memory:).
 process.env.FORGE_DB = ':memory:';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -10,7 +14,7 @@ import assert from 'node:assert/strict';
 const sessions = await import('../src/store/sessions.ts');
 const { store } = await import('../src/store/index.ts');
 
-// 接缝上每个公开操作。漏一个 → 消费方迁移到 store.* 时才暴雷。
+// Every public operation on the seam. Missing one only blows up later, when a consumer migrates to store.*.
 const SEAM_METHODS = [
   'create', 'findByIssueRef', 'isDuplicateDocRefError', 'isDuplicateIssueRefError',
   'get', 'getBySlug', 'findByPrdUrl', 'findByDocRef', 'resolve',
@@ -18,43 +22,46 @@ const SEAM_METHODS = [
   'patch', 'transition', 'appendEvent', 'events', 'lastEventTs', 'leaseClaim',
 ] as const;
 
-// 选择点上被装饰器包过一层的方法。**这是一张白名单，不是豁免**：
-// transition 被 withTransitionHook 包了（扩展生命周期钩子，见 src/store/index.ts）。
-// 谁再悄悄包第二个方法而不更新这张表，下面那条断言当场红——比原来「全都必须引用相等」更严，
-// 因为它同时守住了「不该被包的方法一个都没被包」。
+// The methods the selection point wraps in a decorator. **This is an allowlist, not an exemption**:
+// transition is wrapped by withTransitionHook (the extension lifecycle hook; see src/store/index.ts).
+// If anyone quietly wraps a second method without updating this set, the assertion below goes red immediately -
+// which is stricter than the original "everything must be reference-equal", because it simultaneously holds the
+// line that no method which should not be wrapped has been.
 const WRAPPED = new Set<string>(['transition']);
 
-// ① 选择点 = localSqlite 自由函数 bundle（+ 明确列名的装饰器）。
-test('store 选择点：未列名的方法一律与 sessions 自由函数引用相等（零漂移）', () => {
+// 1. The selection point is the bundle of localSqlite free functions (plus the explicitly named decorators).
+test('the store selection point: every method not on the list is reference-equal to the sessions free function (zero drift)', () => {
   for (const m of SEAM_METHODS) {
     const free = (sessions as unknown as Record<string, unknown>)[m];
-    if (typeof free !== 'function') continue; // 该操作不是自由函数导出，跳过引用比对
+    if (typeof free !== 'function') continue; // this operation is not exported as a free function, so skip the reference comparison
     if (WRAPPED.has(m)) {
-      assert.notEqual(store[m], free, `${m} 在 WRAPPED 名单里却没被包——名单过期了`);
+      assert.notEqual(store[m], free, `${m} is on the WRAPPED list but is not actually wrapped - the list is out of date`);
     } else {
-      assert.equal(store[m], free, `${m} 被悄悄换成了另一份实现（会漂移）；确属有意包装请加进 WRAPPED 并写清理由`);
+      assert.equal(store[m], free, `${m} was quietly swapped for a different implementation (which will drift); if the wrapping is deliberate, add it to WRAPPED and state why`);
     }
   }
 });
 
-test('store 选择点：装饰器不得增删接缝上的方法', () => {
-  // `...inner` 展开只复制自有可枚举属性：将来 adapter 改用 class / 原型方法就会在这里丢方法，
-  // 而症状是运行时 "store.xxx is not a function"，离改动点很远。这条把它挡在提交前。
+test('the store selection point: the decorator must neither add nor remove methods on the seam', () => {
+  // Spreading `...inner` copies only own enumerable properties: if the adapter ever moves to a class with
+  // prototype methods, methods would silently be dropped here, and the symptom would be a runtime
+  // "store.xxx is not a function" far from the change that caused it. This catches it before the commit.
   assert.deepEqual(
     Object.keys(store).sort(),
     Object.keys(sessions.localSqliteStore).sort(),
-    '选择点的方法集合必须与 adapter 完全一致',
+    "the selection point's method set must match the adapter's exactly",
   );
 });
 
-test('store 接缝面完整：覆盖 sessions 全部公开 store 操作', () => {
+test('the store seam is complete: it covers every public store operation in sessions', () => {
   for (const m of SEAM_METHODS) {
-    assert.equal(typeof store[m], 'function', `store.${m} 缺失`);
+    assert.equal(typeof store[m], 'function', `store.${m} is missing`);
   }
 });
 
-// ② 经 store.* 的真实 sqlite 全链（与直调 sessions.* 同库、同行为）。
-test('store.create → get/patch/transition/event 全链（真 sqlite）', async () => {
+// 2. The full chain through store.* against real sqlite (the same database and behaviour as calling sessions.*
+//    directly).
+test('store.create -> the get / patch / transition / event chain (real sqlite)', async () => {
   const s = await store.create({ id: 'p1', slug: 'p1', title: 'T', branch: 'dev', prd_url: 'https://x.feishu.cn/wiki/p1' });
   assert.equal(s.state, 'INTAKE');
   assert.equal((await store.get('p1'))!.slug, 'p1');
@@ -71,8 +78,9 @@ test('store.create → get/patch/transition/event 全链（真 sqlite）', async
   assert.ok(kinds.includes('intake') && kinds.includes('transition') && kinds.includes('note'));
 });
 
-// store 与直调 sessions 同一库：一边写、另一边读得到（证明非两套状态）。
-test('store 与 sessions 自由函数共享同一库（同库视图）', async () => {
+// store and the sessions free functions share one database: what one writes the other reads, proving there are
+// not two separate sets of state.
+test('store and the sessions free functions share one database (the same view)', async () => {
   await sessions.create({ id: 'p2', slug: 'p2', title: 'T', branch: 'dev', prd_url: 'https://x.feishu.cn/wiki/p2' });
   assert.equal((await store.get('p2'))!.id, 'p2');
   await store.patch('p2', { size: 'L' });

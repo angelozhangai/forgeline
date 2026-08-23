@@ -1,5 +1,7 @@
-// 群消息补拉游标：记「每个群处理到哪条消息了」(create_time 毫秒水位)。
-// 离线期间 PM 发的需求 = 群历史里 ts > 水位的消息，开机后 backfill 捞回。
+// The group-message backfill cursor: it records "how far through each chat's messages we got" (a create_time
+// watermark in milliseconds).
+// A requirement the PM posted while the service was offline is a message in the chat history whose ts is above
+// the watermark, and the backfill recovers it on start-up.
 import { db } from './db.ts';
 
 export function getCursor(chatId: string): number | null {
@@ -9,14 +11,16 @@ export function getCursor(chatId: string): number | null {
   return row ? Number(row.last_ts) : null;
 }
 
-// 仅在不存在时种子化（首装从 now 起 → 不补拉工具诞生前的古早历史）。
+// Seed the cursor only when none exists (a first install starts from now, so it does not backfill ancient
+// history from before the tool existed).
 export function seedCursor(chatId: string, ts: number): void {
   if (getCursor(chatId) === null) {
     db().prepare('INSERT INTO chat_cursor(chat_id, last_ts) VALUES(?, ?)').run(chatId, ts);
   }
 }
 
-// 推进水位（只前进不后退）；顺带登记该群供 backfill 遍历。
+// Advance the watermark (forwards only, never backwards); this also registers the chat for the backfill to
+// walk.
 export function advanceCursor(chatId: string, ts: number): void {
   const cur = getCursor(chatId);
   if (cur === null) {
@@ -26,7 +30,7 @@ export function advanceCursor(chatId: string, ts: number): void {
   }
 }
 
-// 所有已知群（配置种子 + live 消息自学习到的）。
+// Every known chat (those seeded from config plus those learned from live messages).
 export function allChats(): string[] {
   const rows = db().prepare('SELECT chat_id FROM chat_cursor').all() as { chat_id: string }[];
   return rows.map((r) => r.chat_id);

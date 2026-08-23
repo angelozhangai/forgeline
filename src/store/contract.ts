@@ -1,4 +1,6 @@
-// 契约探针结果持久化：每依赖一行最新态 + 上次态（供翻转去抖）。守护重启后回填内存缓存。
+// Persistence for the contract-probe results: one row per dependency holding its latest state plus the
+// previous one (which is what allows a flip to be debounced). It also refills the in-memory cache after the
+// daemon restarts.
 import { db } from './db.ts';
 import type { ProbeResult, ProbeDep } from '../llm/probes.ts';
 
@@ -32,18 +34,23 @@ export function allProbes(): ProbeRow[] {
   return rows.map(toRow);
 }
 
-// 启动契约探测是否该跑：**最旧**一条 available 探针距今 ≥ 间隔即跑（任一依赖陈旧就重探整批——
-// runContractProbes 本就一次探全部依赖，重探会让时间戳重新收敛，不会反复付费）。用最旧而非最新：
-// 避免一条新探针遮住另一条陈旧探针——某依赖某轮 unavailable 被跳过（不落库）时其行时间戳会滞后，
-// 若取最新（如 claude 2h 前、codex 50h 前 → 误判「都新」）就会跳过启动探测，让 codex 行永远陈旧。
-// 防 daemon 崩溃重启循环时每次启动都付费探一次（契约探测是付费 claude+codex 调用）。从没探过 → 跑。纯函数，供单测。
+// Whether the startup contract probe is due: it runs when the **oldest** available probe is at least one
+// interval old (if any dependency is stale, the whole batch is re-probed - runContractProbes probes every
+// dependency in one go anyway, so a re-probe reconverges the timestamps rather than paying repeatedly).
+// It uses the oldest rather than the newest so that a fresh probe cannot mask a stale one: when a dependency is
+// unavailable for a round it is skipped and not persisted, so its row's timestamp falls behind. Taking the
+// newest (say claude 2 hours ago and codex 50 hours ago -> "both look fresh") would skip the startup probe and
+// leave the codex row stale forever.
+// This also stops a crash-restart loop from paying for a probe on every start (a contract probe is a billed
+// claude + codex call). Never probed at all -> run. A pure function, for unit tests.
 export function startupProbeDue(probes: ProbeRow[], now: number, intervalMs: number): boolean {
   if (probes.length === 0) return true;
   const oldest = Math.min(...probes.map((p) => p.checkedAt));
   return now - oldest >= intervalMs;
 }
 
-// 写入/更新一条探针结果。仅记 available 的探针（跳过的不落库，免污染上次态）。
+// Insert or update one probe result. Only available probes are recorded (a skipped one is not persisted, so it
+// cannot pollute the previous state).
 export function upsertProbe(r: ProbeResult): void {
   if (!r.available) return;
   db()
