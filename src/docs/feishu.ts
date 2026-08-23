@@ -1,9 +1,11 @@
-// 文档源——**飞书文档**（DocSource 的第一个实现）。这里收敛「一份需求文档长什么样、怎么认出来、
-// 怎么读、怎么回写」的全部飞书知识：链接正则、wiki/docx 的 token 解析、feishu-doc.js 的调用、
-// docx raw_content 直读、批注回写、user_access_token。
+// Document source — **Feishu documents** (the first implementation of DocSource). Everything Feishu knows
+// about "what a requirement document looks like, how to recognise it, how to read it and how to write back
+// to it" is gathered here: the link pattern, parsing a wiki/docx token, calling feishu-doc.js, reading docx
+// raw_content directly, adding a comment, and the user_access_token.
 //
-// 迁自三处（Phase 1）：util/links.ts 的正则、feishu/doc.ts 的解析与读取、workspace.ts 的
-// feishuRead/feishuCommentAdd/feishuUserToken/feishuReadDocxRaw。核心从此只见 DocRef。
+// Moved here from three places in phase 1: the pattern from util/links.ts, the parsing and reading from
+// feishu/doc.ts, and feishuRead/feishuCommentAdd/feishuUserToken/feishuReadDocxRaw from workspace.ts. From
+// here on the core sees nothing but a DocRef.
 import { resolve } from 'node:path';
 import { run } from '../util/proc.ts';
 import { SCRIPTS_DIR } from '../root.ts';
@@ -11,12 +13,15 @@ import type { DocClaimInput, DocRef, DocReadResult, DocSource } from './port.ts'
 
 export const FEISHU_SOURCE = 'feishu';
 
-// 裸 token 的形状：纯字母数字、≥10 位（真实 wiki/docx token 是 24~27 位的 base62）。
-// 这道闸只为把「一句话」和「一个 token」分开，不追求精确——认宽了会把需求正文当 token，
-// 认窄了只是让人多贴一次完整链接。
+// The shape of a bare token: alphanumeric only, at least 10 characters (a real wiki/docx token is 24-27
+// characters of base62).
+// This gate exists only to tell "a sentence" apart from "a token" and does not aim to be exact — too loose
+// and a requirement body gets taken for a token; too strict and someone simply has to paste the full link
+// again.
 const BARE_TOKEN_RE = /^[A-Za-z0-9]{10,}$/;
 
-// 消息里的飞书文档链接（wiki/docx/docs）。live 消息入口与离线补拉共用。
+// The Feishu document links (wiki/docx/docs) in a message. Shared by the live message entry point and the
+// offline backfill.
 export function extractFeishuLinks(text: string): string[] {
   const re = /https?:\/\/[\w.-]*feishu\.[\w.-]+\/(?:wiki|docx|docs)\/[A-Za-z0-9]+/g;
   return Array.from(new Set(text.match(re) ?? []));
@@ -24,8 +29,10 @@ export function extractFeishuLinks(text: string): string[] {
 
 export type DocKind = 'wiki' | 'docx' | 'unknown';
 
-// 从飞书链接解析 {token, kind}。支持 .../wiki/<t>、.../docx/<id>、.../docs/<id>，或裸 token。
-// 同一份文档的 URL 变体（查询参数/锚点/末尾斜杠）必须落到同一 token——PRD 级去重全靠这条归一。
+// Parse {token, kind} out of a Feishu link. It accepts .../wiki/<t>, .../docx/<id>, .../docs/<id>, or a
+// bare token.
+// Every URL variant of the same document (query parameters, an anchor, a trailing slash) must land on the
+// same token — PRD-level deduplication rests entirely on this normalisation.
 export function parseFeishuDoc(urlOrToken: string): { token: string; kind: DocKind } {
   const s = urlOrToken.trim();
   if (!s.includes('/')) return { token: s, kind: 'unknown' };
@@ -45,10 +52,10 @@ export function parseFeishuDoc(urlOrToken: string): { token: string; kind: DocKi
   }
 }
 
-// ── feishu-doc.js（目标项目提供的脚本，「调用、不重写」）────────────────
+// ── feishu-doc.js (a script the target project provides: call it, never rewrite it) ────────────────
 function feishuEnv(): NodeJS.ProcessEnv {
   const env = { ...process.env };
-  // 飞书走国内，代理会断
+  // Feishu is reached domestically; going through a proxy breaks the connection
   delete env.https_proxy;
   delete env.http_proxy;
   delete env.HTTPS_PROXY;
@@ -69,7 +76,7 @@ export async function feishuCommentAdd(token: string, text: string): Promise<{ o
   return { ok: true };
 }
 
-// 取一枚你本人的 user_access_token（feishu-doc.js 自动续期）。
+// Fetch one of your own user_access_tokens (feishu-doc.js refreshes it automatically).
 export async function feishuUserToken(): Promise<string | null> {
   const r = await run('node', [docScript(), 'token'], { env: feishuEnv(), timeoutMs: 30000 });
   if (r.code !== 0) return null;
@@ -77,10 +84,11 @@ export async function feishuUserToken(): Promise<string | null> {
   return t || null;
 }
 
-// 直接读 docx 文档纯文本（绕开 feishu-doc.js 的「<30 字当 wiki 节点」启发式——/docx/ 直链的 doc_id 常 <30 会被误判）。
+// Read a docx document's plain text directly, bypassing feishu-doc.js's "shorter than 30 characters means a
+// wiki node" heuristic — the doc_id in a direct /docx/ link is often shorter than 30 and gets misjudged.
 export async function feishuReadDocxRaw(docId: string): Promise<{ ok: boolean; text: string; error?: string }> {
   const token = await feishuUserToken();
-  if (!token) return { ok: false, text: '', error: '取 user token 失败（feishu-doc.js token）' };
+  if (!token) return { ok: false, text: '', error: 'could not fetch a user token (feishu-doc.js token)' };
   try {
     const res = await fetch(
       `https://open.feishu.cn/open-apis/docx/v1/documents/${encodeURIComponent(docId)}/raw_content?lang=0`,
@@ -94,13 +102,14 @@ export async function feishuReadDocxRaw(docId: string): Promise<{ ok: boolean; t
   }
 }
 
-// ── DocSource 实现 ────────────────────────────────────────────
+// ── The DocSource implementation ──────────────────────────────
 export const feishuDocs: DocSource = {
   id: FEISHU_SOURCE,
 
   claim(input: DocClaimInput): DocRef[] {
-    // 正文优先；正文没有再逐个扫 adapter 挖出的兜底文本块（文档分享卡 / 富文本 post 的链接不在正文里），
-    // 命中即停——与旧的 live 消息入口同序，避免两条路径漂移。
+    // The body comes first; if there is nothing there, scan the fallback text blocks the adapter dug out
+    // (a document share card's link, or a rich-text post's, is not in the body), stopping at the first hit —
+    // the same order as the old live message entry point, so the two paths cannot drift apart.
     const scan = [input.text, ...(input.searchTexts ?? [])];
     for (const t of scan) {
       const urls = extractFeishuLinks(t ?? '');
@@ -113,25 +122,29 @@ export const feishuDocs: DocSource = {
     const s = (urlOrToken ?? '').trim();
     if (!s) return null;
     if (s.includes('/')) {
-      // 只认飞书域的链接。
+      // Only a link on a Feishu domain is recognised.
       if (!/^https?:\/\/[\w.-]*feishu\.[\w.-]+\//.test(s)) return null;
       const { token } = parseFeishuDoc(s);
       return token ? { source: FEISHU_SOURCE, token, url: s } : null;
     }
-    // 裸 token 也收（CLI 允许直接贴 token），但**必须长得像 token**：纯字母数字、够长。
-    // 松到「任何不含 / 的字符串」是有害的——一整句需求会被当成飞书 token 收下，
-    // 于是登记出一条读不出正文的需求，而且把本该轮到兜底源的消息半路截走。
+    // A bare token is accepted too (the CLI lets you paste one directly), but it **must look like a token**:
+    // alphanumeric and long enough.
+    // Being loose enough to accept "any string with no slash in it" is actively harmful — a whole sentence of
+    // requirement would be taken as a Feishu token, registering a requirement whose body cannot be read, and
+    // intercepting a message that should have gone to the fallback source.
     return BARE_TOKEN_RE.test(s) ? { source: FEISHU_SOURCE, token: s } : null;
   },
 
   async read(ref: DocRef): Promise<DocReadResult> {
-    // kind 由链接决定；只有 token 时按 wiki 读法（feishu-doc.js 内部会解析 wiki 节点 → docx）。
+    // The kind comes from the link; with only a token, read it as a wiki (feishu-doc.js resolves a wiki node
+    // to a docx internally).
     const { kind } = parseFeishuDoc(ref.url ?? ref.token);
     if (kind === 'docx') {
-      // /docx/ 直链：doc_id 直接走 docx raw_content（feishu-doc.js read 会把它误当 wiki 节点解析失败）。
+      // A direct /docx/ link: take the doc_id straight to docx raw_content (feishu-doc.js read would
+      // misread it as a wiki node and fail to resolve it).
       const r = await feishuReadDocxRaw(ref.token);
       if (r.ok) return { ok: true, text: r.text };
-      // 兜底：万一其实是 wiki 节点伪装成 /docs/，再试一次 wiki 读法
+      // The fallback: in case it really is a wiki node dressed up as /docs/, try the wiki read once more
       const w = await feishuRead(ref.token);
       return { ok: w.ok, text: w.text, error: w.ok ? undefined : r.error || w.error };
     }
