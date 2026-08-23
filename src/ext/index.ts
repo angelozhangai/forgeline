@@ -21,6 +21,7 @@ import { pathToFileURL } from 'node:url';
 import { EXT_DIR } from '../root.ts';
 import { log } from '../util/log.ts';
 import type { ExtensionPack, ExtCommand, LifecycleHooks, TransitionEvent, TickEvent } from './port.ts';
+import type { DocSource } from '../docs/index.ts';
 
 const HOOK_TIMEOUT_MS = Number(process.env.FORGE_EXT_HOOK_TIMEOUT_MS) || 5000;
 
@@ -44,6 +45,15 @@ export function hooks(): LifecycleHooks | undefined {
   return active.hooks;
 }
 
+// 没有扩展源时返回**同一个**空数组：docs/index.ts 拿引用相等做记忆键，每次现造一个新数组
+// 会让那层记忆彻底失效（于是每来一条消息都重算一次合并、重打一次 warn）。
+const NO_SOURCES: DocSource[] = [];
+
+/** 已装载扩展注册的文档源（未装载或空包 → 空数组）。由 docs/index.ts 合并进注册表。 */
+export function extDocSources(): DocSource[] {
+  return active.docSources ?? NO_SOURCES;
+}
+
 // 形状校验：扩展包来自另一个仓库，形状错了要在装载时就炸掉，而不是等到某个钩子第一次被调用。
 // 只校验「核心会去碰的部分」，不管下游在包里还放了什么别的字段。
 function validate(pack: unknown, from: string): ExtensionPack {
@@ -62,6 +72,19 @@ function validate(pack: unknown, from: string): ExtensionPack {
     }
   }
   if (p.hooks !== undefined && (typeof p.hooks !== 'object' || p.hooks === null)) bad('hooks 不是对象');
+  if (p.docSources !== undefined) {
+    if (!Array.isArray(p.docSources)) bad('docSources 不是数组');
+    for (const [i, d] of p.docSources.entries()) {
+      // 形状错了要在**装载时**炸，而不是等某条消息第一次走到 claim()——那时症状只是「bot 没理我」。
+      if (typeof d?.id !== 'string' || d.id.trim() === '') bad(`docSources[${i}] 缺少非空 id`);
+      for (const fn of ['claim', 'parseRef', 'read'] as const) {
+        if (typeof d?.[fn] !== 'function') bad(`docSources[${i}].${fn} 不是函数`);
+      }
+      for (const fn of ['comment', 'probe'] as const) {
+        if (d[fn] !== undefined && typeof d[fn] !== 'function') bad(`docSources[${i}].${fn} 存在但不是函数`);
+      }
+    }
+  }
   return p as ExtensionPack;
 }
 
