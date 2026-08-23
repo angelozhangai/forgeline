@@ -321,6 +321,34 @@ the spike was split:
   by a build → simulated-submit → parse round-trip test. That validates *our* handling, not Slack's
   behaviour. It remains the one assumption needing a real workspace.
 
+**Phase 3.1 — the local acceptance loop ([#14](https://github.com/angelozhangai/forgeline/issues/14)).**
+The spike above was a throwaway script; what it proved died with it. Phase 3.1 turns the same idea into
+two permanent parts of the suite, and shrinks "needs a real workspace" down to what actually needs one.
+
+- **[test/slack-live-loop.test.ts](../test/slack-live-loop.test.ts) — the whole round trip, nothing
+  mocked.** A fake Slack (`node:http` Web API + a hand-written WebSocket server, zero dependencies) sits
+  opposite the *real* `slack/web.ts` and `slack/socket.ts`, and the loop runs end to end:
+  `apps.connections.open` → wss handshake → envelope → ack → `chat.postMessage` → button click →
+  `views.open` → `view_submission` → the core's `{action, slug, round, formValues}`. It also drives a
+  planned `disconnect` (new connection opened before the old one closes, no false alarm to the core) and
+  a hard disconnect (one reconnect, `onReconnected` fired) over a real socket. What this catches that a
+  unit test cannot: the form encoding that read methods require, the ack frame really being a frame, and
+  the context really surviving `private_metadata`.
+- **[test/slack-blockkit.test.ts](../test/slack-blockkit.test.ts) — the structural gate.** Slack answers
+  a malformed payload with `invalid_blocks` and *no* indication of which block or field; the operator
+  sees "the card never appeared" or "the button does nothing". Those failures are structural, so they are
+  decidable locally: [src/slack/blockkit.ts](../src/slack/blockkit.ts) holds Slack's documented limits as
+  the single source of truth, and the test runs the validator over every card Forge can emit (each
+  `NotifyKind`, each `State`) plus deliberately hostile content — emoji sitting exactly on every
+  truncation boundary, empty strings, oversize text. The same validator runs at runtime *only after*
+  Slack has already said no, turning `invalid_blocks` into "block 3's `section.text` is empty".
+
+**What is still tenant-only, after 3.1.** Only Slack's own behaviour: that a real `views.open` accepts
+this view, that `view_submission` really returns `private_metadata` plus every `state.value` in one
+payload, that the planned `disconnect` really arrives about every 30 minutes, and that acks land inside
+the 3-second window under real latency. Everything upstream of those is now machine-checked on every CI
+run.
+
 **The modal's hidden state problem.** Slack forms live in a modal, but the modal's *contents* (which
 decisions, which DRI pool) are only known when the card is rendered — and the click can come much later.
 The adapter caches the built view in memory at render time. A daemon restart empties that cache while the

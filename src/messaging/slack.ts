@@ -15,6 +15,8 @@ import { log } from '../util/log.ts';
 import { slackApi } from '../slack/web.ts';
 import { createSocketChannel } from '../slack/socket.ts';
 import { buildDecisionModal, buildGoModal, parseViewSubmission, type ModalContext } from '../slack/modal.ts';
+import { BK_LIMIT, explain, validateAttachments, validateView } from '../slack/blockkit.ts';
+import { blank, mrkdwnText, plainText } from '../slack/text.ts';
 import { DECISION_CAP, type DecisionItem } from '../gates/envelopes.ts';
 import type { CalloutTone, CardBlock, CardButton, CardColor, CardModel, FindingLine, InboundCardAction, InboundMessage } from './model.ts';
 import type { InboundChannel, InboundHandlers, InboundProbe, MessagingPort } from './port.ts';
@@ -55,19 +57,31 @@ export function toMrkdwn(src: string): string {
   );
 }
 
-const section = (text: string): Record<string, unknown> => ({ type: 'section', text: { type: 'mrkdwn', text: toMrkdwn(text).slice(0, 3000) } });
-const context = (text: string): Record<string, unknown> => ({ type: 'context', elements: [{ type: 'mrkdwn', text: toMrkdwn(text).slice(0, 3000) }] });
-const plain = (t: string): Record<string, unknown> => ({ type: 'plain_text', text: t.slice(0, 75), emoji: true });
+// 封顶一律走 slack/text.ts（与模态那侧同一份实现）：按**码点**截、绝不留空文本。
+// 裸 `.slice()` 在这里曾经埋着两个只在真工作区才现形的坑——把 emoji 的代理对劈成两半、
+// 或者送出一个空 plain_text，两者都让 Slack 整条拒掉（invalid_blocks），而卡片就这么没了。
+const section = (text: string): Record<string, unknown> => ({ type: 'section', text: mrkdwnText(toMrkdwn(text), BK_LIMIT.sectionText) });
+const context = (text: string): Record<string, unknown> => ({ type: 'context', elements: [mrkdwnText(toMrkdwn(text), BK_LIMIT.contextText)] });
+const plain = (t: string, max: number = BK_LIMIT.buttonText): Record<string, unknown> => plainText(t, max);
 
 // 回调按钮：value 里放核心那套 {action,slug,...}，原样在 block_actions 里回来。
 const BTN_STYLE: Record<CardButton['style'], string | undefined> = { primary: 'primary', danger: 'danger', default: undefined };
+// 按钮 value 超 2000 **不能截**：截出来的 JSON 再也 parse 不回来，回调会被 parseCardAction 原地丢掉，
+// 人看到的还是那句「点了没反应」。宁可丢掉透传字段，也要保住核心真正需要的 {action,slug}。
+function btnValue(b: CardButton): string {
+  const full = JSON.stringify({ action: b.action, slug: b.slug, ...(b.value ?? {}) });
+  if (Array.from(full).length <= BK_LIMIT.buttonValue) return full;
+  log.warn(`Slack 按钮 value 超 ${BK_LIMIT.buttonValue} 字符（${b.action}/${b.slug}）→ 只保留 {action,slug}，透传字段已丢弃`);
+  return JSON.stringify({ action: b.action, slug: b.slug });
+}
+
 function btnEl(b: CardButton): Record<string, unknown> {
   const style = BTN_STYLE[b.style];
   return {
     type: 'button',
     text: plain(b.text),
-    action_id: `forge_${b.action}_${b.slug}`.slice(0, 250),
-    value: JSON.stringify({ action: b.action, slug: b.slug, ...(b.value ?? {}) }).slice(0, 2000),
+    action_id: `forge_${b.action}_${b.slug}`.slice(0, BK_LIMIT.actionId - 5),
+    value: btnValue(b),
     ...(style ? { style } : {}),
   };
 }
@@ -82,7 +96,7 @@ function openModalBtn(text: string, ctx: ModalContext): Record<string, unknown> 
         text: plain(text),
         style: 'primary',
         action_id: OPEN_MODAL_ACTION,
-        value: JSON.stringify(ctx).slice(0, 2000),
+        value: JSON.stringify(ctx).slice(0, BK_LIMIT.buttonValue),
       },
     ],
   };
@@ -100,26 +114,32 @@ const findingLines = (findings: FindingLine[]): Record<string, unknown>[] =>
   findings.map((f, i) => section(`*${i + 1}.* ${SEV_PREFIX(f.severity)} ${f.lead}${(f.notes ?? []).map((n) => `\n_${n.label}：${n.text}_`).join('')}`));
 
 // CardBlock → Block Kit（一块可展开成 0..N 个块，故返回数组）。
+// 内容为空的块**干脆不出**：Slack 的 section/context 不接受空文本，空 fields / 空 elements 同理——
+// 任一处为空都不是"少一块"，而是整条消息被拒（invalid_blocks），卡片就此消失。发占位符也不对，那是噪音。
 function renderBlock(b: CardBlock): Record<string, unknown>[] {
   switch (b.kind) {
     case 'text':
-      return [section(b.md)];
+      return blank(b.md) ? [] : [section(b.md)];
     case 'note':
     case 'footnote':
-      return [context(b.md)];
-    case 'quote':
-      return [section(`> ${b.text.replace(/\s*\n\s*/g, ' ').trim()}`)];
+      return blank(b.md) ? [] : [context(b.md)];
+    case 'quote': {
+      const line = b.text.replace(/\s*\n\s*/g, ' ').trim();
+      return line ? [section(`> ${line}`)] : [];
+    }
     case 'callout':
-      return [section(`${CALLOUT_PREFIX[b.tone]} *${toMrkdwn(b.md)}*`)];
+      return blank(b.md) ? [] : [section(`${CALLOUT_PREFIX[b.tone]} *${toMrkdwn(b.md)}*`)];
     case 'divider':
       return [{ type: 'divider' }];
     case 'stats':
       // Slack 的 section.fields 每行两列自动排布——正好对应飞书那侧的并排统计字段。
-      return [{ type: 'section', fields: b.fields.slice(0, 10).map((f) => ({ type: 'mrkdwn', text: toMrkdwn(f).slice(0, 2000) })) }];
+      return b.fields.length
+        ? [{ type: 'section', fields: b.fields.slice(0, BK_LIMIT.fieldsPerSection).map((f) => mrkdwnText(toMrkdwn(f), BK_LIMIT.fieldText)) }]
+        : [];
     case 'button':
       return [{ type: 'actions', elements: [btnEl(b.button)] }];
     case 'buttonRow':
-      return [{ type: 'actions', elements: b.buttons.slice(0, 5).map(btnEl) }];
+      return b.buttons.length ? [{ type: 'actions', elements: b.buttons.slice(0, 5).map(btnEl) }] : [];
     case 'decisionList':
       return decisionLines(b.items);
     case 'findingList':
@@ -145,8 +165,10 @@ function renderBlock(b: CardBlock): Record<string, unknown>[] {
       rememberModal(ctx, buildGoModal(ctx, b.pool, b.picked));
       return [openModalBtn('✅ 立项 · 建需求', ctx)];
     }
-    case 'petRow':
-      return [context(`${b.mentionId ? `<@${b.mentionId}> ` : ''}${b.voice}`)];
+    case 'petRow': {
+      const line = `${b.mentionId ? `<@${b.mentionId}> ` : ''}${b.voice}`;
+      return blank(line) ? [] : [context(line)];
+    }
   }
 }
 
@@ -154,16 +176,16 @@ function renderBlock(b: CardBlock): Record<string, unknown>[] {
 // text 是必给的：通知栏预览 + 不支持 blocks 的客户端全靠它。
 // Slack 单条消息最多 50 个块。超了必须截——但**绝不静默截**：一张被砍掉尾巴的评审卡看起来完全正常，
 // 只是少了几条待决项，那是最难发现的一类错。
-const MAX_BLOCKS = 50;
 
 export function renderSlackMessage(card: CardModel): { text: string; attachments: Record<string, unknown>[] } {
-  const blocks: Record<string, unknown>[] = [{ type: 'header', text: plain(card.title) }];
+  const blocks: Record<string, unknown>[] = [{ type: 'header', text: plain(card.title, BK_LIMIT.headerText) }];
   if (card.subtitle) blocks.push(context(card.subtitle));
   blocks.push(...card.blocks.flatMap(renderBlock));
-  if (blocks.length > MAX_BLOCKS) {
-    log.warn(`Slack 卡片超出 ${MAX_BLOCKS} 块上限（${blocks.length}），尾部被截断：「${card.title}」`);
+  if (blocks.length > BK_LIMIT.blocksPerMessage) {
+    log.warn(`Slack 卡片超出 ${BK_LIMIT.blocksPerMessage} 块上限（${blocks.length}），尾部被截断：「${card.title}」`);
   }
-  return { text: card.title, attachments: [{ color: COLOR_HEX[card.color], blocks: blocks.slice(0, MAX_BLOCKS) }] };
+  // text 同样不能为空——它是通知栏预览，也是不支持 blocks 的客户端唯一看得到的东西。
+  return { text: card.title.trim() || 'Forge', attachments: [{ color: COLOR_HEX[card.color], blocks: blocks.slice(0, BK_LIMIT.blocksPerMessage) }] };
 }
 
 // ── composite message id ────────────────────────────────────────────
@@ -189,14 +211,22 @@ function dmTarget(): string | undefined {
   return env().SLACK_DM_USER_ID || undefined;
 }
 
+// Slack 拒一条消息时只回 `invalid_blocks`——**不说是哪一块、哪个字段**，于是人看到的只是"卡片没出现"。
+// 已经失败了，这时候对着载荷跑一次结构自检不花什么，却能把它翻译成"第 3 块 section.text 是空的"。
+// happy path 上一次都不跑。
+function why(attachments: Record<string, unknown>[]): string {
+  return ` — ${explain(validateAttachments(attachments))}`;
+}
+
 async function post(channel: string | undefined, card: CardModel, threadTs?: string): Promise<string | null> {
   if (!channel) {
     log.warn('Slack 发卡跳过：未配置目标 channel');
     return null;
   }
-  const r = await slackApi('chat.postMessage', { channel, ...renderSlackMessage(card), ...(threadTs ? { thread_ts: threadTs } : {}) });
+  const msg = renderSlackMessage(card);
+  const r = await slackApi('chat.postMessage', { channel, ...msg, ...(threadTs ? { thread_ts: threadTs } : {}) });
   if (!r.ok) {
-    log.warn(`Slack chat.postMessage 失败：${r.error}`);
+    log.warn(`Slack chat.postMessage 失败：${r.error}${why(msg.attachments)}`);
     return null;
   }
   const ts = typeof r.ts === 'string' ? r.ts : null;
@@ -238,8 +268,9 @@ const slackPort: MessagingPort = {
       log.warn(`Slack editGroupCard：无法解析消息 id「${messageId}」`);
       return false;
     }
-    const r = await slackApi('chat.update', { channel: at.channel, ts: at.ts, ...renderSlackMessage(card) });
-    if (!r.ok) log.warn(`Slack chat.update 失败：${r.error}`);
+    const msg = renderSlackMessage(card);
+    const r = await slackApi('chat.update', { channel: at.channel, ts: at.ts, ...msg });
+    if (!r.ok) log.warn(`Slack chat.update 失败：${r.error}${why(msg.attachments)}`);
     return r.ok === true;
   },
   async postWebhook(title, lines, color) {
@@ -345,7 +376,7 @@ const slackPort: MessagingPort = {
       onError: (reason) => handlers.onError(reason),
       onReconnected: () => handlers.onReconnected(),
     });
-    return { connect: () => channel.connect() };
+    return { connect: () => channel.connect(), close: () => channel.close() };
   },
 
   watchedChats(): string[] {
@@ -364,7 +395,7 @@ const slackPort: MessagingPort = {
         return out; // best-effort：返回已得，绝不抛
       }
       for (const m of (r.messages as Record<string, unknown>[] | undefined) ?? []) {
-        const parsed = slackPort.parseMessage({ ...m, type: 'message', channel: chatId });
+        const parsed = slackPort.parseMessage({ ...m, type: 'message', channel: chatId, channel_type: channelType(chatId) });
         if (parsed) out.push(parsed);
       }
       const next = (r.response_metadata as { next_cursor?: string } | undefined)?.next_cursor;
@@ -397,6 +428,14 @@ const slackPort: MessagingPort = {
   },
 };
 
+// conversations.history 的条目里**没有** channel_type —— 补齐它，否则私聊历史会被当成群消息，
+// 撞上群入口闸「没人 @ 我」被丢掉：离线期间私聊过来的需求就此静默消失，而那正是补拉存在的唯一理由。
+// 频道 id 前缀是 Slack 的公开约定（D=im 私聊，C/G=频道/私有频道，mpim 多人私聊按群处理，本就该要求 @）。
+// 这是 provider 知识，正该留在 provider 里——核心只看得到 provider 无关的 isGroup。
+function channelType(chatId: string): string {
+  return chatId.startsWith('D') ? 'im' : 'channel';
+}
+
 // @ 有两种写法：现代事件里是 <@U123>，历史条目/老客户端里还会出现带显示名的 <@U123|angelo>。
 // 只认前一种的话，群入口会出现「明明 @ 了却没反应」——而入口闸的失败是**静默**的（核心保守忽略、
 // 只留一行 log），没有任何症状指向真正的原因。两种都认，代价是一次 includes。
@@ -423,8 +462,13 @@ async function openModal(payload: Record<string, unknown>): Promise<void> {
     return;
   }
   const spec = pendingModal(ctx) ?? degradedModal(ctx);
-  const r = await slackApi('views.open', { trigger_id: triggerId, view: spec });
-  if (!r.ok) log.warn(`Slack views.open 失败：${r.error}`);
+  // retry:false 是有意的：trigger_id 只活 3 秒，限流退避重试换来的必然是 expired_trigger_id，
+  // 而且会把真正的失败原因盖成一个看不出所以然的错。宁可一次失败、如实报。
+  const r = await slackApi('views.open', { trigger_id: triggerId, view: spec }, { retry: false });
+  if (!r.ok) {
+    const hint = r.error === 'expired_trigger_id' ? '（trigger_id 只有 3 秒——这条路径上不要做任何多余 IO）' : ` — ${explain(validateView(spec))}`;
+    log.warn(`Slack views.open 失败：${r.error}${hint}`);
+  }
 }
 
 // 卡片还挂在 Slack 上、但本进程重启过 → 内存里的模态内容没了。

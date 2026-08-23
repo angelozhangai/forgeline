@@ -17,8 +17,12 @@ export interface InboundHandlers {
 }
 
 // 入站长连接句柄。connect() 建连（首连失败 reject，交 core 决定降级为仅周期 tick）。
+// close() 可选：把这条长连接**关干净**（provider 内部可能同时活着不止一条——计划内换连接会短暂重叠）。
+// 守护进程今天是被信号杀掉的，不走这条路；但 adapter 内部的关闭逻辑必须**有人能够到**，
+// 否则它就是一段永远不会被执行、也永远不会被验证的代码。本地验收回路正是靠它把连接收干净。
 export interface InboundChannel {
   connect(): Promise<void>;
+  close?(): void;
 }
 
 // 入站传输的契约探针结果（provider 无关）：对自家 IM API 跑一发最便宜的只读往返，断言我们依赖的

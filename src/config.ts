@@ -147,6 +147,7 @@ export interface Env {
   SLACK_DM_USER_ID?: string; // 私聊推送目标（你本人的 user id，可直接当 channel 用）
   SLACK_WATCH_CHANNELS?: string; // 逗号分隔的 channel id：开机/重连补拉这些频道的离线消息
   SLACK_WEBHOOK_URL?: string; // 群 webhook 兜底（bot 私聊未送达时的降级）
+  SLACK_API_BASE?: string; // Web API 根地址覆写（缺省 https://slack.com/api）：企业代理 / 本地验收回路用
   NOTIFY_DESKTOP?: string; // '0' 关闭 macOS 本地桌面通知兜底（默认开）
   CLAUDE_CODE_OAUTH_TOKEN?: string;
   [k: string]: string | undefined;
