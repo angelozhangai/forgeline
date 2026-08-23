@@ -462,22 +462,22 @@ const ask = (id: string, q: string) => ({ id, question: q, options: ['a', 'b'], 
 test('composeHumanAnswer：按位置 H{n} 映射所选选项 + 补充说明', () => {
   const asks = [ask('H1', '退款去向？'), ask('H2', '接受风险？')];
   const out = actions.composeHumanAnswer(asks, { ask_H1: '退到余额', ask_H2: '接受', notes: '开发期加幂等单测' });
-  assert.match(out, /H1（退款去向？）：退到余额/);
-  assert.match(out, /H2（接受风险？）：接受/);
-  assert.match(out, /补充：开发期加幂等单测/);
+  assert.match(out, /H1 \(退款去向？\): 退到余额/);
+  assert.match(out, /H2 \(接受风险？\): 接受/);
+  assert.match(out, /Notes: 开发期加幂等单测/);
 });
 
 test('composeHumanAnswer：选「其他」或未选 → 跳过该项，靠补充说明', () => {
   const asks = [ask('H1', 'Q1'), ask('H2', 'Q2')];
   const out = actions.composeHumanAnswer(asks, { ask_H1: '__other__', notes: 'H1 走特殊处理' });
-  assert.doesNotMatch(out, /H1（/); // 选了「其他」→ 不当作选项答复
+  assert.doesNotMatch(out, /H1 \(/); // 选了「其他」→ 不当作选项答复（答复格式已英化，见 envelopes.composeDecisionAnswer）
   assert.doesNotMatch(out, /H2/); // 没选 → 跳过
-  assert.match(out, /补充：H1 走特殊处理/);
+  assert.match(out, /Notes: H1 走特殊处理/);
 });
 
 test('composeHumanAnswer：缺 id 时按序 H{n}；全空 → 空串（交 submit 兜「再修一轮」）', () => {
   const asks = [{ id: '', question: 'Q1', options: ['x'], context: '', severity: 'med' }];
-  assert.match(actions.composeHumanAnswer(asks, { ask_H1: 'x' }), /H1（Q1）：x/);
+  assert.match(actions.composeHumanAnswer(asks, { ask_H1: 'x' }), /H1 \(Q1\): x/);
   assert.equal(actions.composeHumanAnswer(asks, {}), '');
 });
 
@@ -488,6 +488,6 @@ test('composeHumanAnswer：LLM 给重复 id 也不串题（按位置 H1/H2 各�
     { id: 'H1', question: '是否接受风险？', options: ['接受', '不接受'], context: '', severity: 'med' },
   ];
   const out = actions.composeHumanAnswer(asks, { ask_H1: '余额', ask_H2: '接受' });
-  assert.match(out, /H1（退款去向？）：余额/);
-  assert.match(out, /H2（是否接受风险？）：接受/); // 第二题用 H2，不被第一题的值串掉
+  assert.match(out, /H1 \(退款去向？\): 余额/);
+  assert.match(out, /H2 \(是否接受风险？\): 接受/); // 第二题用 H2，不被第一题的值串掉
 });
