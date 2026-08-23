@@ -1,10 +1,14 @@
-// 文档源——**纯文本**（兜底源）：需求正文就是那条 IM 消息本身，没有可回源的远端文档。
+// Document source — **plain text** (the fallback source): the requirement body is the IM message itself,
+// with no remote document to go back to.
 //
-// 存在的理由：接 Slack 不该先欠一个 Notion/Google Docs adapter。人在群里 @ 机器人写一段需求，
-// 这段话本身就够立项——这是最低配、零文档服务依赖的入口。
+// Why it exists: adopting Slack should not first require a Notion or Google Docs adapter. Someone @s the bot
+// in a channel and writes a paragraph of requirement, and that paragraph is enough to open the work — this is
+// the lowest-configuration entry point, with no dependency on a document service at all.
 //
-// **默认关**。开它等于把「@机器人 + 一段话」变成一条会真的跑闸A（花钱）的需求，对既有飞书部署
-// 是行为变化：今天一条没链接的 @ 消息只会被忽略。所以要显式在 runtime.yaml 打开，绝不默认生效。
+// **Off by default.** Turning it on makes "@bot + a paragraph" into a requirement that really runs Gate A,
+// which costs money, and for an existing Feishu deployment that is a behaviour change: today an @ message
+// with no link is simply ignored. So it has to be switched on explicitly in runtime.yaml and never takes
+// effect by default.
 import { createHash } from 'node:crypto';
 import { loadConfig } from '../config.ts';
 import { log } from '../util/log.ts';
@@ -12,62 +16,99 @@ import type { DocClaimInput, DocRef, DocReadResult, DocSource } from './port.ts'
 
 export const PLAINTEXT_SOURCE = 'plaintext';
 
-// 实质性下限：归一后的**非空白字符数**。低于此不认领。
-// 这道闸只为挡「好的/收到，谢谢/ok thanks」这类寒暄——人已经特意 @ 了机器人（群消息入口闸先过一道），
-// 意图本身是明确的，所以不必再猜语义，长度是这里唯一站得住的信号。
-// 取 20：中文一句真需求（「把退款按钮挪到订单详情页顶部并加二次确认」= 21 字）过得去，寒暄过不去。
-// 代价是**假阴性**——极简短的真需求会被忽略；那是可接受的一侧：漏了人再写长点，而误收要花闸A 的钱。
-export const MIN_SUBSTANCE_CHARS = 20;
+// The substance floor. This gate exists only to block pleasantries ("ok, thanks", "got it"). The person has
+// already gone out of their way to @ the bot (the group-message gate is upstream), so their intent is not in
+// doubt and there is no need to guess at semantics — length is the only signal that holds up here.
+//
+// It is measured in **weight**, not raw characters, because a character means very different things across
+// scripts and a requirement can arrive in any language (source is English, input is not). One CJK character
+// carries roughly what an English word does, so the same requirement runs to about 25 characters written in
+// Chinese and about 95 in English. A single character count cannot serve both: the original floor of 20
+// characters was calibrated for Chinese, where a real requirement clears it — but in English 20
+// non-whitespace characters is "Sounds good, thank you!", so every pleasantry got through. Raising that
+// count to suit English would instead reject real requirements in Chinese. Weighting the word-like scripts
+// at CJK_WEIGHT is what lets one threshold hold either way.
+//
+// Calibration (see the fixtures in test/docs-plaintext.test.ts, which pin both bands): the longest
+// pleasantry measured scores 34, and the tersest real one-line requirement scores 38 — in either script. 35
+// sits in that gap with margin on both sides. Re-derive it the same way if the floor ever moves.
+//
+// Where the bands do overlap the cost is a **false negative** — an extremely terse real requirement is
+// ignored. That is the acceptable side of the trade: someone who is missed can write a little more, whereas
+// a false positive spends real money on a Gate A run.
+export const CJK_WEIGHT = 3;
+export const MIN_SUBSTANCE_WEIGHT = 35; // about 12 CJK characters, or about 7 English words
 
-// IM 的 @ 标记。这是**唯一**一处 IM 标记形状出现在 adapter 之外，理由是必须的：
-// 这些占位符会随「@了谁」变化，留在正文里会让同一段话因 @ 的人不同而算出不同 token（去重直接失效）。
-// 认的是**标记形状**、不是任何 provider 的 API；再冒出第三种形态就加在这里。
+// The characters that carry roughly a word each rather than roughly a letter: CJK ideographs (including
+// extension A and the compatibility block), kana, and hangul. Written as escapes rather than as literal
+// characters, the same rule the guard holds itself to (see test/english-only.test.ts).
+const WORDLIKE_RE = /[\u3040-\u30ff\u3400-\u4dbf\u4e00-\u9fff\uac00-\ud7af\uf900-\ufaff]/;
+
+// The IM @ markers. This is the **only** place an IM marker shape appears outside an adapter, and it has to
+// be: these placeholders change with *who* was mentioned, so leaving them in the body would make the same
+// paragraph hash differently depending on who was @'d, and deduplication would stop working outright.
+// What it recognises is the **marker shape**, not any provider's API; a third shape gets added here.
 const MENTION_PATTERNS: RegExp[] = [
-  /@_user_\d+/g, // 飞书：正文里的 @ 占位符
-  /<@[A-Z0-9]+>/g, // Slack：<@U012ABC>
-  /<![a-z]+>/g, // Slack：<!here> / <!channel>
+  /@_user_\d+/g, // Feishu: the @ placeholder inside a message body
+  /<@[A-Z0-9]+>/g, // Slack: <@U012ABC>
+  /<![a-z]+>/g, // Slack: <!here> / <!channel>
 ];
 
-// 归一：剥 @ 标记 → 折叠所有空白为单空格 → trim。
-// 折叠空白是有意的：同一段需求换行方式不同（复制粘贴/手机端）不该算成两份需求。
+// Normalise: strip the @ markers -> collapse all whitespace to a single space -> trim.
+// Collapsing whitespace is deliberate: the same requirement wrapped differently (a copy-paste, a phone
+// keyboard) must not count as two separate requirements.
 export function normalizePlaintext(text: string): string {
   let s = text ?? '';
   for (const re of MENTION_PATTERNS) s = s.replace(re, ' ');
   return s.replace(/\s+/g, ' ').trim();
 }
 
-// 内容寻址：归一正文的 sha256（取前 32 hex）。没有文档身份可言，内容就是身份——
-// 于是「原样再贴一遍」命中去重，「改了字再贴」诚实地算作一条新需求（本来也没有版本可追）。
+// Content addressing: the sha256 of the normalised body (the first 32 hex characters). There is no document
+// identity to speak of, so the content *is* the identity — pasting the same text again hits deduplication,
+// and pasting it with a word changed honestly counts as a new requirement (there was never a version history
+// to follow anyway).
 export function contentToken(normalized: string): string {
   return createHash('sha256').update(normalized, 'utf8').digest('hex').slice(0, 32);
 }
 
-export function hasSubstance(normalized: string): boolean {
-  return normalized.replace(/\s/g, '').length >= MIN_SUBSTANCE_CHARS;
+// The weighted length of the normalised body, ignoring whitespace.
+export function substanceWeight(normalized: string): number {
+  let weight = 0;
+  for (const ch of normalized.replace(/\s/g, '')) weight += WORDLIKE_RE.test(ch) ? CJK_WEIGHT : 1;
+  return weight;
 }
 
-// 是否启用（runtime.yaml `doc_sources.plaintext.enabled`，默认 false）。
-// 读 config 而不是 env：这是「这套部署把不把一段话当需求」的产品决策，该和其它花钱开关放在一起。
+export function hasSubstance(normalized: string): boolean {
+  return substanceWeight(normalized) >= MIN_SUBSTANCE_WEIGHT;
+}
+
+// Whether it is enabled (runtime.yaml `doc_sources.plaintext.enabled`, false by default).
+// It reads config rather than an env var: this is the product decision of "does this deployment treat a
+// paragraph as a requirement", and it belongs alongside the other switches that cost money.
 function enabled(): boolean {
   try {
     return loadConfig().runtime.doc_sources?.plaintext?.enabled === true;
   } catch {
-    return false; // 配置读不出来时保守当关（绝不因为配置坏了反而多花钱）
+    return false; // if the config cannot be read, be conservative and treat it as off (a broken config must never cost more money)
   }
 }
 
 export const plaintextDocs: DocSource = {
   id: PLAINTEXT_SOURCE,
-  fallback: true, // 只有没人认领时才轮到；且 resolveClaims 最多取一条
+  fallback: true, // its turn comes only when nobody else claims; and resolveClaims takes at most one
 
   claim(input: DocClaimInput): DocRef[] {
     if (!enabled()) return [];
-    // 只看正文：searchTexts 是 adapter 挖出来的**序列化事件**兜底块，把整坨 JSON 当需求正文是灾难。
+    // The body only: searchTexts is the adapter's fallback block of **serialised event** text, and treating
+    // that lump of JSON as a requirement body would be a disaster.
     const norm = normalizePlaintext(input.text);
     if (!norm) return [];
     if (!hasSubstance(norm)) {
-      // 不静默：让人能从日志看出「我们看见了，判它太短」，而不是什么都没发生。
-      log.info(`plaintext：正文归一后不足 ${MIN_SUBSTANCE_CHARS} 字，不当作需求（"${norm.slice(0, 40)}"）`);
+      // Not silent: someone reading the log should see "we saw it, and judged it too short" rather than
+      // nothing happening at all.
+      log.info(
+        `plaintext: the normalised body scores ${substanceWeight(norm)}, below the substance floor of ${MIN_SUBSTANCE_WEIGHT}; not treating it as a requirement ("${norm.slice(0, 40)}")`,
+      );
       return [];
     }
     return [{ source: PLAINTEXT_SOURCE, token: contentToken(norm), raw: norm }];
@@ -77,8 +118,9 @@ export const plaintextDocs: DocSource = {
     if (!enabled()) return null;
     const s = (urlOrToken ?? '').trim();
     if (!s) return null;
-    // 链接一律不收。没有任何主源认得的链接，八成是**我们读不了的**文档服务——
-    // 把那串 URL 本身当成需求正文存下来，比直说「认不出」糟糕得多。
+    // Links are never accepted. A link no primary source recognises is most likely a document service **we
+    // cannot read** — storing that URL itself as the requirement body would be far worse than saying plainly
+    // that it is unrecognised.
     if (/^https?:\/\//i.test(s)) return null;
     const norm = normalizePlaintext(s);
     if (!norm || !hasSubstance(norm)) return null;
@@ -86,15 +128,18 @@ export const plaintextDocs: DocSource = {
   },
 
   async read(ref: DocRef): Promise<DocReadResult> {
-    // raw 只在 claim() → read() 这一趟里存在（它不落库）。拿一个**存量** plaintext ref 来重读，
-    // 这里如实说读不了，而不是返回空正文装作读到了——上游据此停泊，人才看得见发生了什么。
+    // `raw` exists only for the one trip from claim() to read() — it is not persisted. Asked to re-read a
+    // **stored** plaintext ref, this says truthfully that it cannot, rather than returning an empty body and
+    // pretending it read something: upstream parks on that, so a human can see what happened.
     if (typeof ref.raw === 'string' && ref.raw.length > 0) return { ok: true, text: ref.raw };
     return {
       ok: false,
       text: '',
-      error: 'plaintext 源不可回源：正文只在消息进来的那一趟里存在（需求正文已在建档时落到 prd.txt，此处无法重读）',
+      error:
+        'the plaintext source cannot be re-read: the body exists only for the trip the message came in on (the requirement body was written to prd.txt when the session was created, and cannot be re-read here)',
     };
   },
 
-  // 没有 comment：一段 IM 文本无处回写批注。这是**能力缺口**，核心静默跳过（见 docs/index.ts commentDoc）。
+  // No comment: there is nowhere to write an annotation back to on a piece of IM text. This is a **capability
+  // gap**, and the core skips it silently (see commentDoc in docs/index.ts).
 };
