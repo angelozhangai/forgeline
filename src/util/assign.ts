@@ -1,35 +1,38 @@
-// 自动指派推荐：least-loaded + WIP limit（纯函数，便于单测）。
-// 选「投影负载最低且未超 WIP 上限」的人：投影 = 当前在研负载 + 本需求规模点数 → 最小化削峰（近似 makespan 最小）；
-// WIP 上限防单人并发线头过多（上下文切换成本）。全员超上限 → 回退全池（不阻断，仅标注，交人裁量）。
+// The automatic-assignment recommendation: least-loaded plus a WIP limit (a pure function, easy to unit-test).
+// It picks the person with the lowest projected load who is still under their WIP limit. Projected = their
+// current in-progress load + this requirement's size points, which minimises the peak (an approximation of
+// minimising makespan); the WIP limit stops one person holding too many concurrent threads (the cost is
+// context switching). If everyone is over the limit it falls back to the whole pool — never blocking, only
+// flagging it, and leaving the judgement to a human.
 import { sizePoints, type Size } from './sizing.ts';
 import type { AssignmentConfig } from '../config.ts';
 
 export interface LoadRow {
-  code: string; // 短码
-  wip: number; // 在研需求条数
-  loadPoints: number; // 在研加权点数
-  ok?: boolean; // 负载探测是否成功（失败=未知；仍参与，但调用方可在卡上标注）
+  code: string; // the short code
+  wip: number; // how many requirements are in progress
+  loadPoints: number; // the weighted points in progress
+  ok?: boolean; // whether the load probe succeeded (a failure means unknown; they still appear, but the caller can flag it on the card)
 }
 
 export interface RecoRow extends LoadRow {
-  projected: number; // loadPoints + 本需求点数
+  projected: number; // loadPoints + this requirement's points
   wipLimit: number;
-  eligible: boolean; // 未超 WIP 上限
+  eligible: boolean; // still under the WIP limit
 }
 
 export interface Recommendation {
-  pick: string | null; // 推荐短码（无可定候选→null，强制人工）
-  allOverWip: boolean; // 已知负载者全超 WIP → 回退「已知池」择优
-  probeIncomplete: boolean; // 有成员负载探测失败/未知 → 已从自动选里排除（绝不当 0 负载）
-  points: number; // 本需求规模点数
-  table: RecoRow[]; // 各候选展开（供卡片/CLI 展示理由）
+  pick: string | null; // the recommended short code (null when there is no determinable candidate, which forces a human decision)
+  allOverWip: boolean; // everyone with a known load is over their WIP limit -> fall back to picking the best of the known pool
+  probeIncomplete: boolean; // some member's load probe failed or is unknown -> they are excluded from the automatic pick (never treated as zero load)
+  points: number; // this requirement's size points
+  table: RecoRow[]; // every candidate laid out (so the card and the CLI can show the reasoning)
 }
 
 export function wipLimitOf(cfg: AssignmentConfig, code: string): number {
   return cfg.wip_limit[code] ?? cfg.wip_limit.default;
 }
 
-// 短码归一到池内规范写法（大小写不敏感）；不在池 → null。
+// Normalise a short code to the pool's canonical spelling (case-insensitive); not in the pool -> null.
 export function inPool(cfg: AssignmentConfig, raw: string): string | null {
   const up = raw.trim().toUpperCase();
   return cfg.pool.find((c) => c.toUpperCase() === up) ?? null;
@@ -39,13 +42,16 @@ export function recommend(size: Size | null, loads: LoadRow[], cfg: AssignmentCo
   const points = sizePoints(size);
   const byCode = new Map(loads.map((l) => [l.code, l]));
   const order = cfg.pool;
-  // 缺行=池成员未被探测到 → 负载未知（ok:false），绝不当 0 负载。
+  // A missing row means a pool member was never probed -> their load is unknown (ok:false), and must never be
+  // treated as zero load.
   const table: RecoRow[] = order.map((code) => {
     const l = byCode.get(code) ?? { code, wip: 0, loadPoints: 0, ok: false };
     const wipLimit = wipLimitOf(cfg, code);
     return { ...l, code, projected: l.loadPoints + points, wipLimit, eligible: l.wip < wipLimit };
   });
-  // 只在「负载已知」者里自动选：探测失败/未知（ok===false）排除——否则瞬时 GitHub 故障会把人误判成 0 负载抢着指派。
+  // Pick automatically only among those whose load is known: a failed or unknown probe (ok === false) is
+  // excluded — otherwise a momentary GitHub outage would make someone look like zero load and win every
+  // assignment.
   const known = table.filter((r) => r.ok !== false);
   const probeIncomplete = known.length < table.length;
   const underCap = known.filter((r) => r.eligible);
@@ -53,10 +59,10 @@ export function recommend(size: Size | null, loads: LoadRow[], cfg: AssignmentCo
   let allOverWip = false;
   if (underCap.length) candidates = underCap;
   else if (known.length) {
-    candidates = known; // 已知者全超 WIP → 回退已知池择优（仍标注）
+    candidates = known; // everyone known is over their WIP limit -> pick the best of the known pool anyway (still flagged)
     allOverWip = true;
-  } else candidates = []; // 全员负载未知（全探测失败）→ 无可定候选，pick=null 强制人工
-  // argmin：投影负载 → 在研条数 → 当前负载 → pool 顺序（稳定，决定性）
+  } else candidates = []; // nobody's load is known (every probe failed) -> no determinable candidate, pick=null, a human decides
+  // argmin: projected load -> requirements in progress -> current load -> pool order (stable and deterministic)
   const pick =
     [...candidates].sort(
       (a, b) =>

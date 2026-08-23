@@ -1,14 +1,20 @@
-// 每人「当前在研负载」：自动指派的输入。⚠️ 负载口径镜像主仓 tools/weekly-load.sh（规模×跨栈），
-// 改口径先改主仓真源再同步这里——保持「需求 × 规模(S1/M3/L8/XL20) × 跨栈(1/1.3/1.5)」一致。
-// 与 weekly-load 的区别：这里只算「当前在研」（rollup 状态 ∈ in_progress_statuses），不含已上线，
-// 也不乘质量因子——衡量的是「手上正推进的活」这一容量，不是回顾性产出。
+// Each person's "work in progress right now" — the input to automatic assignment. ⚠️ The load formula
+// mirrors the main repo's tools/weekly-load.sh (size x cross-repo breadth); to change the formula, change
+// the source of truth there first and then sync it here, keeping "requirement x size (S1/M3/L8/XL20) x
+// cross-repo (1/1.3/1.5)" identical.
+// Where it differs from weekly-load: this only counts what is **currently in progress** (rollup state ∈
+// in_progress_statuses), excluding what has shipped, and it does not apply the quality factor — it measures
+// the capacity taken by "what is on their plate right now", not retrospective output.
 import { run } from './proc.ts';
 import { normSize, sizePoints, type Size } from './sizing.ts';
 import { resolveLogin, type Config } from '../config.ts';
 
-// 仓 slug → 字母（C/U/A/E 计入跨栈，对齐主仓 new-req.sh 短码；example-project=P 是 Epic 本体不算代码仓）。
-// 默认项目（demo）的硬编码口径，作为 scoreLoad 的**缺省** repoCode：直调 scoreLoad（无项目上下文的纯函数测试）仍用它。
-// 生产路径（probeLoad）按目标项目 repoMap+umbrella 反推 repoCode 注入 → 非 demo 项目也能算对字母（见 buildRepoCode）。
+// Repo slug -> letter (C/U/A/E count towards cross-repo breadth, matching the short codes in the main repo's
+// new-req.sh; example-project=P is the Epic itself and is not a code repo).
+// This is the default project's (demo's) hardcoded set, used as scoreLoad's **default** repoCode: a direct
+// call to scoreLoad (a pure-function test with no project context) still gets it.
+// The production path (probeLoad) derives repoCode from the target project's repoMap + umbrella and injects
+// it, so a non-demo project also gets its letters right (see buildRepoCode).
 const REPO_CODE: Record<string, string> = {
   demo: 'C',
   'example-web': 'U',
@@ -17,19 +23,23 @@ const REPO_CODE: Record<string, string> = {
   'example-project': 'P',
 };
 
-// 由目标项目仓身份反推「GitHub slug → 字母」：字母(C/U/A/E)→本地 key(repoMap)→slug(repoSlugs)，伞仓→P。
-// 伞仓只在「不与代码仓 slug 撞」时才标 P（monorepo 下伞仓即代码仓 → 保留其代码字母，不被 P 抹掉）。
-// demo 反推结果与上面 REPO_CODE 逐键相等（行为不变）；非 demo 项目据自身配置得对的字母。
+// Derive "GitHub slug -> letter" from the target project's repo identity: letter (C/U/A/E) -> local key
+// (repoMap) -> slug (repoSlugs), with the umbrella repo mapping to P.
+// The umbrella only gets P when its slug does not collide with a code repo's (under a monorepo the umbrella
+// *is* the code repo, so it keeps its code letter rather than being wiped out by P).
+// For demo this derives key-for-key the same result as REPO_CODE above (behaviour is unchanged); a non-demo
+// project gets the right letters from its own configuration.
 export function buildRepoCode(repoMap: Record<string, string>, umbrella: string, repoSlugs: Record<string, string>): Record<string, string> {
   const slug = (key: string): string => repoSlugs[key] ?? key;
   const out: Record<string, string> = {};
   for (const [letter, localKey] of Object.entries(repoMap)) out[slug(localKey)] = letter;
   const umbSlug = slug(umbrella);
-  if (!(umbSlug in out)) out[umbSlug] = 'P'; // 伞仓(非代码仓) → Epic 本体标记，不计跨栈
+  if (!(umbSlug in out)) out[umbSlug] = 'P'; // the umbrella (not a code repo) -> marks the Epic itself, not counted as cross-repo
   return out;
 }
 
-// 跨栈倍率：单仓×1.0 / 两仓×1.3 / 三仓×1.5（协调/契约成本，同 weekly-load）。
+// The cross-repo multiplier: one repo x1.0 / two x1.3 / three x1.5 (coordination and contract cost, same as
+// weekly-load).
 export function crossStack(span: number): number {
   return span >= 3 ? 1.5 : span === 2 ? 1.3 : 1.0;
 }
@@ -37,22 +47,22 @@ export function crossStack(span: number): number {
 const SIZE_RANK: Record<Size, number> = { S: 1, M: 2, L: 3, XL: 4 };
 
 export interface LoadIssue {
-  repo: string; // 仓 dir 名（demo / example-web / example-admin / example-project）
+  repo: string; // the repo's directory name (demo / example-web / example-admin / example-project)
   number: number;
-  labels: string[]; // GitHub label 名（status:* / epic:* / size:*）
+  labels: string[]; // GitHub label names (status:* / epic:* / size:*)
 }
 
 export interface LoadItem {
-  key: string; // epic:<slug>（跨仓需求收成一条）或 <C|U|A>#<n>（单仓）
-  size: Size; // 子 issue 最高档（无→缺省 M）
-  span: number; // 跨代码仓数（≥1）
-  status: number; // rollup（最小/最不成熟 status 序；0=无）
-  points: number; // sizePoints × crossStack
+  key: string; // epic:<slug> (a cross-repo requirement collapses into one) or <C|U|A>#<n> (single repo)
+  size: Size; // the highest tier among the sub-issues (none -> defaults to M)
+  span: number; // how many code repos it spans (>= 1)
+  status: number; // the rollup (the lowest, least mature status ordinal; 0 = none)
+  points: number; // sizePoints x crossStack
 }
 
 export interface PersonLoad {
-  wip: number; // 在研需求条数
-  loadPoints: number; // 在研加权点数
+  wip: number; // how many requirements are in progress
+  loadPoints: number; // the weighted points in progress
   items: LoadItem[];
 }
 
@@ -60,7 +70,7 @@ function parseLabel(labels: string[], prefix: string): string | null {
   const hit = labels.find((l) => l.startsWith(prefix));
   return hit ? hit.slice(prefix.length) : null;
 }
-// status 标签形如 "4-开发中" → 4；无/坏 → 0。
+// A status label looks like "4-in-development" -> 4; missing or malformed -> 0.
 function statusOrd(labels: string[]): number {
   const st = parseLabel(labels, 'status:');
   if (!st) return 0;
@@ -68,21 +78,24 @@ function statusOrd(labels: string[]): number {
   return Number.isFinite(n) ? n : 0;
 }
 
-// 纯函数：把某人名下 issue 聚合成需求并算在研负载。便于单测（喂 label 数组即可）。
-// repoCode：仓 slug → 字母（缺省回退默认项目 REPO_CODE）；生产由 probeLoad 按项目反推注入。
+// A pure function: aggregate one person's issues into requirements and compute their in-progress load. Easy
+// to unit-test, since it only needs an array of labels.
+// repoCode: repo slug -> letter (defaulting back to the default project's REPO_CODE); in production
+// probeLoad derives it from the project and injects it.
 export function scoreLoad(issues: LoadIssue[], opts: { inProgressStatuses: number[]; repoCode?: Record<string, string> }): PersonLoad {
   const repoCode = opts.repoCode ?? REPO_CODE;
   interface Agg {
     repos: Set<string>;
     size: Size | null;
-    codeStatus: number; // 代码子仓(C/U/A) rollup = min(子状态)；DRI 恒在每个子，故这些会出现在本人探测里
-    otherStatus: number; // P Epic 本体/未知仓的 status（仅纯 P 需求兜底用）
+    codeStatus: number; // the code sub-repos' (C/U/A) rollup = min(sub-statuses); the DRI is always on every sub-issue, so these turn up in their own probe
+    otherStatus: number; // the status of the P Epic itself, or of an unknown repo (a fallback used only for a pure-P requirement)
   }
   const aggs = new Map<string, Agg>();
   for (const iss of issues) {
     const epic = parseLabel(iss.labels, 'epic:');
     const code = repoCode[iss.repo] ?? '?';
-    // epic:<slug> 把跨仓子 issue 收成 1 条需求（绝不重复计数）；单仓 issue 各算 1 条。
+    // epic:<slug> collapses the cross-repo sub-issues into one requirement (never double-counted); a
+    // single-repo issue counts as one on its own.
     const key = epic ? `epic:${epic}` : `${code}#${iss.number}`;
     let a = aggs.get(key);
     if (!a) {
@@ -92,10 +105,11 @@ export function scoreLoad(issues: LoadIssue[], opts: { inProgressStatuses: numbe
     const isCode = code !== 'P' && code !== '?';
     if (isCode) a.repos.add(code);
     const sz = normSize(parseLabel(iss.labels, 'size:') ?? '');
-    if (sz && (!a.size || SIZE_RANK[sz] > SIZE_RANK[a.size])) a.size = sz; // 取最高档
+    if (sz && (!a.size || SIZE_RANK[sz] > SIZE_RANK[a.size])) a.size = sz; // take the highest tier
     const ord = statusOrd(iss.labels);
     if (ord > 0) {
-      // rollup = 最落后(最小)子。分流：代码子仓单独算 codeStatus，P Epic 本体只入 otherStatus。
+      // The rollup is the furthest-behind (lowest) sub-issue. They are kept apart: the code sub-repos give
+      // codeStatus, and the P Epic itself only ever feeds otherStatus.
       if (isCode) {
         if (a.codeStatus === 0 || ord < a.codeStatus) a.codeStatus = ord;
       } else if (a.otherStatus === 0 || ord < a.otherStatus) a.otherStatus = ord;
@@ -104,12 +118,13 @@ export function scoreLoad(issues: LoadIssue[], opts: { inProgressStatuses: numbe
   const inProg = new Set(opts.inProgressStatuses);
   const items: LoadItem[] = [];
   for (const [key, a] of aggs) {
-    // 有代码子仓 → 按子仓 rollup 判在研（P Epic 的 rollup 标签常滞后于 start-issue，绝不用它把活跃跨仓需求误判成空闲）；
-    // 纯 P 需求（暂无代码子）→ 用 P 自身状态。
+    // If there are code sub-repos, judge "in progress" by their rollup — the P Epic's rollup label often lags
+    // behind start-issue, and it must never make an active cross-repo requirement look idle.
+    // A pure-P requirement (no code sub-issues yet) uses P's own status.
     const status = a.codeStatus > 0 ? a.codeStatus : a.otherStatus;
-    if (!inProg.has(status)) continue; // 只算「当前在研」（含无 status 的被排除）
-    const span = Math.max(1, a.repos.size); // 仅挂 Epic(P)→span 1
-    const size = a.size ?? 'M'; // 无 size 缺省 M（同 weekly-load）
+    if (!inProg.has(status)) continue; // count only what is currently in progress (which excludes anything with no status)
+    const span = Math.max(1, a.repos.size); // attached only to the Epic (P) -> span 1
+    const size = a.size ?? 'M'; // no size -> default M (same as weekly-load)
     const points = sizePoints(size) * crossStack(span);
     items.push({ key, size, span, status, points });
   }
@@ -118,12 +133,13 @@ export function scoreLoad(issues: LoadIssue[], opts: { inProgressStatuses: numbe
 }
 
 export interface PersonLoadResult extends PersonLoad {
-  code: string; // 短码
+  code: string; // the short code
   login: string | null;
-  ok: boolean; // gh 探测是否成功（失败 → 该人负载未知，算法据此知情；绝不静默当 0）
+  ok: boolean; // whether the gh probe succeeded (on failure this person's load is unknown and the algorithm knows it; never silently treated as 0)
 }
 
-// 拉某人名下各仓 open issue（薄 IO）。失败的仓记 ok=false，不静默丢。
+// Pull one person's open issues from each repo (thin IO). A repo that fails is recorded as ok=false rather
+// than silently dropped.
 async function fetchPersonIssues(
   login: string,
   repos: string[],
@@ -154,23 +170,28 @@ async function fetchPersonIssues(
   return { ok, issues };
 }
 
-// 探测整个人选池的当前在研负载（每人每仓一发 gh，与 weekly-load 同量级）。
-// proj 由调用方按 session 的项目传（projectForSession(s)）——扫哪些仓、跨栈字母口径都不再写死 demo。
-// 结构化子集（非 import ProjectFull）：避免 load.ts 运行时依赖 projects.ts（防 mock.module 导入期脆裂）。
+// Probe the current in-progress load of the whole candidate pool (one gh call per person per repo, the same
+// order of magnitude as weekly-load).
+// The caller passes `proj` for the session's project (projectForSession(s)) — which repos to scan and which
+// cross-repo letters to use are no longer hardcoded to demo.
+// It takes a structural subset rather than importing ProjectFull, so that load.ts has no runtime dependency
+// on projects.ts (which would make it fragile at import time under mock.module).
 export interface ProbeRepoIdentity {
-  owner: string; // 该项目 GitHub org
-  repos: string[]; // 本地 repo key/path（monorepo 为 '.'）
-  umbrella: string; // 本地伞仓 key
-  repoSlugs: Record<string, string>; // 本地 key → GitHub slug（monorepo '.' → your-monorepo）
-  repoMap: Record<string, string>; // 字母(C/U/A/E) → 本地 key；反推跨栈字母口径用
+  owner: string; // this project's GitHub org
+  repos: string[]; // the local repo keys/paths ('.' for a monorepo)
+  umbrella: string; // the local umbrella repo key
+  repoSlugs: Record<string, string>; // local key -> GitHub slug (a monorepo's '.' -> your-monorepo)
+  repoMap: Record<string, string>; // letter (C/U/A/E) -> local key; used to derive the cross-repo letters
 }
 export async function probeLoad(cfg: Config, proj: ProbeRepoIdentity): Promise<PersonLoadResult[]> {
   const { owner, repos: projRepos, umbrella, repoSlugs, repoMap } = proj;
-  // 本地 repo key/path → GitHub slug（monorepo '.' → your-monorepo），再拼 gh -R owner/<slug>——绝不把本地路径 '.' 当仓名。
+  // Local repo key/path -> GitHub slug (a monorepo's '.' -> your-monorepo) before building gh -R owner/<slug>
+  // — the local path '.' must never be used as a repo name.
   const slug = (key: string): string => repoSlugs[key] ?? key;
   const keys = umbrella && !projRepos.includes(umbrella) ? [...projRepos, umbrella] : [...projRepos];
   const repos = keys.map(slug);
-  // 跨栈字母口径按本项目反推（slug→字母）：demo 得 C/U/A/E/P（同 REPO_CODE），非 demo 据自身 repoMap。
+  // Derive the cross-repo letters for this project (slug -> letter): demo yields C/U/A/E/P (the same as
+  // REPO_CODE), and a non-demo project follows its own repoMap.
   const repoCode = buildRepoCode(repoMap, umbrella, repoSlugs);
   const out: PersonLoadResult[] = [];
   for (const code of cfg.assignment.pool) {

@@ -186,7 +186,7 @@ test('群状态卡 待产品确认：@PM + 确认表单 + 人话状态，不泄�
   const c = json(buildStatusCard(sess({ state: 'AWAITING_PM_CONFIRM', poster_id: 'ou_pm', gate_a_output_path: null })));
   assert.match(c, /<at id=ou_pm>/); // 群里 @ 发 PRD 的产品
   assert.match(c, /"action":"confirm_submit"/); // 确认表单在群卡上
-  assert.match(c, /待产品确认/);
+  assert.match(c, /Waiting on product to confirm/);
   assert.doesNotMatch(c, /闸A|闸B|GATE_/);
 });
 
@@ -212,13 +212,13 @@ test('群状态卡 复评轮（第2轮起）：醒目红横幅，跟首轮一眼
 
 test('群状态卡 复评中：人话「依答复复评」、无残留表单按钮', () => {
   const c = json(buildStatusCard(sess({ state: 'GATE_A_REVISION_REQUESTED', gate_a_round: 2 } as never)));
-  assert.match(c, /复评|答复/);
+  assert.match(c, /Reviewing again with your answers/);
   assert.doesNotMatch(c, /"action":"confirm_submit"/);
 });
 
 test('群状态卡 运行态：人话进度、无交互按钮', () => {
   const c = json(buildStatusCard(sess({ state: 'GATE_A_RUNNING' })));
-  assert.match(c, /评审中|对照代码/);
+  assert.match(c, /Reviewing the requirement/);
   assert.doesNotMatch(c, /"behaviors"/);
 });
 
@@ -232,7 +232,7 @@ test('群状态卡：藏成本($)、显示宠物彩蛋(进化树 + 投喂)', () 
   const c = json(buildStatusCard(sess({ state: 'GATE_A_RUNNING' }))); // sess 成本 $3
   assert.doesNotMatch(c, /\$/); // 群里不露金额
   assert.match(c, /进化树/);
-  assert.match(c, /投喂/);
+  assert.match(c, /Fed \d+ bites/);
 });
 
 test('私聊卡 needs_go：保留真实成本($) + 带宠物彩蛋', () => {

@@ -1,5 +1,6 @@
-// SF1 回归：负载探测把**本地 repo key/path**（monorepo '.'）经 repoSlugs 映射成 GitHub slug 再拼 gh -R，
-// 绝不把 '.' 当 GitHub 仓名（否则 your-monorepo 的 auto DRI 探测全失败、GO 被「未指派 DRI」挡）。
+// SF1 regression: the load probe maps the **local repo key/path** (a monorepo's '.') through repoSlugs into a
+// GitHub slug before building gh -R, and must never use '.' as a GitHub repo name (which would fail every
+// auto-DRI probe for your-monorepo and have GO blocked on "no DRI assigned").
 process.env.FORGE_DB = ':memory:';
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
@@ -19,22 +20,22 @@ mock.module('../src/util/proc.ts', {
 });
 
 const { probeLoad } = await import('../src/util/load.ts');
-// biome-ignore lint/suspicious/noExplicitAny: 最小 cfg（probeLoad 只用 assignment.pool/in_progress_statuses + routing.reviewers）
+// biome-ignore lint/suspicious/noExplicitAny: the minimal cfg (probeLoad only reads assignment.pool / in_progress_statuses and routing.reviewers)
 const cfg: any = { routing: { reviewers: { M: 'ming' } }, assignment: { pool: ['M'], in_progress_statuses: [3] } };
 
-test('probeLoad：本地 monorepo key . 经 repoSlugs → gh issue list -R owner/your-monorepo（绝不 owner/.）', async () => {
+test("probeLoad: the local monorepo key . goes through repoSlugs -> gh issue list -R owner/your-monorepo (never owner/.)", async () => {
   calls.length = 0;
   await probeLoad(cfg, { owner: 'your-org', repos: ['.'], umbrella: '.', repoSlugs: { '.': 'your-monorepo' }, repoMap: { C: '.' } });
   const lists = calls.filter((c) => c.bin === 'gh' && c.args[0] === 'issue' && c.args[1] === 'list');
-  assert.ok(lists.length > 0, '应有 gh issue list 调用');
+  assert.ok(lists.length > 0, 'there should be a gh issue list call');
   for (const c of lists) {
     const r = c.args[c.args.indexOf('-R') + 1];
-    assert.equal(r, 'your-org/your-monorepo', `本地 '.' 必映射成 your-monorepo，实得 ${r}`);
+    assert.equal(r, 'your-org/your-monorepo', `the local '.' must map to your-monorepo, but it was ${r}`);
   }
-  assert.ok(!calls.some((c) => c.args.includes('your-org/.')), '绝不出现未映射的 owner/.');
+  assert.ok(!calls.some((c) => c.args.includes('your-org/.')), 'an unmapped owner/. must never appear');
 });
 
-test('probeLoad：无 repoSlugs（demo 仓名即 slug）→ 原样（行为不变）', async () => {
+test('probeLoad: with no repoSlugs (demo\'s repo names are already the slugs) -> passed through as they are (behaviour unchanged)', async () => {
   calls.length = 0;
   await probeLoad(cfg, { owner: 'your-org', repos: ['demo', 'example-web'], umbrella: 'example-project', repoSlugs: {}, repoMap: { C: 'demo', U: 'example-web' } });
   const slugs = calls.filter((c) => c.bin === 'gh' && c.args[1] === 'list').map((c) => c.args[c.args.indexOf('-R') + 1]);
