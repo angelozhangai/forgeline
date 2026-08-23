@@ -1,14 +1,19 @@
-// 集成（收 Codex retry-Blocker）：面板写网关接的是**真** actions.retry（不 mock action），证明面板 retry 真的继承
-// 生产 retry 的权限闸——web_actor 不在对应失败闸名单 → !ok 且**失败态纹丝不动**（绝不被无权点击重新点燃付费闸链/外向写）。
-// 只 mock config（控 web_actor + 名单）与外部边界（projects/notify/writes/load）；真：actions.ts、action-gateway、状态机、sessions。
+// Integration (closing the retry blocker Codex raised): the panel's write gateway is wired to the **real**
+// actions.retry (the action is not mocked), proving the panel's retry really inherits production retry's
+// permission gate — a web_actor not on the relevant failed gate's list gets !ok and the **failed state does
+// not budge** (an unauthorised click must never re-ignite a chain of paid gates or an outward write).
+// Only config (which controls web_actor and the lists) and the external boundaries (projects, notify, writes,
+// load) are mocked; actions.ts, action-gateway, the state machine and sessions are all real.
 process.env.FORGE_DB = ':memory:';
 import { test, mock, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
 
-// 面板署名 actor = runtime.web_actor（缺省 routing.lead）。控它来覆盖「无权 / 有权」两路。
+// The panel's signing actor is runtime.web_actor (defaulting to routing.lead). Controlling it covers both
+// paths: unauthorised and authorised.
 let webActor = 'NOPE';
 const PERMS = { gate_b_allowed: ['M'], go_approvers: ['M'], gate_c_allowed: ['M'], pr_create_approvers: ['M'], merge_ack_allowed: ['M'] };
-// 复刻真 inAllowList 的判定（仅按短码大小写匹配；本测试不涉及 login 映射，故 resolveLogin 返 null）。
+// Reproduces the real inAllowList's judgement (matching the short code case-insensitively; this test does not
+// involve login mapping, so resolveLogin returns null).
 function inAllowList(_cfg: unknown, list: string[], who: string): boolean {
   const up = who.toUpperCase();
   return list.some((c) => c.toUpperCase() === up);
@@ -23,7 +28,8 @@ mock.module('../src/config.ts', {
     inAllowList,
   },
 });
-// 配置分化：panelActor 经 configForProject 取 web_actor；桩回退同一受控配置（与 loadConfig 一致）。
+// Configuration diverges per project: panelActor reads web_actor through configForProject, and the stub falls
+// back to the same controlled config (matching loadConfig).
 mock.module('../src/projects.ts', { namedExports: { projectForSession: () => ({ autonomy: { level: 0, actor: 'M' } }), configForProject: currentCfg, configForSession: currentCfg } });
 mock.module('../src/notify.ts', { namedExports: { notify: async () => {}, syncGroupCard: async () => {} } });
 mock.module('../src/writes.ts', {
@@ -43,15 +49,15 @@ async function mkFailed(id: string, state: string, fields: Record<string, unknow
 
 beforeEach(() => { db().exec('DELETE FROM session; DELETE FROM event_log;'); webActor = 'NOPE'; });
 
-test('面板 retry·真 action：web_actor 不在 gate_c_allowed → !ok，GATE_C_FAILED 态不变 + permission_denied', async () => {
+test("the panel's retry against the real action: a web_actor not in gate_c_allowed -> !ok, GATE_C_FAILED unchanged, and a permission_denied event", async () => {
   await mkFailed('s1', 'GATE_C_FAILED', { error: 'boom', worktree_path: '/tmp/wt' });
   const r = await runPanelAction('retry', 's1');
   assert.equal(r.ok, false);
-  assert.equal((await sessions.get('s1'))!.state, 'GATE_C_FAILED'); // 失败闸未被无权 web_actor 重新点燃
+  assert.equal((await sessions.get('s1'))!.state, 'GATE_C_FAILED'); // the failed gate was not re-ignited by an unauthorised web_actor
   assert.ok((await sessions.events('s1')).some((e) => e.kind === 'permission_denied'));
 });
 
-test('面板 retry·真 action：web_actor 不在 pr_create_approvers → !ok，GATE_D_FAILED 态不变', async () => {
+test("the panel's retry against the real action: a web_actor not in pr_create_approvers -> !ok, GATE_D_FAILED unchanged", async () => {
   await mkFailed('s1', 'GATE_D_FAILED', { error: 'boom', pr_url: 'https://x/pr/1' });
   const r = await runPanelAction('retry', 's1');
   assert.equal(r.ok, false);
@@ -59,10 +65,10 @@ test('面板 retry·真 action：web_actor 不在 pr_create_approvers → !ok，
   assert.ok((await sessions.events('s1')).some((e) => e.kind === 'permission_denied'));
 });
 
-test('面板 retry·真 action：web_actor=M（在名单）→ 真重置 GATE_C_FAILED → GATE_C_LOOP', async () => {
+test("the panel's retry against the real action: web_actor=M (on the list) -> it really resets GATE_C_FAILED to GATE_C_LOOP", async () => {
   webActor = 'M';
   await mkFailed('s1', 'GATE_C_FAILED', { error: 'boom', worktree_path: '/tmp/wt' });
   const r = await runPanelAction('retry', 's1');
   assert.equal(r.ok, true);
-  assert.equal((await sessions.get('s1'))!.state, 'GATE_C_LOOP'); // 有 worktree + 无 pending_input → 续跑实现循环
+  assert.equal((await sessions.get('s1'))!.state, 'GATE_C_LOOP'); // there is a worktree and no pending_input -> it carries on with the implementation loop
 });

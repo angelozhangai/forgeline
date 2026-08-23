@@ -1,8 +1,11 @@
-// 心跳文件：守护(listen)进程周期性写，看门狗/状态页读。原子写(临时文件+rename)避免读到半截。
+// The heartbeat file: the daemon (listen) process writes it periodically, and the watchdog and the status
+// page read it. The write is atomic (a temporary file plus a rename) so nothing reads a half-written file.
 //
-// 为何要独立 liveness：runCycle() 会 await tick()，一个 10 分钟的 gate 会让「上次周期完成」自然变旧，
-// 不能用它判活。而 claude/codex 是 async spawn（不堵 event loop），所以一个每 10s 的快 ping 能稳定
-// 更新——liveness 过期 ⇒ event loop 真卡死/进程已死，这才是看门狗的判活依据。
+// Why liveness is separate: runCycle() awaits tick(), and a gate that takes 10 minutes naturally makes "the
+// last cycle finished" go stale, so it cannot be used to judge liveness. claude and codex are spawned
+// asynchronously (they do not block the event loop), so a quick ping every 10 seconds updates reliably — a
+// stale liveness means the event loop really is wedged or the process is dead, and that is what the watchdog
+// judges on.
 import { writeFileSync, renameSync, readFileSync, existsSync } from 'node:fs';
 import { dirname } from 'node:path';
 import { mkdirSync } from 'node:fs';
@@ -11,15 +14,15 @@ import { HEARTBEAT_PATH } from '../root.ts';
 export interface Heartbeat {
   pid: number;
   port: number;
-  startedAt: number; // 守护启动时刻(毫秒)
-  livenessPingAt: number; // 最近一次 liveness ping（真·判活）
-  lastCycleAt: number | null; // 最近一次 runCycle 完成（业务进度；长 gate 期间会偏旧，仅展示用）
+  startedAt: number; // when the daemon started (milliseconds)
+  livenessPingAt: number; // the most recent liveness ping (the real liveness signal)
+  lastCycleAt: number | null; // when runCycle last finished (business progress; it goes stale during a long gate, and is for display only)
   lastCycleOk: boolean | null;
   cycleCount: number;
-  wsConfigured: boolean; // 入站传输是否已配齐（port.inboundConfigured()；未配=仅周期 tick，长连接 n/a）
+  wsConfigured: boolean; // whether the inbound transport is fully configured (port.inboundConfigured(); unconfigured = the periodic tick only, and the connection is n/a)
   wsConnected: boolean;
   wsLastEventAt: number | null;
-  activeGates: number; // 当前 GATE_*_RUNNING / ADVERSARIAL_LOOP 的 session 数
+  activeGates: number; // how many sessions are currently in GATE_*_RUNNING or ADVERSARIAL_LOOP
 }
 
 let current: Heartbeat | null = null;
@@ -30,10 +33,10 @@ function persist(): void {
   mkdirSync(dir, { recursive: true });
   const tmp = `${HEARTBEAT_PATH}.tmp.${current.pid}`;
   writeFileSync(tmp, JSON.stringify(current), 'utf8');
-  renameSync(tmp, HEARTBEAT_PATH); // rename 在同盘是原子的
+  renameSync(tmp, HEARTBEAT_PATH); // a rename within one filesystem is atomic
 }
 
-// 守护启动时调一次：建立内存心跳并落盘。
+// Called once when the daemon starts: set up the in-memory heartbeat and write it out.
 export function initHeartbeat(opts: { pid: number; port: number; wsConfigured: boolean; now: number }): Heartbeat {
   current = {
     pid: opts.pid,
@@ -52,7 +55,8 @@ export function initHeartbeat(opts: { pid: number; port: number; wsConfigured: b
   return current;
 }
 
-// 快 ping：event loop 活着的证明。activeGates 由调用方算好传入（避免本模块依赖 store）。
+// The quick ping: proof the event loop is alive. The caller works out activeGates and passes it in, so this
+// module does not have to depend on the store.
 export function pingLiveness(now: number, activeGates: number): void {
   if (!current) return;
   current.livenessPingAt = now;
@@ -75,7 +79,8 @@ export function markWs(connected: boolean, now: number | null): void {
   persist();
 }
 
-// 从文件读（看门狗/CLI 等独立进程，或守护内统一口径）。缺失/损坏 → null。
+// Read it from the file (for a separate process such as the watchdog or the CLI, or for one consistent view
+// inside the daemon). Missing or corrupt -> null.
 export function readHeartbeat(): Heartbeat | null {
   try {
     if (!existsSync(HEARTBEAT_PATH)) return null;
@@ -87,7 +92,7 @@ export function readHeartbeat(): Heartbeat | null {
   }
 }
 
-// 测试用：清掉内存态，避免跨用例串味。
+// For tests: clear the in-memory state so it does not bleed between cases.
 export function _resetForTest(): void {
   current = null;
 }

@@ -1,4 +1,5 @@
-// Layer-3 翻转去抖 + 持久化 + contractCheck 聚合，确定性证明（无二进制、不花钱）。
+// Layer 3's flip debouncing, persistence and contractCheck aggregation, proved deterministically (no
+// binaries involved, and it costs nothing).
 process.env.FORGE_DB = ':memory:';
 
 import { test, mock } from 'node:test';
@@ -13,10 +14,10 @@ mock.module('../src/health/alert.ts', {
 const { maybeAlertContractDrift, contractCheck } = await import('../src/health/contract.ts');
 const { getProbe } = await import('../src/store/contract.ts');
 
-const pr = (dep: ProbeResult['dep'], ok: boolean, at = 1000): ProbeResult => ({ dep, available: true, ok, detail: ok ? '完好' : 'drift', raw: ok ? undefined : 'renamed-jsonl…', at });
+const pr = (dep: ProbeResult['dep'], ok: boolean, at = 1000): ProbeResult => ({ dep, available: true, ok, detail: ok ? 'fine' : 'drift', raw: ok ? undefined : 'renamed-jsonl...', at });
 
-// 顺序共享 :memory: 库，按真实时间线推进。
-test('首次漂移 → 告警一次 degraded + 落库 ok=0 + contractCheck degraded', async () => {
+// These share one :memory: database in order, advancing along a real timeline.
+test('the first drift -> one degraded alert, ok=0 persisted, and contractCheck degraded', async () => {
   alerts = [];
   await maybeAlertContractDrift([pr('codex', false, 1000)]);
   assert.equal(alerts.length, 1);
@@ -28,13 +29,13 @@ test('首次漂移 → 告警一次 degraded + 落库 ok=0 + contractCheck degra
   assert.match(c.detail, /codex/);
 });
 
-test('持久漂移 → 不再重复告警（翻转去抖）', async () => {
+test('a persistent drift -> no repeat alert (debounced on the flip)', async () => {
   alerts = [];
   await maybeAlertContractDrift([pr('codex', false, 3000)]);
-  assert.equal(alerts.length, 0, '同一依赖持续漂移不该每日刷屏');
+  assert.equal(alerts.length, 0, 'one dependency drifting persistently should not spam every day');
 });
 
-test('恢复 → 发 recovered 一次 + contractCheck healthy', async () => {
+test('recovery -> one recovered alert, and contractCheck healthy', async () => {
   alerts = [];
   await maybeAlertContractDrift([pr('codex', true, 5000)]);
   assert.equal(alerts.length, 1);
@@ -43,7 +44,7 @@ test('恢复 → 发 recovered 一次 + contractCheck healthy', async () => {
   assert.equal(contractCheck(6000).status, 'healthy');
 });
 
-test('available=false（探针跳过）→ 不告警、不落库', async () => {
+test('available=false (the probe was skipped) -> no alert and nothing persisted', async () => {
   alerts = [];
   await maybeAlertContractDrift([{ dep: 'claude', available: false, ok: false, detail: 'skip', at: 7000 }]);
   assert.equal(alerts.length, 0);

@@ -1,6 +1,9 @@
-// 看门狗：独立进程（launchd StartInterval=60s 调 `forge watchdog`），探活 → 判定 → 自愈 → 告警 → 去抖。
-// 为何独立：卡死/已死的守护无法自我监控，监控者必须在守护之外（launchd 只管退出，卡死交外部探针）。
-// 决策抽成纯函数 decideWatchdogAction 便于单测；runWatchdog 负责 IO（探针/launchctl/飞书/日志轮转）。
+// The watchdog: a separate process (launchd's StartInterval=60s calls `forge watchdog`) that probes,
+// classifies, self-heals, alerts, and debounces.
+// Why it is separate: a daemon that is wedged or dead cannot monitor itself, so the monitor has to live
+// outside it (launchd only handles the process exiting; a wedge is left to an external probe).
+// The decision is pulled out into the pure function decideWatchdogAction so it can be unit-tested;
+// runWatchdog does the IO (the probe, launchctl, the alert, log rotation).
 import { spawnSync } from 'node:child_process';
 import { get as httpGet } from 'node:http';
 import { statSync, renameSync, readFileSync, writeFileSync, existsSync, mkdirSync } from 'node:fs';
@@ -13,7 +16,7 @@ import { readHeartbeat } from './heartbeat.ts';
 import type { Heartbeat } from './heartbeat.ts';
 import { sendHealthAlert } from './alert.ts';
 
-export const LABEL = 'com.forge.daemon'; // 主守护的 launchd 标签（看门狗 kickstart 它）
+export const LABEL = 'com.forge.daemon'; // the main daemon's launchd label (the watchdog kickstarts it)
 
 export type WatchdogClass = 'ok' | 'process-down' | 'wedged' | 'wedged-deferred' | 'http-degraded';
 
@@ -24,13 +27,13 @@ export type WatchdogAction =
   | { kind: 'alert'; reason: string };
 
 export interface WatchdogInput {
-  running: boolean; // launchd 主任务有 PID 在跑
-  healthzOk: boolean; // 本次 /healthz 探针
-  consecutiveFails: number; // /healthz 连续失败次数（含本次）
+  running: boolean; // launchd's main job has a PID running
+  healthzOk: boolean; // this round's /healthz probe
+  consecutiveFails: number; // how many /healthz probes have failed in a row (including this one)
   hb: Heartbeat | null;
   now: number;
   cfg: HealthCfg;
-  wedgedSince: number | null; // 持久化：首次判卡死的时刻（宽限窗起点）
+  wedgedSince: number | null; // persisted: when it was first judged wedged (the start of the grace window)
 }
 
 export interface WatchdogDecision {
@@ -40,49 +43,54 @@ export interface WatchdogDecision {
   livenessAgeSec: number | null;
 }
 
-// ── 纯决策（单测目标）─────────────────────────────────────────────
+// ── The pure decision (what the unit tests target) ─────────────────────────────
 export function decideWatchdogAction(i: WatchdogInput): WatchdogDecision {
   const ageSec = i.hb ? Math.max(0, Math.round((i.now - i.hb.livenessPingAt) / 1000)) : null;
 
-  // 1) 进程根本没在跑 → 拉起（KeepAlive 通常也会，但 kickstart 幂等兜底）。
+  // 1) The process is not running at all -> start it (KeepAlive usually would too, but kickstart is
+  // idempotent and covers the gap).
   if (!i.running) {
-    return { action: { kind: 'restart', force: false, reason: '守护进程未在运行' }, klass: 'process-down', wedgedSince: null, livenessAgeSec: ageSec };
+    return { action: { kind: 'restart', force: false, reason: 'the daemon is not running' }, klass: 'process-down', wedgedSince: null, livenessAgeSec: ageSec };
   }
 
   const fresh = ageSec != null && ageSec <= i.cfg.wedgedAfterSec;
-  // 2) 探针通且 liveness 新鲜 → 正常。
+  // 2) The probe answers and liveness is fresh -> everything is fine.
   if (i.healthzOk && fresh) {
     return { action: { kind: 'none' }, klass: 'ok', wedgedSince: null, livenessAgeSec: ageSec };
   }
 
-  // 卡死判定：liveness 过期（event loop 真停了）+ 探针连续失败到阈值（去抖瞬时抖动）。
-  // 注：event loop 活着时 ping 定时器与 http 都会动；二者同时哑 ⇒ 真卡死。
+  // Judging it wedged: liveness has gone stale (the event loop really has stopped) **and** the probe has
+  // failed enough times in a row to clear the threshold (which debounces a momentary blip).
+  // Note: while the event loop is alive both the ping timer and http keep moving; both going silent at once
+  // means it really is wedged.
   const wedged = ageSec != null && ageSec > i.cfg.wedgedAfterSec && i.consecutiveFails >= i.cfg.probeFailThreshold;
 
   if (!wedged) {
-    // liveness 还新鲜但 /healthz 连续失败 = http 服务挂了而主循环还活着 → 降级告警，不强杀（别打断 gate）。
+    // Liveness still fresh but /healthz failing repeatedly means the http service died while the main loop is
+    // still alive -> a degraded alert, not a kill (do not interrupt a running gate).
     if (!i.healthzOk && i.consecutiveFails >= i.cfg.probeFailThreshold && fresh) {
-      return { action: { kind: 'alert', reason: '健康端口无响应，但守护主循环仍活（liveness 新鲜）' }, klass: 'http-degraded', wedgedSince: null, livenessAgeSec: ageSec };
+      return { action: { kind: 'alert', reason: 'the health port is not responding, but the daemon\'s main loop is still alive (liveness is fresh)' }, klass: 'http-degraded', wedgedSince: null, livenessAgeSec: ageSec };
     }
-    // 单次/未到阈值的抖动 → 观望。
+    // A single blip, or one that has not reached the threshold -> wait and see.
     return { action: { kind: 'none' }, klass: 'ok', wedgedSince: i.wedgedSince, livenessAgeSec: ageSec };
   }
 
-  // 3) 确认卡死。
+  // 3) Confirmed wedged.
   const activeGates = i.hb?.activeGates ?? 0;
   if (activeGates > 0) {
-    // 有 gate 在跑：先暂缓强杀，过宽限窗仍卡死才动手（避免白烧 claude/codex token）。
+    // A gate is running: hold off on the kill and only act if it is still wedged after the grace window
+    // (so claude and codex tokens are not burned for nothing).
     const since = i.wedgedSince ?? i.now;
     if (i.now - since >= i.cfg.wedgedGraceSec * 1000) {
-      return { action: { kind: 'restart', force: true, reason: `卡死且宽限窗(${i.cfg.wedgedGraceSec}s)已过，强制重启` }, klass: 'wedged', wedgedSince: null, livenessAgeSec: ageSec };
+      return { action: { kind: 'restart', force: true, reason: `wedged, and the grace window (${i.cfg.wedgedGraceSec}s) has passed: forcing a restart` }, klass: 'wedged', wedgedSince: null, livenessAgeSec: ageSec };
     }
-    return { action: { kind: 'defer', reason: '卡死但有 gate 在跑，暂缓强杀', activeGates }, klass: 'wedged-deferred', wedgedSince: since, livenessAgeSec: ageSec };
+    return { action: { kind: 'defer', reason: 'wedged, but a gate is running, so the kill is held off', activeGates }, klass: 'wedged-deferred', wedgedSince: since, livenessAgeSec: ageSec };
   }
-  // 无 gate 在跑 → 立即强制重启。
-  return { action: { kind: 'restart', force: true, reason: '卡死且无 gate 在跑，立即强制重启' }, klass: 'wedged', wedgedSince: null, livenessAgeSec: ageSec };
+  // No gate is running -> force a restart immediately.
+  return { action: { kind: 'restart', force: true, reason: 'wedged with no gate running: forcing a restart immediately' }, klass: 'wedged', wedgedSince: null, livenessAgeSec: ageSec };
 }
 
-// ── IO（runWatchdog 用，不单测）────────────────────────────────────
+// ── The IO (used by runWatchdog; not unit-tested) ────────────────────────────────
 
 interface WatchdogState {
   consecutiveFails: number;
@@ -101,7 +109,7 @@ function readState(): WatchdogState {
       };
     }
   } catch {
-    /* 损坏 → 重置 */
+    /* corrupt -> reset */
   }
   return { consecutiveFails: 0, wedgedSince: null, klass: 'ok' };
 }
@@ -111,7 +119,7 @@ function writeState(s: WatchdogState): void {
     mkdirSync(dirname(WATCHDOG_STATE_PATH), { recursive: true });
     writeFileSync(WATCHDOG_STATE_PATH, JSON.stringify(s), 'utf8');
   } catch (e) {
-    log.warn(`看门狗状态写盘失败：${String(e).slice(0, 120)}`);
+    log.warn(`writing the watchdog state to disk failed: ${String(e).slice(0, 120)}`);
   }
 }
 
@@ -143,9 +151,9 @@ function kickstart(force: boolean): { ok: boolean; detail: string } {
   const args = force ? ['kickstart', '-k', domain] : ['kickstart', domain];
   try {
     const r = spawnSync('launchctl', args, { encoding: 'utf8' });
-    return { ok: r.status === 0, detail: r.status === 0 ? `launchctl ${args.join(' ')}` : `kickstart 失败(${r.status})：${(r.stderr || '').slice(0, 160)}` };
+    return { ok: r.status === 0, detail: r.status === 0 ? `launchctl ${args.join(' ')}` : `kickstart failed (${r.status}): ${(r.stderr || '').slice(0, 160)}` };
   } catch (e) {
-    return { ok: false, detail: `kickstart 异常：${String(e).slice(0, 160)}` };
+    return { ok: false, detail: `kickstart threw: ${String(e).slice(0, 160)}` };
   }
 }
 
@@ -158,13 +166,13 @@ function rotateLogIfBig(maxMb: number): void {
       const src = i === 1 ? LAUNCHD_LOG : `${LAUNCHD_LOG}.${i - 1}`;
       if (existsSync(src)) renameSync(src, `${LAUNCHD_LOG}.${i}`);
     }
-    log.info(`launchd.log 达 ${mb.toFixed(0)}MB → 已轮转`);
+    log.info(`launchd.log reached ${mb.toFixed(0)}MB and has been rotated`);
   } catch (e) {
-    log.warn(`日志轮转失败：${String(e).slice(0, 120)}`);
+    log.warn(`rotating the log failed: ${String(e).slice(0, 120)}`);
   }
 }
 
-// 一次性运行：探活 + 自愈 + 去抖告警。供 launchd StartInterval 每 60s 调一次。
+// One run: probe, self-heal, and alert with debouncing. launchd's StartInterval calls it every 60 seconds.
 export async function runWatchdog(now: number = Date.now()): Promise<WatchdogDecision> {
   const cfg = healthConfig();
   const prev = readState();
@@ -176,33 +184,33 @@ export async function runWatchdog(now: number = Date.now()): Promise<WatchdogDec
   const decision = decideWatchdogAction({ running, healthzOk, consecutiveFails, hb, now, cfg, wedgedSince: prev.wedgedSince });
   const a = decision.action;
 
-  // 执行动作（每次都执行，kickstart 幂等）。
+  // Carry out the action (every round; kickstart is idempotent).
   if (a.kind === 'restart') {
     const k = kickstart(a.force);
-    log.warn(`看门狗：${a.reason} → ${k.detail}`);
+    log.warn(`watchdog: ${a.reason} -> ${k.detail}`);
   } else if (a.kind === 'defer') {
-    log.warn(`看门狗：${a.reason}（活跃 gate ${a.activeGates}）`);
+    log.warn(`watchdog: ${a.reason} (${a.activeGates} active gates)`);
   }
 
-  // 去抖告警：仅在状态类翻转时发。
+  // Debounced alerting: it only sends when the classification flips.
   if (decision.klass !== prev.klass) {
     if (decision.klass === 'ok') {
-      if (prev.klass !== 'ok') await sendHealthAlert('recovered', '服务已恢复', ['守护进程已恢复响应（/healthz 通、liveness 新鲜）。'], now);
+      if (prev.klass !== 'ok') await sendHealthAlert('recovered', 'the service has recovered', ['the daemon is responding again (/healthz answers and liveness is fresh).'], now);
     } else if (a.kind === 'restart') {
       const sev = 'down' as const;
-      const what = decision.klass === 'process-down' ? '守护进程已退出' : '守护进程卡死';
-      await sendHealthAlert(sev, `${what} · 已自动重启`, [
-        `**原因**：${a.reason}`,
-        hb ? `PID ${hb.pid} · liveness ${decision.livenessAgeSec ?? '—'}s 未更新 · 活跃 gate ${hb.activeGates}` : '心跳缺失',
-        '已执行 `launchctl kickstart`，重启后 orphan 会被自动回收。',
+      const what = decision.klass === 'process-down' ? 'the daemon has exited' : 'the daemon is wedged';
+      await sendHealthAlert(sev, `${what} · restarted automatically`, [
+        `**Why**: ${a.reason}`,
+        hb ? `PID ${hb.pid} · liveness has not updated for ${decision.livenessAgeSec ?? '—'}s · ${hb.activeGates} active gates` : 'no heartbeat',
+        '`launchctl kickstart` has been run; any orphans are reclaimed automatically after the restart.',
       ], now);
     } else if (a.kind === 'defer') {
-      await sendHealthAlert('down', '守护卡死 · 暂缓强杀', [
-        `检测到卡死，但有 **${a.activeGates}** 个 gate 在跑——先告警，过宽限窗(${cfg.wedgedGraceSec}s)仍卡死才强制重启，避免白烧 token。`,
-        hb ? `liveness ${decision.livenessAgeSec ?? '—'}s 未更新。` : '',
+      await sendHealthAlert('down', 'the daemon is wedged · holding off on the kill', [
+        `It looks wedged, but **${a.activeGates}** gates are running — so this is an alert first, and it only forces a restart if it is still wedged after the grace window (${cfg.wedgedGraceSec}s), rather than burning tokens for nothing.`,
+        hb ? `liveness has not updated for ${decision.livenessAgeSec ?? '—'}s.` : '',
       ], now);
     } else if (a.kind === 'alert') {
-      await sendHealthAlert('degraded', '健康端口无响应', [a.reason, '主循环仍在跑（liveness 新鲜），未强杀。建议查 logs/launchd.log。'], now);
+      await sendHealthAlert('degraded', 'the health port is not responding', [a.reason, 'the main loop is still running (liveness is fresh), so nothing was killed. Check logs/launchd.log.'], now);
     }
   }
 

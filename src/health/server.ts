@@ -1,12 +1,16 @@
-// 本地健康服务（仅 127.0.0.1）：看门狗探针 + 人看的状态页。
-//   GET /healthz        → 200 'ok'（极简，证明 event loop + http 还活着；看门狗廉价探针）
-//   GET /health         → 实时健康 JSON（evaluateHealth）
-//   GET  /api/board     → PRD 流水线看板（按状态分组 + 需关注 session 列表）
-//   GET  /api/sessions  → 全量需求列表（?state= 过滤）   GET /api/session?id= → 单条详情 + 事件流
-//   GET  /api/history   → 近 N 小时滚动历史（在线率 + 宕机/恢复事件）
-//   POST /api/action    → 面板写动作（{action,slug}；本机 + 同源闸 + application/json；走真 action 权限闸）
-//   GET  /              → 自包含状态页 HTML（类 status.claude.ai）
-// 嵌在 listen() 守护进程内：claude/codex 是 async spawn 不堵 event loop，故 gate 跑期间本服务仍响应。
+// The local health service (127.0.0.1 only): the watchdog's probe, plus a status page for humans.
+//   GET  /healthz       -> 200 'ok' (as simple as possible, proving the event loop and http are still alive;
+//                          the watchdog's cheap probe)
+//   GET  /health        -> live health as JSON (evaluateHealth)
+//   GET  /api/board     -> the PRD pipeline board (grouped by state, plus the sessions needing attention)
+//   GET  /api/sessions  -> the full requirement list (filtered by ?state=)
+//   GET  /api/session?id= -> one requirement's detail and its event stream
+//   GET  /api/history   -> the rolling history over the last N hours (uptime, plus outages and recoveries)
+//   POST /api/action    -> a panel write action ({action,slug}; local, same-origin gated, application/json;
+//                          it goes through the real action's permission gate)
+//   GET  /              -> the self-contained status page HTML (in the style of status.claude.ai)
+// It is embedded inside the listen() daemon process: claude and codex are spawned asynchronously and do not
+// block the event loop, so this service still responds while a gate is running.
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from 'node:http';
 import { hours } from '../util/time.ts';
 import { readFileSync } from 'node:fs';
@@ -28,7 +32,7 @@ function page(): string {
   try {
     pageCache = readFileSync(PAGE_PATH, 'utf8');
   } catch {
-    pageCache = '<!doctype html><meta charset=utf-8><title>Forge</title><body>状态页资源缺失，见 /health</body>';
+    pageCache = '<!doctype html><meta charset=utf-8><title>Forge</title><body>the status page asset is missing; see /health</body>';
   }
   return pageCache;
 }
@@ -38,9 +42,13 @@ function send(res: ServerResponse, code: number, type: string, body: string): vo
   res.end(body);
 }
 
-// 严格同源闸：有 Origin 时要求其与本次请求的 Host **完全同源**（scheme+host+port），且主机是本机回环。
-// 只比 hostname 不够（旧实现注释承诺「同源」却只看 hostname，跨端口/跨 scheme 会漏放）。防恶意网页 drive-by
-// POST 到 localhost 触发 forge 动作。无 Origin = 同机非浏览器工具（curl/CLI），已由「绑 127.0.0.1 + 要 application/json」兜底。
+// The strict same-origin gate: when an Origin is present it must be **exactly the same origin** as this
+// request's Host (scheme + host + port), and the host must be local loopback.
+// Comparing the hostname alone is not enough — the old implementation's comment promised "same origin" but
+// only looked at the hostname, which let a different port or scheme through. This is what stops a malicious
+// web page drive-by POSTing to localhost to trigger a forge action. No Origin means a non-browser tool on the
+// same machine (curl, the CLI), which is already covered by binding to 127.0.0.1 and requiring
+// application/json.
 function isSameLocalOrigin(origin: string, host: string | undefined): boolean {
   if (!host) return false;
   try {
@@ -53,16 +61,18 @@ function isSameLocalOrigin(origin: string, host: string | undefined): boolean {
   }
 }
 
-// POST /api/action：面板写动作。安全闸 = 绑 127.0.0.1（startHealthServer host）+ 同源 Origin + 要求 application/json
-// （跨域 JSON 触发预检，普通表单设不了该 content-type）。真权限/lint/红线由被调 action 自身把关（见 action-gateway）。
+// POST /api/action: a panel write action. The security gate is: bound to 127.0.0.1 (startHealthServer's
+// host), a same-origin Origin, and application/json required (cross-origin JSON triggers a preflight, and an
+// ordinary form cannot set that content type). The real permissions, lint and red lines are enforced by the
+// action being called (see action-gateway).
 function handleAction(req: IncomingMessage, res: ServerResponse): void {
   const origin = req.headers.origin;
   if (origin && !isSameLocalOrigin(origin, req.headers.host)) {
-    send(res, 403, JSONT, JSON.stringify({ ok: false, msg: '跨源请求被拒（面板仅限本机同源）' }));
+    send(res, 403, JSONT, JSON.stringify({ ok: false, msg: 'cross-origin request refused (the panel is local same-origin only)' }));
     return;
   }
   if (!String(req.headers['content-type'] ?? '').includes('application/json')) {
-    send(res, 415, JSONT, JSON.stringify({ ok: false, msg: '需 application/json' }));
+    send(res, 415, JSONT, JSON.stringify({ ok: false, msg: 'application/json is required' }));
     return;
   }
   let body = '';
@@ -82,7 +92,7 @@ function handleAction(req: IncomingMessage, res: ServerResponse): void {
         const r = await runPanelAction(String(action ?? ''), String(slug ?? ''));
         send(res, r.ok ? 200 : 400, JSONT, JSON.stringify(r));
       } catch (e) {
-        send(res, 400, JSONT, JSON.stringify({ ok: false, msg: `请求处理失败：${String(e).slice(0, 120)}` }));
+        send(res, 400, JSONT, JSON.stringify({ ok: false, msg: `the request could not be handled: ${String(e).slice(0, 120)}` }));
       }
     })();
   });
@@ -105,7 +115,7 @@ export function startHealthServer(port: number, host = '127.0.0.1'): Server {
         if (path === '/api/sessions') return send(res, 200, 'application/json; charset=utf-8', JSON.stringify(await sessionsPayload(url.searchParams.get('state'), url.searchParams.get('project'))));
         if (path === '/api/session') {
           const detail = await sessionDetail(url.searchParams.get('id') ?? '', url.searchParams.get('project'));
-          if (!detail) return send(res, 404, 'application/json; charset=utf-8', JSON.stringify({ error: '找不到该需求' }));
+          if (!detail) return send(res, 404, 'application/json; charset=utf-8', JSON.stringify({ error: 'no such requirement' }));
           return send(res, 200, 'application/json; charset=utf-8', JSON.stringify(detail));
         }
         if (path === '/api/history') {
@@ -118,17 +128,17 @@ export function startHealthServer(port: number, host = '127.0.0.1'): Server {
         try {
           send(res, 500, 'application/json; charset=utf-8', JSON.stringify({ error: String(e).slice(0, 200) }));
         } catch {
-          /* 响应已发出 */
+          /* the response has already been sent */
         }
       }
     })();
   });
   server.on('error', (e: NodeJS.ErrnoException) => {
-    if (e.code === 'EADDRINUSE') log.warn(`健康服务端口 ${port} 被占用 → 状态页/探针不可用（其余照常）`);
-    else log.warn(`健康服务出错：${String(e).slice(0, 160)}`);
+    if (e.code === 'EADDRINUSE') log.warn(`the health service's port ${port} is already in use, so the status page and the probe are unavailable (everything else carries on)`);
+    else log.warn(`the health service errored: ${String(e).slice(0, 160)}`);
   });
   server.listen(port, host, () => {
-    log.ok(`本地状态页已起：http://${host}:${port}/（/healthz /health /api/board /api/history）`);
+    log.ok(`the local status page is up: http://${host}:${port}/ (/healthz /health /api/board /api/history)`);
   });
   return server;
 }

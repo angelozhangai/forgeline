@@ -1,4 +1,5 @@
-// 健康分级纯函数：classifyDaemon / classifyWs / rollupStatus。不碰 DB/网络。
+// The pure health classification functions: classifyDaemon / classifyWs / rollupStatus. They touch neither
+// the database nor the network.
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { classifyDaemon, classifyWs, rollupStatus } from '../src/health/check.ts';
@@ -14,14 +15,14 @@ function hb(over: Partial<Heartbeat> = {}): Heartbeat {
   };
 }
 
-test('classifyDaemon：心跳缺失 → down/未运行', () => {
+test('classifyDaemon: no heartbeat -> down and not running', () => {
   const d = classifyDaemon(null, 1_000_000, cfg);
   assert.equal(d.check.status, 'down');
   assert.equal(d.running, false);
   assert.equal(d.wedged, false);
 });
 
-test('classifyDaemon：liveness 新鲜 → healthy/running', () => {
+test('classifyDaemon: fresh liveness -> healthy and running', () => {
   const now = 1_000_000;
   const d = classifyDaemon(hb({ livenessPingAt: now }), now, cfg);
   assert.equal(d.check.status, 'healthy');
@@ -30,7 +31,7 @@ test('classifyDaemon：liveness 新鲜 → healthy/running', () => {
   assert.equal(d.livenessAgeSec, 0);
 });
 
-test('classifyDaemon：liveness 过期 → down/wedged', () => {
+test('classifyDaemon: stale liveness -> down and wedged', () => {
   const now = 1_000_000;
   const d = classifyDaemon(hb({ livenessPingAt: now - (cfg.wedgedAfterSec + 10) * 1000 }), now, cfg);
   assert.equal(d.check.status, 'down');
@@ -38,20 +39,20 @@ test('classifyDaemon：liveness 过期 → down/wedged', () => {
   assert.equal(d.running, false);
 });
 
-test('classifyWs：项名跟着当前 provider 走（换到 Slack 的部署不该在状态页上看到"飞书"）', () => {
-  assert.equal(classifyWs(hb({ wsConfigured: true, wsConnected: true }), 'slack').name, 'slack 长连接');
-  assert.equal(classifyWs(null, 'feishu').name, 'feishu 长连接');
-  assert.equal(classifyWs(null).name, 'IM 长连接', '没给 provider 名时用中性兜底，不假设某一家');
+test("classifyWs: the entry's name follows the provider in effect (a deployment that switched to Slack should not see the other provider's name on its status page)", () => {
+  assert.equal(classifyWs(hb({ wsConfigured: true, wsConnected: true }), 'slack').name, 'slack connection');
+  assert.equal(classifyWs(null, 'feishu').name, 'feishu connection');
+  assert.equal(classifyWs(null).name, 'IM connection', 'with no provider name given it falls back to something neutral rather than assuming one');
 });
 
-test('classifyWs：未配 → na；配了断 → degraded；连上 → healthy', () => {
+test('classifyWs: unconfigured -> na; configured but disconnected -> degraded; connected -> healthy', () => {
   assert.equal(classifyWs(null).status, 'na');
   assert.equal(classifyWs(hb({ wsConfigured: false })).status, 'na');
   assert.equal(classifyWs(hb({ wsConfigured: true, wsConnected: false })).status, 'degraded');
   assert.equal(classifyWs(hb({ wsConfigured: true, wsConnected: true })).status, 'healthy');
 });
 
-test('rollupStatus：取最坏（down>degraded>healthy；na 不计）', () => {
+test('rollupStatus: takes the worst (down > degraded > healthy; na does not count)', () => {
   const c = (status: Check['status']): Check => ({ name: 'x', status, detail: '' });
   assert.equal(rollupStatus([c('healthy'), c('na')]), 'healthy');
   assert.equal(rollupStatus([c('healthy'), c('degraded'), c('na')]), 'degraded');
