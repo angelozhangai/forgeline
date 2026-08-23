@@ -52,7 +52,7 @@ Any gate can **park** (`*_STALLED` / `*_FAILED`) instead of guessing: unresolved
 - **A reusable review⇄fix engine** ([src/review/reviewFixLoop.ts](src/review/reviewFixLoop.ts)) — the "reviewer judges → fixer revises → human escalation → round caps" loop is one generic engine, reused by Gates A, B, and D.
 - **Two independent pluggable axes — the IM and the document source.**
   - *Messaging*: the core depends on a provider-agnostic `MessagingPort` + semantic `CardModel`. **Feishu (Lark) and Slack both ship**; pick one with `FORGE_MESSAGING_PROVIDER` (default `feishu`). An unknown value is a hard startup error — never a silent fallback, because a typo that quietly keeps sending everything to the old provider has no symptom at all. Slack needs no extra npm dependency: raw `fetch` for the Web API, Node's native `WebSocket` for Socket Mode.
-  - *Documents*: requirement docs come through a `DocSourcePort` **registry** — not a selection point, because one message may legitimately carry links from several sources. Feishu Docs ships; a `plaintext` fallback source (the message body *is* the requirement) ships **default-off**, so Slack can run with no document service at all. Adding a source is one file plus one line in `src/docs/index.ts`.
+  - *Documents*: requirement docs come through a `DocSourcePort` **registry** — not a selection point, because one message may legitimately carry links from several sources. Feishu Docs ships; a `plaintext` fallback source (the message body *is* the requirement) ships **default-off**, so Slack can run with no document service at all. Adding a source is one file plus one line in `src/docs/index.ts`. Which one you need — and what turning `plaintext` on actually costs — is [below](#which-document-source).
   - Both seams are machine-guarded: [test/arch-boundary.test.ts](test/arch-boundary.test.ts) fails CI if core code imports a provider's raw layer or a concrete document source directly.
 - **Ops for a real service** — launchd daemon + watchdog (distinguishes *dead* from *wedged*, grace-periods active gates before force-restart), hourly SQLite backups, a localhost status page + web action panel that reuses the same permission gates as the CLI and cards.
 - **Progressive autonomy** (default 0 = fully manual) — levels that auto-advance only *authorization-only* stops, with red lines no level can cross: never auto-merge, never skip a red CI, never answer a human-escalation on a human's behalf.
@@ -80,6 +80,46 @@ cp config/forge.env.example config/forge.env   # point FORGE_PROJECT_ROOT at you
 ```
 
 For the always-on experience — IM long connection (Feishu or Slack), chat-message intake, card buttons for the whole flow, watchdog, status page — see [deploy/README.md](deploy/README.md) (`./forge listen`, `./deploy/install.sh`). Setup for both providers and for document sources: [docs/pluggable-messaging-and-doc-sources.md](docs/pluggable-messaging-and-doc-sources.md); the env keys are documented inline in [config/forge.env.example](config/forge.env.example).
+
+### Which document source?
+
+Intake is **content-addressed**: a chat message enters the pipeline only if some registered document
+source claims something in it. Nothing claims it → the message is dropped with a single
+`没有任何文档源认领这条消息，忽略` warning. That is a *warn*, not an error, so the symptom is simply
+"the bot ignored me" — worth knowing before you point Forge at a new workspace.
+
+| Source | Claims | Reads the requirement from |
+| --- | --- | --- |
+| `feishu` | Feishu/Lark doc + wiki links in the message | the document, via the project's `feishu-doc.js` |
+| `plaintext` | nothing — it is the **fallback**, and only runs when no other source claimed | the message body itself |
+
+So the two working combinations today are **Feishu docs** (either IM) and **`plaintext`** (either IM).
+Slack plus a document system that isn't Feishu has no source that recognises the link — see
+[#22](https://github.com/angelozhangai/forgeline/issues/22) for the missing downstream registration hook.
+
+**Turning on `plaintext`** — the message *is* the requirement, no document service involved:
+
+```yaml
+# config/runtime.yaml
+doc_sources:
+  plaintext:
+    enabled: true
+```
+
+**What it costs, stated plainly.** Once on, a message whose body normalizes to **≥ 20 non-whitespace
+characters** becomes a requirement and runs Gate A — a paid model call, per message. Three things follow:
+
+- In a **group**, the @-mention gate still applies first, so only messages that @ the bot get this far.
+  In a **DM** there is no such gate: every message long enough becomes a requirement. Keep that in mind
+  before DMing the bot a paragraph of thinking-out-loud.
+- The 20-character floor exists only to stop "ok, thanks" — it is deliberately a **length** signal, not a
+  semantic one, so it biases toward false negatives. A genuinely terse requirement gets ignored; write
+  more and it goes through. That is the cheap side of the trade.
+- Identity is the **content hash** of the normalized body. Pasting the same text again is deduped;
+  changing a word makes it honestly a *new* requirement, because there is no document version to track.
+
+It is off by default for exactly this reason: on an existing Feishu deployment, flipping it changes
+behaviour — a link-free @-mention that is ignored today would start costing a Gate A run.
 
 Forge treats the **target project as pluggable**: mechanical actions (creating issues, publishing docs, running CI) are delegated to the project's own scripts, or to the built-in native GitHub adapter (`gh`) for projects without them. Register multiple projects via `config/projects.yaml` ([example](config/projects.yaml.example)).
 
