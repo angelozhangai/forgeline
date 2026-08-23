@@ -307,7 +307,7 @@ const slackPort: MessagingPort = {
     // 群消息入口闸的判定材料。im=私聊，天然定向；其余按群处理，要求 @ 了本机器人。
     // 未配 SLACK_BOT_USER_ID → 无法确认身份 → null，核心保守忽略（与飞书同语义）。
     const isGroup = ev.channel_type !== 'im';
-    const mentionedBot = botId ? text.includes(`<@${botId}>`) : null;
+    const mentionedBot = botId ? mentionsBot(text, botId) : null;
     return {
       type: 'message',
       chatId,
@@ -396,6 +396,13 @@ const slackPort: MessagingPort = {
     return { available: true, ok: true, detail: 'Slack conversations.history 分页信封完好' };
   },
 };
+
+// @ 有两种写法：现代事件里是 <@U123>，历史条目/老客户端里还会出现带显示名的 <@U123|angelo>。
+// 只认前一种的话，群入口会出现「明明 @ 了却没反应」——而入口闸的失败是**静默**的（核心保守忽略、
+// 只留一行 log），没有任何症状指向真正的原因。两种都认，代价是一次 includes。
+function mentionsBot(text: string, botId: string): boolean {
+  return text.includes(`<@${botId}>`) || text.includes(`<@${botId}|`);
+}
 
 function isOpenModal(payload: Record<string, unknown>): boolean {
   if (payload.type !== 'block_actions') return false;

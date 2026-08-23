@@ -119,18 +119,66 @@ test('hello 不当业务事件；坏 JSON 跳过不崩；无 payload 的信封�
   assert.deepEqual(ws.sent, ['{"envelope_id":"env-2"}'], '缺 payload 也要 ack——不 ack 就会被无限重投');
 });
 
-test('② type:disconnect 是计划内换连接：关掉旧连接并重连，不当故障报警', async () => {
+// Slack 每半小时左右就来这么一次。做错了不会有任何报错，只会「偶尔一个按钮点了没反应」+
+// 每半小时一条假故障日志——两种最难查的形态。故这条路径的三件事全部钉死。
+test('② type:disconnect 是计划内换连接：先建新连接、连上之后才关旧的（中间不留空窗）', async () => {
   const h = harness();
   const p = h.channel.connect();
   await tick();
-  const ws = h.sockets[0];
-  ws.fire('open');
+  const old = h.sockets[0];
+  old.fire('open');
   await p;
-  ws.frame({ type: 'disconnect', reason: 'refresh_requested' });
-  assert.equal(ws.closed, true);
+  old.frame({ type: 'disconnect', reason: 'refresh_requested' });
+  await tick();
+  assert.equal(h.sockets.length, 2, '收到 disconnect 就立刻建新连接，不等退避');
+  assert.equal(old.closed, false, '新连接还没连上 → 旧的必须还活着：空窗里丢掉的按钮点击是补拉捞不回来的');
+  h.sockets[1].fire('open');
+  assert.equal(old.closed, true, '新连接 open 之后才关旧的');
+  assert.equal(h.sockets.length, 2, '一次换连接只开一条新的');
+});
+
+test('② 计划内换连接不算故障：不报 onError（否则核心 markWs(false)+log.err，每半小时一次假警报），也不走退避', async () => {
+  const h = harness();
+  const p = h.channel.connect();
+  await tick();
+  const old = h.sockets[0];
+  old.fire('open');
+  await p;
+  old.frame({ type: 'disconnect', reason: 'refresh_requested' });
+  await tick();
+  h.sockets[1].fire('open');
+  assert.deepEqual(h.errors, [], '计划内的换连接不是错误');
+  assert.deepEqual(h.sleeps, [], '不走退避 sleep——那 1s 就是空窗本身');
+  assert.equal(h.reconnects, 1, '仍然通知核心「已重连」→ 顺手补拉一次，空窗即便为零也不吃亏');
+});
+
+test('② 同一条连接上重复收到 disconnect：不再多开一条（否则一次换连接开出两条，信封收两遍）', async () => {
+  const h = harness();
+  const p = h.channel.connect();
+  await tick();
+  const old = h.sockets[0];
+  old.fire('open');
+  await p;
+  old.frame({ type: 'disconnect' });
+  old.frame({ type: 'disconnect' });
+  await tick();
+  assert.equal(h.sockets.length, 2);
+});
+
+test('② 换连接之后，新连接上的硬断照样报错并重连（「计划内」是每条连接的属性，不是全局开关）', async () => {
+  const h = harness();
+  const p = h.channel.connect();
+  await tick();
+  h.sockets[0].fire('open');
+  await p;
+  h.sockets[0].frame({ type: 'disconnect' });
+  await tick();
+  h.sockets[1].fire('open'); // 换连接完成
+  h.sockets[1].fire('close', { code: 1006 }); // 这次是真断了
   await tick();
   await tick();
-  assert.equal(h.sockets.length, 2, '应当已经在建第二条连接');
+  assert.deepEqual(h.errors, ['WebSocket closed code=1006']);
+  assert.equal(h.sockets.length, 3, '真断开要重连');
 });
 
 test('③ error 与 close 成对触发时只重连一次（否则每条信封会被收两遍）', async () => {
@@ -216,4 +264,52 @@ test('close() 之后不再重连（守护退出时不该留个循环在后台刷
   await tick();
   assert.equal(h.sockets.length, 1);
   assert.deepEqual(h.errors, []);
+});
+
+// 换连接的重叠窗口里同时活着两条连接 —— close() 只关「当前那条」的话，另一条就成了没人管的：
+// 它不会再重连（superseded），也永远没人关它，于是进程带着一个活着的句柄退不出去。
+// 这正是本仓最忌讳的形态：没有报错，只是 daemon 停不下来。
+test('close() 落在换连接的重叠窗口里：两条连接都要关掉，一条都不能漏', async () => {
+  const h = harness();
+  const p = h.channel.connect();
+  await tick();
+  const old = h.sockets[0];
+  old.fire('open');
+  await p;
+  old.frame({ type: 'disconnect' });
+  await tick();
+  assert.equal(h.sockets.length, 2, '前置条件：新连接已在建、旧连接还活着');
+  assert.equal(old.closed, false);
+  h.channel.close();
+  assert.equal(old.closed, true, '旧连接不能被漏下（它已经 superseded，没人会再管它）');
+  assert.equal(h.sockets[1].closed, true);
+});
+
+test('close() 撞上首连的 openUrl：connect() 必须落地，且不再建连接（否则启动路径被挂住）', async () => {
+  let release: () => void = () => {};
+  const gate = new Promise<void>((r) => {
+    release = r;
+  });
+  const h = harness({
+    openUrl: async () => {
+      await gate;
+      return { ok: true, url: 'wss://fake' };
+    },
+  });
+  const p = h.channel.connect();
+  h.channel.close(); // 还卡在 openUrl 里就被关了
+  release();
+  await p; // 挂住的话这条用例会超时——那正是生产里 daemon 起不来的样子
+  assert.equal(h.sockets.length, 0, '关了就别再建一条没人管的连接');
+});
+
+test('close() 之后迟到的 open：连接被关掉，connect() 也照样落地', async () => {
+  const h = harness();
+  const p = h.channel.connect();
+  await tick();
+  h.channel.close(); // socket 已建好，但还没 open
+  h.sockets[0].fire('open'); // 迟到的 open
+  await p;
+  assert.equal(h.sockets[0].closed, true);
+  assert.deepEqual(h.errors, [], '自己关的，不算故障');
 });
