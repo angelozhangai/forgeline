@@ -46,7 +46,7 @@ test('requestGateC：非 DONE 态拒绝（提示用 implement --issue 单跑）'
   const id = await at('CONFIRMED');
   const r = await actions.requestGateC(id, 'M');
   assert.equal(r.ok, false);
-  assert.match(r.msg, /需先 DONE/);
+  assert.match(r.msg, /it has to be DONE/);
   assert.equal((await sessions.get(id))!.state, 'CONFIRMED');
 });
 
@@ -115,7 +115,7 @@ test('addImplementTask：--repo 指定有效仓 → 落 target_repos；无效仓
   const bad = await intake.addImplementTask({ issueRef: 'your-org/x#44', title: 'x', repo: 'nope-repo', by: 'M' });
   assert.equal(bad.ok, false);
   assert.equal(bad.created, false);
-  assert.match(bad.msg, /不在项目/);
+  assert.match(bad.msg, /is not among the project/);
 });
 
 test('addImplementTask：同 issue_ref 去重（第二次复用，不重复建）', async () => {

@@ -2,21 +2,21 @@ import { loadConfig } from '../config.ts';
 import { configForSession } from '../projects.ts';
 import { hours } from '../util/time.ts';
 import { log } from '../util/log.ts';
-import { store as sessions } from '../store/index.ts'; // 经 SessionStore 接缝（选择点），不直连 store/sessions.ts
+import { store as sessions } from '../store/index.ts'; // through the SessionStore seam (the selection point), never straight to store/sessions.ts
 import * as cursors from '../store/cursors.ts';
 import { tick } from '../orchestrator/worker.ts';
 import { confirm, submitPmAnswers, requestGateB, submitGateBAnswers, forceGateBGo, go, deny, retry, composeHumanAnswer, postConfirmComment } from '../actions.ts';
 import { readFileSync, existsSync } from 'node:fs';
 import { parseHumanAsks, parseOpenQuestions, openQuestionsToDecisions, composeDecisionAnswer } from '../gates/envelopes.ts';
 import { addPrd } from '../intake.ts';
-import { backfillAll } from '../messaging/backfill.ts'; // provider 无关的补拉循环（历史那一次 API 往返在 adapter 里）
+import { backfillAll } from '../messaging/backfill.ts'; // the provider-agnostic backfill loop (the one API round trip for history lives in the adapter)
 import { maybeBackup } from '../store/backup.ts';
 import { notify, syncGroupCard } from '../notify.ts';
 import { port } from '../messaging/index.ts';
 import { resolveActor } from '../messaging/operators.ts';
 import type { CardModel } from '../messaging/index.ts';
 import { claimDocs } from '../docs/index.ts';
-import { mentionGate } from '../messaging/gate.ts'; // 群入口闸判据：与离线补拉共用，见该文件
+import { mentionGate } from '../messaging/gate.ts'; // the channel entry gate's criteria, shared with the offline backfill; see that file
 import { ACTIVE_GATE_STATES } from '../statemachine/states.ts';
 import { healthConfig } from '../health/config.ts';
 import { initHeartbeat, pingLiveness, markCycle, markWs } from '../health/heartbeat.ts';
@@ -29,70 +29,87 @@ import { runContractProbes } from '../health/contract.ts';
 import { allProbes, startupProbeDue } from '../store/contract.ts';
 
 async function ack(text: string): Promise<void> {
-  await port.sendDmText('⏳ 处理中', [text], 'grey').catch(() => undefined);
+  await port.sendDmText('⏳ working on it', [text], 'grey').catch(() => undefined);
 }
 
 async function handleCardAction(evt: Record<string, unknown>): Promise<void> {
-  // 入站解析交给 adapter：把飞书原始事件规整成 provider 无关的 {action, slug, value, formValues}。
+  // Parsing the inbound event is the adapter's job: it normalises the provider's raw event into a
+  // provider-agnostic {action, slug, value, formValues}.
   const parsed = port.parseCardAction(evt);
   if (!parsed) {
-    log.warn('cardAction 缺 action/slug（无法识别的回调）');
+    log.warn('the cardAction has no action or slug (an unrecognised callback)');
     return;
   }
   const { action: act, slug } = parsed;
-  // 操作者身份：把飞书 open_id 映射成短码，权限闸按真实点击人裁决（未配 operators → 回退 M，单人沿用旧行为）。
-  // operators 取**该需求所属项目**的覆盖（配置分化：项目可有自己的 open_id→短码映射，且 map 合并保留全局）；
-  // 找不到 session/项目未覆盖 → 回退全局。否则项目级真实点击人会被错当全局/单人 M（Codex Blocker）。
+  // Who is acting: the IM user id is mapped to a short code, and the permission gate is decided against
+  // whoever really clicked (with no operators configured it falls back to the maintainer, which is the old
+  // single-person behaviour).
+  // operators is taken from **the project this requirement belongs to** (configuration diverges per project:
+  // a project can have its own user-id-to-short-code mapping, and the map merge keeps the global entries).
+  // If the session cannot be found, or the project overrides nothing, it falls back to global. Otherwise a
+  // project-level clicker would be mistaken for the global single-person maintainer (the blocker Codex
+  // raised).
   const cardSession = await sessions.resolve(slug);
   const operators = (cardSession ? configForSession(cardSession) : loadConfig()).permissions.operators ?? {};
   const actor = resolveActor(parsed.operatorId, operators);
   log.info(`cardAction: ${act} ${slug} by=${actor}`);
   try {
     if (act === 'confirm_submit') {
-      // PM 在群里提交答复。注意：PM「答复」不等于「定案」——答复回喂同一 claude 会话做下一轮复评
-      // （闸A 多轮循环）；评审何时结束由 claude（无剩余开放问题）或 M（强制结束）决定，PM 无权结束。
+      // Product submits their answers in the channel. Note: product *answering* is not product *deciding* —
+      // the answers are fed back into the same claude session for another review round (Gate A's loop), and
+      // when the review ends is decided by claude (no open question remains) or by the maintainer (forcing it
+      // closed). Product cannot end it.
       const fv = parsed.formValues;
       const verdict = fv.verdict || 'accept';
-      // 逐条收集：每个 open_question 的下拉选择（ask_<id>）+ 整体结论 + 全局补充，结构化拼成一段答复。
-      // 读 gate-a.json 取同一份 open_questions（与卡片渲染同源）→ answerableDecisions 保证选项↔问题对齐。
+      // Collected item by item: each open_question's dropdown selection (ask_<id>), the overall verdict, and
+      // the free-text notes, composed into one structured answer.
+      // gate-a.json is read for the same open_questions the card was rendered from, which is what keeps each
+      // option lined up with its question.
       const before = await sessions.resolve(slug);
       const oqRaw = before?.gate_a_output_path && existsSync(before.gate_a_output_path) ? readFileSync(before.gate_a_output_path, 'utf8') : '';
       const items = openQuestionsToDecisions(parseOpenQuestions(oqRaw));
-      const answerBody = composeDecisionAnswer(items, fv); // 逐条选择 + 全局补充（无 verdict 前缀）——PRD 留痕用
-      const note = composeDecisionAnswer(items, fv, verdict).trim(); // 回喂复评（含整体结论框架）
-      // 提交按钮防二次点击：靠下面 syncGroupCard 把带表单的群卡换成「复评中·第N轮」无按钮卡。
-      // 兜底：SDK 去重(12h)+ submitPmAnswers 幂等(REVISION_REQUESTED 重入)+ 失败分支也刷新群卡。
+      const answerBody = composeDecisionAnswer(items, fv); // the per-item selections plus the notes (with no verdict prefix) — this is what is recorded on the PRD
+      const note = composeDecisionAnswer(items, fv, verdict).trim(); // what is fed back for the re-review (including the overall verdict)
+      // Guarding the submit button against a second click: syncGroupCard below replaces the channel card's
+      // form with a "re-reviewing, round N" card that has no buttons.
+      // The backstops: the SDK's own deduplication (12h), submitPmAnswers being idempotent (re-entering
+      // REVISION_REQUESTED), and the failure branch refreshing the card too.
       const r = await submitPmAnswers(slug, 'PM', note || undefined);
       const s = await sessions.resolve(slug);
       if (r.ok && s) {
-        // PRD 留痕取结构化答复（含逐条下拉选择），而非仅自由文本——否则 PM 只点下拉时留痕成「批注：（无）」。
+        // The record on the PRD takes the structured answer (including the per-item dropdown selections)
+        // rather than the free text alone — otherwise, when product only uses the dropdowns, the record would
+        // read "Notes: (none)".
         postConfirmComment(s, { who: 'PM', verdict, notes: answerBody });
-        await syncGroupCard(s); // 群卡 → 「复评中·第N轮」（去掉残留表单）
-        await tick(); // 立即跑复评；tick 内据结果再发 needs_confirm（下一轮）/ needs_gateb（完成）/ needs_arbitration（停泊）
+        await syncGroupCard(s); // the channel card becomes "re-reviewing, round N" (with the form removed)
+        await tick(); // run the re-review immediately; from its result the tick sends needs_confirm (another round), needs_gateb (finished) or needs_arbitration (parked)
       } else {
-        if (s) await syncGroupCard(s); // 失败也刷新群卡，避免旧表单/按钮滞留
-        await ack(`提交失败：${r.msg}`);
+        if (s) await syncGroupCard(s); // refresh the card on failure too, so a stale form or button does not linger
+        await ack(`the submission failed: ${r.msg}`);
       }
       return;
     }
     if (act === 'force_confirm') {
-      // M 在「待裁决」卡上强制结束评审（PM 无此按钮）。
+      // The maintainer forces the review closed from the "waiting on a decision" card (product has no such
+      // button).
       const r = await confirm(slug, actor);
       const s = await sessions.resolve(slug);
       if (r.ok && s) await notify('needs_gateb', s);
-      else await ack(`强制通过失败：${r.msg}`);
+      else await ack(`forcing it through failed: ${r.msg}`);
       return;
     }
     if (act === 'gateb') {
-      await ack(`闸B 排队中：${slug}（出方案 + Codex⇄Claude 多轮对抗，约数分钟）…`);
+      await ack(`Gate B is queued for ${slug} (producing the plan, then several Codex/Claude adversarial rounds — a few minutes)...`);
       const r = await requestGateB(slug, actor);
       if (!r.ok) await ack(r.msg);
-      await tick(); // 立即推进闸B
+      await tick(); // advance Gate B immediately
       return;
     }
     if (act === 'gateb_answer_submit') {
-      // M 在「方案待拍板」卡上提交决定 → 回喂同一 claude 会话续修（闸B 多轮人在环）。
-      // 读各下拉选择(ask_*) + 补充说明(notes)，按 id 结构化拼回喂；全空时 submitGateBAnswers 兜「再修一轮」。
+      // The maintainer submits their decisions from the "the plan is waiting on your decision" card, which is
+      // fed back into the same claude session to carry on (Gate B's human-in-the-loop rounds).
+      // It reads each dropdown selection (ask_*) plus the notes and composes them by id; when everything is
+      // empty, submitGateBAnswers falls back to "one more round".
       const fv = parsed.formValues;
       const before = await sessions.resolve(slug);
       const asks = before ? parseHumanAsks(before.gate_b_human_asks) : [];
@@ -100,41 +117,44 @@ async function handleCardAction(evt: Record<string, unknown>): Promise<void> {
       const r = await submitGateBAnswers(slug, actor, answer || undefined);
       const s = await sessions.resolve(slug);
       if (r.ok && s) {
-        await syncGroupCard(s); // 群卡 → 「依答复修订方案中」（去掉残留表单）
-        await tick(); // 立即续修；tick 内据结果再发卡（下一轮升级 / 待 GO / 停泊裁决）
+        await syncGroupCard(s); // the channel card becomes "revising the plan with your answers" (with the form removed)
+        await tick(); // carry on immediately; from its result the tick sends the next card (another escalation / waiting on GO / parked for a decision)
       } else {
         if (s) await syncGroupCard(s);
-        await ack(`提交失败：${r.msg}`);
+        await ack(`the submission failed: ${r.msg}`);
       }
       return;
     }
     if (act === 'gateb_force_go') {
-      // M 在「方案待裁决」卡上强制立项 → AWAITING_GO（内含算自动指派推荐）。
+      // The maintainer forces the work open from the "the plan is waiting on a decision" card -> AWAITING_GO
+      // (which computes the automatic assignment along the way).
       const r = await forceGateBGo(slug, actor);
       const s = await sessions.resolve(slug);
       if (r.ok && s) await notify('needs_go', s);
-      else await ack(`强制立项失败：${r.msg}`);
+      else await ack(`forcing the work open failed: ${r.msg}`);
       return;
     }
     if (act === 'gateb_send_back') {
-      // M 在「方案待裁决」卡上选「再修一轮」→ 续修点。
-      const r = await submitGateBAnswers(slug, actor, '再修一轮（M 未给具体批注）');
+      // The maintainer picks "one more round" on the "the plan is waiting on a decision" card.
+      const r = await submitGateBAnswers(slug, actor, 'one more round (the maintainer gave no specific notes)');
       const s = await sessions.resolve(slug);
       if (r.ok && s) {
         await syncGroupCard(s);
         await tick();
       } else {
-        await ack(`再修失败：${r.msg}`);
+        await ack(`another round could not be started: ${r.msg}`);
       }
       return;
     }
     if (act === 'go') {
-      // GO 卡 go_form 提交：form_value.assignee = 选定 DRI（默认推荐人，可下拉改）。
+      // The GO card's go_form submission: form_value.assignee is the chosen DRI (the recommendation by
+      // default, changeable from the dropdown).
       const fv = parsed.formValues;
       const assignee = (fv.assignee ?? '').trim() || undefined;
-      await ack(`建需求中：${slug}${assignee ? `（指派 ${assignee}）` : ''}…`);
-      const r = await go(slug, actor, assignee ? { assignee } : {}); // 成功/写阶段失败各自发卡
-      // 预检拒绝（权限/lint/未指派 DRI）不会自发卡——仍停在 GO 待办态，于此回执让 M 知道为何没建。
+      await ack(`creating the work items for ${slug}${assignee ? ` (assigned to ${assignee})` : ''}...`);
+      const r = await go(slug, actor, assignee ? { assignee } : {}); // success and a write-stage failure each send their own card
+      // A pre-check refusal (permissions, the lint, no DRI assigned) sends no card of its own — the session
+      // stays in the waiting-on-GO state, so this reply tells the maintainer why nothing was created.
       if (!r.ok) {
         const st = (await sessions.resolve(slug))?.state;
         if (st === 'AWAITING_GO' || st === 'GO_DENIED') await ack(r.msg);
@@ -142,114 +162,132 @@ async function handleCardAction(evt: Record<string, unknown>): Promise<void> {
       return;
     }
     if (act === 'deny') {
-      const r = await deny(slug, actor); // 无权限/状态不符 → 不真打回，回执原因（别假报「已打回」）
-      await ack(r.ok ? `已打回 ${slug}` : r.msg);
+      const r = await deny(slug, actor); // no permission, or the wrong state -> it is not really sent back, and the reason is replied (never falsely reporting "sent back")
+      await ack(r.ok ? `${slug} sent back` : r.msg);
       return;
     }
     if (act === 'retry') {
-      const r = await retry(slug, actor); // 无权限/无可重试态 → 不真重置，回执原因（别假报「已重置」）
+      const r = await retry(slug, actor); // no permission, or nothing to retry -> it is not really reset, and the reason is replied (never falsely reporting "reset")
       if (!r.ok) {
         await ack(r.msg);
         return;
       }
-      await ack(`已重置 ${slug}，重跑中…`);
+      await ack(`${slug} reset, re-running...`);
       await tick();
       return;
     }
-    log.warn(`未知 cardAction：${act}`);
+    log.warn(`unknown cardAction: ${act}`);
   } catch (e) {
-    log.err(`cardAction 处理失败：${String(e).slice(0, 200)}`);
-    await ack(`处理失败：${String(e).slice(0, 160)}`);
+    log.err(`handling the cardAction failed: ${String(e).slice(0, 200)}`);
+    await ack(`it failed: ${String(e).slice(0, 160)}`);
   }
 }
 
 export const __handleCardActionForTest = handleCardAction;
 
-// 重复 PRD 提醒卡（灰头，回复 PM 那条；无 msgId 则发到群）。best-effort，失败只记日志不阻断。
+// The duplicate-PRD notice card (grey, posted as a reply to product's message; with no msgId it goes into the
+// channel). Best-effort: a failure is only logged and never blocks.
 async function replyDuplicate(intakeMsgId: string | undefined, chatId: string, notice: string): Promise<void> {
-  const card: CardModel = { color: 'grey', title: '🔁 重复提交', blocks: [{ kind: 'text', md: notice }] };
+  const card: CardModel = { color: 'grey', title: '🔁 submitted again', blocks: [{ kind: 'text', md: notice }] };
   try {
     if (intakeMsgId) await port.replyGroupCard(intakeMsgId, card);
     else if (chatId) await port.sendGroupCard(chatId, card);
   } catch (e) {
-    log.warn(`重复 PRD 回复失败(不影响去重)：${String(e).slice(0, 120)}`);
+    log.warn(`replying about the duplicate PRD failed (deduplication is unaffected): ${String(e).slice(0, 120)}`);
   }
 }
 
 async function handleMessage(evt: Record<string, unknown>): Promise<void> {
-  // 入站解析交给 adapter：把飞书原始事件规整成 provider 无关的 InboundMessage（text + searchTexts 候选）。
+  // Parsing the inbound event is the adapter's job: it normalises the provider's raw event into a
+  // provider-agnostic InboundMessage (text plus the searchTexts candidates).
   const m = port.parseMessage(evt);
   if (!m) return;
   const chatId = m.chatId;
-  const createTime = m.createTime; // adapter 已兜 now()（缺 createTime 不塞 0，避免水位插到 epoch）
+  const createTime = m.createTime; // the adapter already falls back to now() (a missing createTime is never 0, which would put the cursor back at the epoch)
   const posterId = m.senderId;
   const intakeMsgId = m.messageId;
   const text = m.text;
-  // 群消息入口闸：群里**只有 @机器人**才入流程——否则群内随手分享/转发的文档会被误当 PRD 吃进闸A（白花钱）。
-  // 判定材料由 adapter 从事件里**服务端填充的 mentions** 算好（isGroup/mentionedBot，独立于 SDK 正文 @ normalize）；
-  // 判据本身收在 messaging/gate.ts——与离线补拉**共用同一个**，两条路径不会对「什么算一条需求」各说各话。
-  // live 侧对「确认不了」取忽略：这条消息还在群里，人再 @ 一次即可，代价只是一次重发（补拉侧取反，理由见 gate.ts）。
+  // The channel entry gate: in a channel **only a message that mentions the bot** enters the pipeline —
+  // otherwise a document someone casually shares or forwards would be taken for a PRD and run through Gate A,
+  // spending money for nothing.
+  // The material for that judgement is worked out by the adapter from the **server-populated mentions** in
+  // the event (isGroup / mentionedBot, independent of how the SDK normalises an @ in the body); the criteria
+  // themselves live in messaging/gate.ts — **shared with** the offline backfill, so the two paths cannot
+  // disagree about what counts as a requirement.
+  // On the live side "cannot confirm" means ignore: the message is still in the channel, so someone can
+  // mention the bot again and the only cost is one repost (the backfill side takes the opposite choice; the
+  // reasoning is in gate.ts).
   const gate = mentionGate(m);
   if (gate !== 'admit') {
     if (gate === 'unconfirmable') {
-      log.warn(`消息入口：群消息但无法确认是否 @ 了机器人（${port.id} 未配 bot 自身 id）→ 保守忽略此消息`);
+      log.warn(`message entry: a channel message, but whether the bot was mentioned cannot be confirmed (${port.id} has no bot user id configured) -> conservatively ignoring it`);
     } else {
-      log.info('消息入口：群消息未 @机器人 → 按规则忽略（不入流程）');
+      log.info('message entry: a channel message that does not mention the bot -> ignored by the rule (it does not enter the pipeline)');
     }
-    if (chatId) cursors.advanceCursor(chatId, createTime); // 仍推进水位，避免重连后反复重拉这条非 @ 消息
+    if (chatId) cursors.advanceCursor(chatId, createTime); // the cursor still advances, so a reconnect does not keep re-fetching this non-mentioning message
     return;
   }
-  // 链接常不在纯文本里（文档分享卡片 / 富文本 post）——adapter 把这些结构挖成 searchTexts 候选，
-  // 交给**文档源注册表**认领（谁认得出就归谁；一个都不认才轮到兜底源）。核心不知道任何一种链接长什么样。
+  // A link is often not in the plain text (a document share card, or a rich-text post) — the adapter digs
+  // those structures out into the searchTexts candidates, and the **document source registry** claims them
+  // (whoever recognises it owns it; the fallback source only gets its turn when nobody does). The core knows
+  // what none of these links look like.
   const docs = claimDocs({ text, searchTexts: m.searchTexts });
   if (process.env.FORGE_WS_DEBUG === '1') {
-    log.info(`消息入口收到：chat=${chatId} docs=${docs.length} text="${text.slice(0, 80)}" evt=${JSON.stringify(evt).slice(0, 700)}`);
+    log.info(`message entry received: chat=${chatId} docs=${docs.length} text="${text.slice(0, 80)}" evt=${JSON.stringify(evt).slice(0, 700)}`);
   }
   if (docs.length === 0) {
-    log.warn('消息入口：没有任何文档源认领这条消息，忽略');
+    log.warn('message entry: no document source claimed this message, so it is ignored');
   } else {
     for (const doc of docs) {
       const r = await addPrd({ doc, chatId: chatId || undefined, posterId, intakeMsgId });
       if (r.ok && r.session) {
         if (r.created) {
-          log.ok(`消息入口：登记 ${r.session.slug}`);
-          await syncGroupCard(r.session); // 立刻在群里回复 PM 那条、发/刷新状态卡（即时反馈）
+          log.ok(`message entry: registered ${r.session.slug}`);
+          await syncGroupCard(r.session); // reply beneath product's message in the channel straight away with the status card, for immediate feedback
         } else {
-          // PRD 级去重：同一需求重复提交 → 明确回复 PM「已评审过，本次不再评审」，不重复建需求。
-          log.info(`消息入口：重复 PRD（${r.session.slug}，${r.session.state}）→ 回复 PM`);
+          // PRD-level deduplication: the same requirement submitted again gets a clear reply to product —
+          // "this has already been reviewed and will not be reviewed again" — rather than a duplicate.
+          log.info(`message entry: a duplicate PRD (${r.session.slug}, ${r.session.state}) -> replying to product`);
           await replyDuplicate(intakeMsgId, chatId, r.msg);
         }
       } else {
-        log.warn(`消息入口：登记失败 ${r.msg}`);
+        log.warn(`message entry: registration failed ${r.msg}`);
       }
     }
-    await tick(); // 立即跑闸A
+    await tick(); // run Gate A immediately
   }
-  // 推进该群水位（含无链接消息）→ 登记群供 backfill + 避免重连后重复补拉本条。
+  // Advance this channel's cursor (including for a message with no link) -> it registers the channel for the
+  // backfill and stops a reconnect re-fetching this message.
   if (chatId) cursors.advanceCursor(chatId, createTime);
 }
 
 export const __handleMessageForTest = handleMessage;
 
-// 全局崩溃安全网（长驻 daemon 专用，CLI 一次性命令不需要）。分两类语义：
-// - unhandledRejection：单个漏网 promise 通常不污染全局状态 → log + 私聊告警 M + **续跑**（绝不静默吞，符合「失败不静默」）。
-// - uncaughtException：进程状态已不可信（Node 官方明确续跑不安全）→ log + 告警 + **退出**，
-//   交 launchd KeepAlive 干净重启；崩溃残留的孤儿态由 reclaimOrphans + 毒丸保护回收。
-// 与既有「保活两层（看门狗救卡死 / launchd 救死）」互补：这条专救「event handler 里漏网的异步抛」。
+// The global crash safety net (for the long-running daemon only; a one-shot CLI command does not need it).
+// It has two distinct semantics:
+// - unhandledRejection: one escaped promise usually does not corrupt global state -> log it, alert the
+//   maintainer by direct message, and **carry on** (never swallowed silently, in line with "a failure is
+//   never silent").
+// - uncaughtException: the process's state can no longer be trusted (Node states plainly that carrying on is
+//   unsafe) -> log it, alert, and **exit**, leaving launchd's KeepAlive to restart cleanly; whatever orphaned
+//   state the crash left behind is reclaimed by reclaimOrphans plus the poison-pill protection.
+// It complements the two existing keep-alive layers (the watchdog rescues a wedge, launchd rescues a death):
+// this one is specifically for an async throw that escaped an event handler.
 function installCrashHandlers(): void {
   process.on('unhandledRejection', (reason) => {
     const msg = String((reason as { stack?: string } | undefined)?.stack ?? reason).slice(0, 400);
-    log.err(`unhandledRejection（已捕获，daemon 续跑）：${msg}`);
-    void port.sendDmText('⚠️ unhandledRejection（daemon 续跑）', [msg], 'red').catch(() => undefined);
+    log.err(`unhandledRejection (caught; the daemon carries on): ${msg}`);
+    void port.sendDmText('⚠️ unhandledRejection (the daemon carries on)', [msg], 'red').catch(() => undefined);
   });
   process.on('uncaughtException', (err) => {
     const msg = String(err?.stack ?? err).slice(0, 400);
-    log.err(`uncaughtException（进程状态不可信，优雅退出待 launchd 重启）：${msg}`);
-    // 告警尽力而为：给 1.5s 让飞书把卡片发出去，无论成败都退出（不长期阻塞在不可信状态里）。
+    log.err(`uncaughtException (the process's state cannot be trusted; exiting gracefully for launchd to restart): ${msg}`);
+    // The alert is best-effort: 1.5s is allowed for the card to go out, and it exits either way rather than
+    // blocking indefinitely in an untrustworthy state.
     const bail = (): never => process.exit(1);
     const t = setTimeout(bail, 1500);
     void port
-      .sendDmText('🔴 uncaughtException（守护重启中）', [msg], 'red')
+      .sendDmText('🔴 uncaughtException (the daemon is restarting)', [msg], 'red')
       .catch(() => undefined)
       .finally(() => {
         clearTimeout(t);
@@ -263,15 +301,20 @@ export async function listen(): Promise<void> {
   const cfg = loadConfig();
   const intervalMs = Math.max(30, cfg.runtime.poll_interval_sec || 180) * 1000;
 
-  // 保活/健康：起心跳 + 本地状态页 + liveness ping + 健康采样。
+  // Keep-alive and health: start the heartbeat, the local status page, the liveness ping and the health
+  // sampling.
   const hcfg = healthConfig();
   initHeartbeat({ pid: process.pid, port: hcfg.port, wsConfigured: port.inboundConfigured(), now: Date.now() });
   startHealthServer(hcfg.port);
-  // 控制面/Runner 分离：本机当**控制面**时同进程起控制面 HTTP（/jobs+/store），让 `forge listen` 一个进程 =
-  // 编排（reclaim/retry/autonomy/remind/sweep/drift，见 worker.tick）+ 自身 job loop + 服务额外 runner——
-  // 单 sqlite 连接、无多进程争用。这才是「控制面进程跑全 tick + 服务」可运行的真身（额外 runner 设 FORGE_CONTROL_URL
-  // 只跑 job loop）。仅当配 FORGE_CONTROL_PORT 且本机**非纯 runner**（未设 FORGE_CONTROL_URL）才起；纯 runner 当
-  // server 会被 startControlServer fail-closed② 拦。默认（未配 PORT）不起，行为零变更。
+  // The control-plane / runner split: when this machine is the **control plane**, the control-plane HTTP
+  // surface (/jobs and /store) starts in the same process, so one `forge listen` process is the orchestration
+  // (reclaim, retry, autonomy, reminders, the sweep and drift — see worker.tick) plus its own job loop plus
+  // serving the extra runners — one sqlite connection, with no contention between processes. This is what
+  // "the control-plane process runs the whole tick and serves" actually looks like (an extra runner sets
+  // FORGE_CONTROL_URL and runs the job loop only).
+  // It starts only when FORGE_CONTROL_PORT is set and this machine is **not a pure runner**
+  // (FORGE_CONTROL_URL unset); a pure runner acting as the server is caught by startControlServer's
+  // fail-closed guard 2. By default (no PORT) it does not start, and behaviour is unchanged.
   if (process.env.FORGE_CONTROL_PORT && !process.env.FORGE_CONTROL_URL) {
     try {
       await startControlServer({
@@ -280,95 +323,105 @@ export async function listen(): Promise<void> {
         token: process.env.FORGE_CONTROL_TOKEN || undefined,
       });
     } catch (e) {
-      // fail-fast：配了控制面端口却绑不上 = 半启动（health/tick 活着但 /jobs+/store 不可用、额外 runner 拉不到 job）。
-      // 硬退（health server 已起会留住 event loop，单靠 exitCode 退不掉）→ launchd 重启；端口持续被占则**响亮地反复失败**，
-      // 暴露误配，绝不静默以「无控制面」形态活着。
-      log.err(`控制面 HTTP 启动失败，拒绝以「无控制面」形态运行：${String(e).slice(0, 200)}`);
+      // Fail fast: a control-plane port configured but impossible to bind means a half-start — health and the
+      // tick are alive while /jobs and /store are unavailable and the extra runners can pull no jobs.
+      // It exits hard (the health server is already up and holds the event loop, so setting exitCode alone
+      // would not exit) and launchd restarts it; if the port stays occupied it fails **loudly and
+      // repeatedly**, exposing the misconfiguration, rather than living on silently with no control plane.
+      log.err(`the control-plane HTTP surface failed to start; refusing to run without a control plane: ${String(e).slice(0, 200)}`);
       process.exit(1);
     }
   }
-  // liveness ping：gate 是 async spawn 不堵 event loop，此快 ping 是真·判活信号（看门狗据此判卡死）。
+  // The liveness ping: a gate is spawned asynchronously and does not block the event loop, so this quick ping
+  // is the real liveness signal (and what the watchdog judges a wedge on).
   const pingHealth = async (): Promise<void> => {
     try {
       const active = await sessions.countByStates([...ACTIVE_GATE_STATES]);
       pingLiveness(Date.now(), active);
     } catch {
-      /* ping 尽力而为 */
+      /* the ping is best-effort */
     }
   };
   void pingHealth();
   setInterval(() => void pingHealth(), hcfg.livenessPingSec * 1000);
-  // 健康采样：落滚动历史；总状态翻转时发飞书（守护活着才发——进程级宕机由看门狗负责）。
+  // Health sampling: it records the rolling history and alerts when the overall status flips (only while the
+  // daemon is alive — a process-level outage is the watchdog's job).
   const sampleHealth = async (): Promise<void> => {
     try {
       const report = await evaluateHealth(Date.now());
       const { flipped, prev } = recordSample(report, hcfg.historyRetainHours);
       if (flipped && prev) {
         if (report.status === 'healthy') {
-          await sendHealthAlert('recovered', '服务已恢复', [`从「${prev}」恢复正常。`]);
+          await sendHealthAlert('recovered', 'the service has recovered', [`back to normal from "${prev}".`]);
         } else {
           const lines = report.checks
             .filter((c) => c.status === 'down' || c.status === 'degraded')
-            .map((c) => `- **${c.name}**：${c.detail}`);
-          await sendHealthAlert(report.status === 'down' ? 'down' : 'degraded', report.status === 'down' ? '服务异常' : '服务降级', lines.length ? lines : ['（无明细）']);
+            .map((c) => `- **${c.name}**: ${c.detail}`);
+          await sendHealthAlert(report.status === 'down' ? 'down' : 'degraded', report.status === 'down' ? 'the service is disrupted' : 'the service is degraded', lines.length ? lines : ['(no detail)']);
         }
       }
     } catch (e) {
-      log.warn(`健康采样失败：${String(e).slice(0, 140)}`);
+      log.warn(`the health sampling failed: ${String(e).slice(0, 140)}`);
     }
   };
   setInterval(() => void sampleHealth(), hcfg.sampleIntervalSec * 1000);
 
-  // 外部依赖契约：每日带外主动探测（codex/claude 升级会悄悄改输出 schema，发生在我们提交之外）。
-  // 探针付费（codex+claude 各一发 trivial），故仅每 contract_interval_hours 跑一次；漂移翻转去抖后私聊告警。
+  // The external dependencies' contracts: an active out-of-band probe once a day (a codex or claude upgrade
+  // can quietly change the output schema, and it happens outside anything we commit).
+  // The probe costs money (one trivial call each for codex and claude), so it only runs every
+  // contract_interval_hours; a drift is debounced on the flip and then sent as a direct message.
   if (hcfg.contractCheckEnabled) {
     const contractDaily = async (): Promise<void> => {
       try {
         await runContractProbes(Date.now());
       } catch (e) {
-        log.warn(`契约探测失败：${String(e).slice(0, 140)}`);
+        log.warn(`the contract probe failed: ${String(e).slice(0, 140)}`);
       }
     };
-    // 启动即跑一次（状态页/doctor 不显「尚未探测」），但**按 checked_at 节流**：最近一次探测在间隔内则跳过，
-    // 防 daemon 崩溃重启循环时每次启动都付费探一次（contract 探测是付费 claude+codex 调用）。
+    // It runs once at startup, so the status page and doctor do not say "not probed yet" — but **throttled by
+    // checked_at**: if the most recent probe is within the interval it is skipped, so a daemon
+    // crash-restart loop does not pay for a probe on every start (a contract probe is a paid claude and codex
+    // call).
     if (startupProbeDue(allProbes(), Date.now(), hours(hcfg.contractIntervalHours))) {
       void contractDaily();
     } else {
-      log.info(`外部契约最近一次探测在 ${hcfg.contractIntervalHours}h 内，启动跳过（防崩溃重启反复付费探测；状态页仍显示上次结果）`);
+      log.info(`the external contracts were last probed within ${hcfg.contractIntervalHours}h, so the startup probe is skipped (which stops a crash-restart loop paying repeatedly; the status page still shows the last result)`);
     }
     setInterval(() => void contractDaily(), hours(hcfg.contractIntervalHours));
-    log.ok(`外部契约每日探测已启动（每 ${hcfg.contractIntervalHours}h）`);
+    log.ok(`the daily external-contract probe is running (every ${hcfg.contractIntervalHours}h)`);
   }
 
-  // 内置周期循环：先补拉离线期间群消息(backfill)，再推进闸处理(tick)。即便长连接没起也不停。
+  // The built-in periodic loop: backfill the channel messages missed while offline, then advance the gates
+  // (tick). It keeps running even when the connection never came up.
   const runCycle = async (): Promise<void> => {
     let ok = true;
     try {
       await backfillAll();
     } catch (e) {
-      log.err(`补拉失败：${String(e).slice(0, 160)}`);
+      log.err(`the backfill failed: ${String(e).slice(0, 160)}`);
     }
     try {
       await tick();
     } catch (e) {
       ok = false;
-      log.err(`周期 tick 失败：${String(e).slice(0, 160)}`);
+      log.err(`the periodic tick failed: ${String(e).slice(0, 160)}`);
     }
-    await maybeBackup(Date.now()).catch(() => undefined); // 每小时一份在线备份(内部 throttle)
+    await maybeBackup(Date.now()).catch(() => undefined); // one online backup an hour (throttled internally)
     markCycle(Date.now(), ok);
   };
   void runCycle();
   const timer = setInterval(() => void runCycle(), intervalMs);
-  log.ok(`周期循环已启动（补拉 + tick，每 ${intervalMs / 1000}s）`);
+  log.ok(`the periodic loop is running (backfill + tick, every ${intervalMs / 1000}s)`);
 
   if (!port.inboundConfigured()) {
-    log.warn(`未配置入站传输（${port.id} bot 凭据缺失）→ 仅周期 tick，无长连接（卡片按钮/群消息入口不可用）`);
-    await new Promise(() => {}); // 常驻
+    log.warn(`the inbound transport is not configured (${port.id}'s bot credentials are missing) -> the periodic tick only, with no connection (card buttons and the channel entry point are unavailable)`);
+    await new Promise(() => {}); // stays up
     return;
   }
 
-  // 长连接交给 adapter（port.startInbound 内建 channel + 收发）；core 只接 provider 无关回调，
-  // markWs(健康判活) / runCycle(补拉) 留在 core——adapter 不碰任何健康/业务概念。
+  // The connection is the adapter's job (port.startInbound builds the channel and does the sending and
+  // receiving); the core only takes provider-agnostic callbacks, and markWs (the health liveness signal) and
+  // runCycle (the backfill) stay in the core — the adapter touches no health or business concept at all.
   const channel = port.startInbound({
     onCardAction: (raw) => {
       markWs(true, Date.now());
@@ -380,12 +433,13 @@ export async function listen(): Promise<void> {
     },
     onError: (reason) => {
       markWs(false, Date.now());
-      log.err(`长连接错误：${reason.slice(0, 200)}`);
+      log.err(`the connection errored: ${reason.slice(0, 200)}`);
     },
-    // 断线重连后立即补拉断连期间漏掉的群消息（长连接不补推历史事件）。
+    // After reconnecting, immediately backfill the channel messages missed while disconnected (the connection
+    // does not replay historical events).
     onReconnected: () => {
       markWs(true, Date.now());
-      log.ok('长连接已重连 → 补拉断连期间群消息');
+      log.ok('the connection is back -> backfilling the channel messages missed while disconnected');
       void runCycle();
     },
   });
@@ -393,13 +447,13 @@ export async function listen(): Promise<void> {
   try {
     await channel.connect();
     markWs(true, Date.now());
-    log.ok(`${port.id} 长连接已建立（卡片按钮回调 + 群消息入口已就绪）`);
-    void runCycle(); // 开机首次：立即捞离线期间 PM 发的需求
+    log.ok(`the ${port.id} connection is established (card button callbacks and the channel entry point are ready)`);
+    void runCycle(); // the first run at startup: pick up the requirements posted while offline
   } catch (e) {
     markWs(false, Date.now());
-    log.err(`长连接建立失败：${String(e).slice(0, 200)}（检查 ${port.id} 后台的事件订阅/长连接是否已开，见 deploy/README）。仅周期 tick 继续。`);
+    log.err(`the connection could not be established: ${String(e).slice(0, 200)} (check whether event subscription over a long connection is enabled in ${port.id}'s app settings — see deploy/README). The periodic tick carries on alone.`);
   }
-  // 常驻：长连接事件 + 周期 tick
+  // It stays up: connection events plus the periodic tick
   await new Promise(() => {});
-  clearInterval(timer); // 不会到达，留作语义完整
+  clearInterval(timer); // never reached; kept so the code reads completely
 }

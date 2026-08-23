@@ -70,3 +70,11 @@ export function refTitle(s: Pick<Session, 'ref_num' | 'slug' | 'title'>, prefix 
   const t = (s.title ?? '').replace(/\s+/g, ' ').trim().slice(0, 40);
   return `${prefix}${reqRef(s)}${t ? ` · ${t}` : ''}`;
 }
+
+// The tag actions.ts writes into confirmed_notes for each round of product's answers, and notify.ts reads
+// back out to echo the previous round on the re-review banner.
+// Both sides go through this one definition on purpose. While it was a literal spelled out on each side,
+// changing the wording in one of them silently emptied the banner for every session — the write kept working,
+// the read matched nothing, and no test noticed.
+export const answerRoundTag = (round: number): string => `[round ${round} answers]`;
+export const ANSWER_ROUND_TAG_RE = /^\[round \d+ answers\]\s*/;

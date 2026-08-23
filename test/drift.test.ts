@@ -146,7 +146,7 @@ test('reposOffRef：HEAD==sha 且干净→对齐(空)；sha 不符/脏树→列�
 test('driftDm：漂移告警含标题/逐条漂移/复核入口', () => {
   const s = { slug: 'refund', title: '退款', ref_num: null } as never;
   const dm = driftDm(s, strictParse(DriftSchema, DRIFTED));
-  assert.match(dm.title, /实现漂移/);
+  assert.match(dm.title, /the implementation has drifted/);
   assert.ok(dm.lines.some((l) => /POST \/refund 返回 202/.test(l)));
   assert.ok(dm.lines.some((l) => /forge show refund/.test(l)));
 });
@@ -172,7 +172,7 @@ test('reconcileDrift：全关 + claude 判漂移 → drift_detected + 终态 + �
   assert.ok(k.includes('drift_detected'));
   assert.ok(k.includes('drift_reconciled'));
   assert.equal(dmCards.length, 1);
-  assert.match(dmCards[0].title, /实现漂移/);
+  assert.match(dmCards[0].title, /the implementation has drifted/);
   assert.equal(dmCards[0].color, 'red');
 });
 
@@ -240,7 +240,7 @@ test('reconcileDrift：退避耗尽(max_polls) → 放弃记终态 + 橙色告�
   assert.ok(k.includes('drift_reconciled')); // 放弃也记终态
   assert.equal(claudeCalls, 0);
   assert.equal(dmCards.length, 1);
-  assert.match(dmCards[0].title, /放弃/);
+  assert.match(dmCards[0].title, /giving up/);
   assert.equal(dmCards[0].color, 'orange');
 });
 

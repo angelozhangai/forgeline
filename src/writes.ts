@@ -16,42 +16,52 @@ export interface WriteResult {
   ok: boolean;
   stdout: string;
   issues: CreatedIssue[];
-  published: boolean; // 技术方案是否**真的**发布了主仓 PR（demo 真发=true；native no-op / 未开发布=false）。DONE 文案据此。
+  published: boolean; // whether the technical plan **really** was published as a PR to the main repo (the demo adapter really does = true; a native no-op, or publishing switched off = false). The DONE wording follows this.
 }
 
-// dryRun=只打印不创建；onCreated=issue 一建成立即回调落库（崩溃窗内也不丢已建记录，retry 据此跳过重建）。
+// dryRun prints without creating; onCreated is called back the moment an issue is created so it is persisted
+// (nothing is lost in the crash window, and a retry uses it to skip recreating).
 export interface WriteOpts {
   dryRun?: boolean;
   onCreated?: (issues: CreatedIssue[]) => void;
 }
 
-// 伞仓（多仓 Epic 本体所在仓）与「仓字母 → 仓名」映射现按目标项目解析（projectForSession(s) → .umbrella / .repoMap）。
+// The umbrella repo (where a multi-repo Epic itself lives) and the "repo letter -> repo name" mapping are now
+// resolved from the target project (projectForSession(s) -> .umbrella / .repoMap).
 
-// 交付文档自动提交（config 门控、默认关、**绝不 push**）：把 docs/delivery/<slug>/ 提交到目标项目当前分支。
-// 两处调用：① 立项成功（归档 req-review/tech-design）；② 闸D 全部目标仓补强完进合并就绪（归档 merge-readiness*.md）。
-// best-effort——失败/异常只 warn，绝不阻断已成功的流程；返回结果供调用方留事件/审计。导出供下游 worker 复用同一门控。
+// Committing the delivery documents automatically (gated by config, off by default, and it **never pushes**):
+// it commits docs/delivery/<slug>/ onto the target project's current branch.
+// It is called from two places: (1) when the work is opened successfully (archiving req-review and
+// tech-design); (2) when Gate D has finished hardening every target repo and moves to merge-ready (archiving
+// merge-readiness*.md).
+// Best-effort — a failure or an exception only warns and never blocks a pipeline that has already succeeded;
+// the result is returned so the caller can record an event and an audit trail. Exported so the downstream
+// worker reuses the same gating.
 export async function maybeCommitDeliveryDocs(s: Session): Promise<{ ok: boolean; committed: boolean }> {
   if (!loadConfig().runtime.delivery_doc_commit?.enabled) return { ok: true, committed: false };
   try {
     const { root } = projectForSession(s);
     const r = await commitDeliveryDocs({ root, slug: s.slug, refNum: s.ref_num ?? undefined });
-    if (r.committed) log.info(`📄 已提交交付文档 docs/delivery/${s.slug}（目标项目当前分支，未 push）`);
-    else if (!r.ok) log.warn(`交付文档自动提交失败（不影响流程，请人工提交）：${r.stderr}`);
+    if (r.committed) log.info(`📄 committed the delivery documents docs/delivery/${s.slug} (onto the target project's current branch; not pushed)`);
+    else if (!r.ok) log.warn(`committing the delivery documents automatically failed (it does not affect the pipeline; please commit them yourself): ${r.stderr}`);
     return { ok: r.ok, committed: r.committed };
   } catch (e) {
-    log.warn(`交付文档自动提交异常（不影响流程）：${String(e).slice(0, 140)}`);
+    log.warn(`committing the delivery documents automatically threw (it does not affect the pipeline): ${String(e).slice(0, 140)}`);
     return { ok: false, committed: false };
   }
 }
 
-// 上一轮已建成的 issue（WRITE_FAILED 多发生在建成后的 labels/approve 步骤）→ retry 据此跳过重建，绝不重复建 issue。
+// The issues the previous round already created (a WRITE_FAILED usually happens in the labelling or approval
+// step *after* they exist) -> a retry uses this to skip recreating them, so an issue is never created twice.
 function alreadyCreated(s: Session): CreatedIssue[] {
   const arr = safeParse<CreatedIssue[]>(s.created_issues, []);
   return Array.isArray(arr) ? arr.filter((i) => i?.repo && i.number) : [];
 }
 
-// 给建好的 issue 打 size:* 标签（喂主仓 weekly-load.sh 的「规模」轴）。返回失败列表（聚合后由 doWrites 决定是否停泊）。
-// size 对工程师可见(标签)、但人均工作量加权(weekly-load)才是管理面——符合 show size / 别滥用 workload。
+// Label the created issues with size:* (which feeds the size axis of the main repo's weekly-load.sh). It
+// returns the failures, and doWrites decides from the aggregate whether to park.
+// The size is visible to engineers as a label, but the weighted per-person workload (weekly-load) is
+// management-facing — show the size, and do not misuse workload.
 async function applySizeLabels(
   issues: CreatedIssue[],
   overall: Size | null,
@@ -61,7 +71,8 @@ async function applySizeLabels(
 ): Promise<{ repo: string; number: number; stderr: string }[]> {
   const fails: { repo: string; number: number; stderr: string }[] = [];
   for (const iss of issues) {
-    // Epic(伞仓)/单仓 → 整需求档；子 issue → 该仓切片档(无则回退整需求档)。
+    // An Epic (in the umbrella repo) or a single repo takes the whole requirement's tier; a sub-issue takes
+    // that repo's slice tier, falling back to the whole requirement's.
     const spec = specs.find((sp) => repoMap[sp.repo] === iss.repo);
     const size = (spec?.size ? normSize(spec.size) : null) ?? overall;
     if (!size) continue;
@@ -71,87 +82,106 @@ async function applySizeLabels(
   return fails;
 }
 
-// 真正落地：建 issue（单仓/Epic）+ 闸B 放行置 status:3。dryRun=只打印不创建。
-// 幂等（P1-D）：① issue 一建成立即 onCreated 落库（建成后 labels/approve 失败也不丢记录）；
-// ② 入口若 created_issues 已有记录 → 跳过重建，仅补跑幂等的 labels/approve，绝不重复建 issue。
-// 失败不静默：approve 非零退出、size 标签打失败、多仓子 issue 部分缺失 → 一律抛 → WRITE_FAILED（绝不假装 DONE）。
+// Where it actually lands: create the issues (single repo or an Epic) and set status:3 as Gate B releases it.
+// dryRun prints without creating.
+// Idempotence (P1-D): (1) an issue is persisted through onCreated the moment it is created, so a failure in
+// the labelling or approval that follows does not lose the record; (2) if created_issues already has entries
+// on entry, recreating is skipped and only the idempotent labelling and approval are re-run — an issue is
+// never created twice.
+// Failures are never silent: a non-zero approve, a failed size label, or missing sub-issues in a multi-repo
+// requirement all throw -> WRITE_FAILED, and it never pretends to be DONE.
 export async function doWrites(s: Session, opts: WriteOpts = {}): Promise<WriteResult> {
   if (!s.gate_b_draft_path || !existsSync(s.gate_b_draft_path)) {
-    throw new Error('缺 gate-b 草稿，无法建需求');
+    throw new Error('the gate-b draft is missing, so the work items cannot be created');
   }
   const env = GateBSchema.parse(JSON.parse(readFileSync(s.gate_b_draft_path, 'utf8')));
-  if (env.issue_specs.length === 0) throw new Error('issue_specs 为空，无可建 issue');
-  // 目标项目：决定仓字母→仓名映射、伞仓；机械动作经 ProjectActions 端口（scriptsDir/owner 由 adapter 注入）。
+  if (env.issue_specs.length === 0) throw new Error('issue_specs is empty, so there is no issue to create');
+  // The target project decides the repo letter -> repo name mapping and the umbrella repo; the mechanical
+  // actions go through the ProjectActions port (the adapter injects scriptsDir and owner).
   const proj = projectForSession(s);
   const { repoMap, umbrella } = proj;
   const pa = projectActions(proj);
   const prd = s.prd_url ?? undefined;
-  // 立项 DRI：会话指派（自动推荐/人工改派）优先，回退闸B issue_spec 的 assignee。短码→login 按**该项目**的 reviewers
-  // 解析（配置分化：项目 pool 产出的短码须用项目级 reviewers 映射到 GitHub login，否则裸短码传给 new-req.sh 指错人/失败）。
+  // The DRI the work is opened under: the session's assignment (the automatic recommendation, or a human
+  // reassignment) wins, falling back to the assignee in Gate B's issue_spec. The short code is resolved to a
+  // login through **that project's** reviewers (configuration diverges per project: a short code produced by
+  // the project's pool has to be mapped to a GitHub login by the project's own reviewers, or passing the bare
+  // code to new-req.sh assigns the wrong person or fails).
   const sessionDri = s.assignee ? resolveLogin(configForSession(s), s.assignee) ?? s.assignee : null;
-  // 需求编号全程流转 → 写进 issue 正文（回链评审来源）。复杂度走 size:* 标签（见 applySizeLabels）。
-  const refLine = `评审编号：${reqRef(s)}`;
+  // The requirement number travels the whole way through, so it goes into the issue body (linking back to
+  // where the review came from). The complexity goes on as a size:* label (see applySizeLabels).
+  const refLine = `Review reference: ${reqRef(s)}`;
 
-  // 先把技术方案 doc 发布到主仓（提交+PR+merge）→ 再建 issue（用户口径：方案落地后才立项）。
-  // 失败抛 → go() 转 WRITE_FAILED，不建 issue；瞬时错(gh/网络) classifyError 自动重试；幂等不重复发。
+  // Publish the technical-design document to the main repo first (commit, PR, merge), and only then create
+  // the issues — the maintainer's rule is that the work opens once the plan has landed.
+  // A failure throws -> go() moves to WRITE_FAILED and creates no issues; a transient error (gh, the network)
+  // is retried automatically by classifyError; and it is idempotent, so it never publishes twice.
   let publishOut = '';
-  let published = false; // 真的发了 PR 才 true（native publishTechDesign 是 no-op → false）——绝不让 DONE 文案谎称 PR 已合
-  const pub = proj.techDesignPublish; // 按项目解析（projects.yaml 可单独关）；不再读全局 runtime（多项目/可插拔目标必需）
+  let published = false; // only true when a PR really was opened (the native publishTechDesign is a no-op -> false), so the DONE wording never falsely claims the PR was merged
+  const pub = proj.techDesignPublish; // resolved per project (projects.yaml can switch it off individually); it no longer reads the global runtime, which multiple projects and a pluggable target require
   if (pub?.enabled) {
     const r = await pa.publishTechDesign(s.slug, { base: pub.base, dryRun: opts.dryRun });
     publishOut = r.stdout ? `${r.stdout}\n` : '';
-    if (!r.ok) throw new Error(`技术方案发布主仓失败：${(r.stderr || r.stdout || '').slice(0, 300)}（修复后 retry go；幂等不会重复发）`);
+    if (!r.ok) throw new Error(`publishing the technical plan to the main repo failed: ${(r.stderr || r.stdout || '').slice(0, 300)} (fix it and retry go; it is idempotent and will not publish twice)`);
     published = r.published;
   }
 
-  // 真跑（非 dryRun）才考虑续建；dryRun 永远完整预演。
+  // Only a real run (not a dry run) considers resuming; a dry run always rehearses the whole thing.
   const resume = !opts.dryRun ? alreadyCreated(s) : [];
 
-  // size 标签失败聚合后统一抛（不静默漏数 weekly-load 口径）；先于 approve，缺标签不放行 status:3。
+  // Failed size labels are aggregated and thrown together (weekly-load's numbers are never silently short);
+  // this happens before approve, so a missing label does not get released to status:3.
   const failIfLabelsFailed = (fails: { repo: string; number: number }[]): void => {
     if (fails.length) {
       throw new Error(
-        `size 标签打失败 ${fails.length} 个：${fails.map((f) => `${f.repo}#${f.number}`).join(', ')}` +
-          `（标签没同步？主仓 sync-labels.sh 后 retry go；issue 已建、不会重复）`,
+        `${fails.length} size label(s) failed: ${fails.map((f) => `${f.repo}#${f.number}`).join(', ')}` +
+          ` (labels out of sync? run the main repo's sync-labels.sh, then retry go; the issues already exist and are not created again)`,
       );
     }
   };
   const approveOrThrow = async (issue?: string): Promise<void> => {
     const ap = await pa.approveTechDesign(s.slug, issue, false);
-    if (!ap.ok) throw new Error(`tech-design approve 失败：${(ap.stderr || ap.stdout || '').slice(0, 300)}（修复后 retry go）`);
+    if (!ap.ok) throw new Error(`the tech-design approve failed: ${(ap.stderr || ap.stdout || '').slice(0, 300)} (fix it and retry go)`);
   };
 
   if (env.multi_repo) {
-    const expectedRepos = [...new Set(env.issue_specs.map((i) => repoMap[i.repo] ?? i.repo))]; // 期望子仓（去重）
+    const expectedRepos = [...new Set(env.issue_specs.map((i) => repoMap[i.repo] ?? i.repo))]; // the repos expected to have a sub-issue (deduplicated)
     const missingOf = (have: CreatedIssue[]): string[] => expectedRepos.filter((repo) => !have.some((i) => i.repo === repo));
 
     const fromResume = resume.length > 0;
     let issues = resume;
-    let stdout = '(已建 issue，跳过重建，仅补跑 labels/approve)';
+    let stdout = '(the issues already exist; recreating is skipped and only labelling and approval are re-run)';
     if (!fromResume) {
       const dri = sessionDri ?? env.issue_specs.find((i) => i.assignee)?.assignee;
       const type = env.epic_doc_type || env.issue_specs[0]?.type || 'feat';
       const prio = env.issue_specs[0]?.prio;
       const children = env.issue_specs.map((i) => ({ repo: i.repo, title: i.title }));
-      // Epic 正文挂全量外环验收（跨仓契约的 Done 定义）；各仓子 issue 由 epic 脚本据 children 建。
+      // The Epic's body carries the full outer-ring acceptance (the definition of done for the cross-repo
+      // contract); the per-repo sub-issues are created from `children` by the epic script.
       const epicBody = [refLine, acceptanceMarkdown(env.acceptance)].filter(Boolean).join('\n\n');
       const r = await pa.createEpic(s.slug, env.epic_title || s.title, children, {
         type, prio, assignee: dri, docUrl: prd, body: epicBody, dryRun: opts.dryRun,
       });
       if (opts.dryRun) return { ok: r.ok, stdout: publishOut + r.stdout, issues: r.issues, published };
-      if (!r.ok) throw new Error(`建 Epic 失败：${r.stderr.slice(0, 300)}`);
-      // 端口契约：createEpic.issues = Epic + 全部已建子 issue（demo adapter 解 ✓C#n / native 自建并直接返回）。
-      // doWrites 不再 know 任何脚本输出格式——多仓 native 据此可端到端跑通。
+      if (!r.ok) throw new Error(`creating the Epic failed: ${r.stderr.slice(0, 300)}`);
+      // The port's contract: createEpic.issues is the Epic plus every sub-issue created (the demo adapter
+      // parses them out of the script's output; the native one creates them itself and returns them
+      // directly).
+      // doWrites no longer knows any script's output format, which is what lets multi-repo work end to end on
+      // the native path.
       issues = r.issues;
-      opts.onCreated?.(issues); // Epic + 已建子 issue 都落库（保留已建出的，便于人工补救 + done 卡完整）
+      opts.onCreated?.(issues); // the Epic and every created sub-issue are persisted (keeping what exists makes manual recovery possible and the done card complete)
       stdout = r.stdout;
     }
 
-    // 覆盖校验（**fresh + resume 都跑**，堵「首次挡住、重跑从侧门进」）：期望子仓必须都齐。
-    // 主仓脚本子 issue 建失败是 continue（脚本仍退 0），故缺子 issue 绝不静默 approve 到 DONE。
+    // The coverage check runs on **both a fresh run and a resume**, closing the "blocked the first time, then
+    // slips in through the side door on a re-run" gap: every expected repo has to have its sub-issue.
+    // The main repo's script continues past a failed sub-issue (and still exits 0), so a missing sub-issue
+    // must never be silently approved through to DONE.
     let missing = missingOf(issues);
     if (missing.length && fromResume && !opts.dryRun) {
-      // 重跑场景：人工可能已 new-req.sh add-child 补建 → 按 epic:<slug> 标签从 GitHub 重新发现并刷新 created_issues。
+      // On a re-run someone may already have filled the gap with new-req.sh add-child, so it rediscovers them
+      // from GitHub by the epic:<slug> label and refreshes created_issues.
       const refreshed = [...issues];
       for (const repo of missing) {
         const q = await pa.listEpicChildren(repo, s.slug);
@@ -159,41 +189,44 @@ export async function doWrites(s: Session, opts: WriteOpts = {}): Promise<WriteR
       }
       if (refreshed.length !== issues.length) {
         issues = refreshed;
-        opts.onCreated?.(issues); // 刷新落库 → 后续 retry 直接命中、done 卡完整
+        opts.onCreated?.(issues); // persist the refreshed set, so a later retry hits it directly and the done card is complete
       }
       missing = missingOf(issues);
     }
     if (missing.length) {
       throw new Error(
-        `多仓子 issue 缺失：${missing.join('/')}（期望 ${expectedRepos.join('/')}）。` +
-          `用 \`new-req.sh add-child <slug> <repo>\` 补建后 retry go（会按 epic 标签自动补登记，绝不重复建）`,
+        `multi-repo sub-issues are missing: ${missing.join('/')} (expected ${expectedRepos.join('/')}). ` +
+          `Create them with \`new-req.sh add-child <slug> <repo>\` and retry go (it rediscovers them by the epic label automatically, and never creates them twice)`,
       );
     }
 
-    // size 只打在 Epic（需求行）；子 issue 不带（主仓约定，跨栈倍率另算）。
+    // The size label goes on the Epic only (the requirement's own row); sub-issues do not carry it (the main
+    // repo's convention, and the cross-repo multiplier is computed separately).
     failIfLabelsFailed(await applySizeLabels(issues.filter((i) => i.repo === umbrella), normSize(s.size ?? ''), env.issue_specs, repoMap, pa));
-    await approveOrThrow(); // epic.sh set <slug> 3 + tech-design 文档 active
-    await maybeCommitDeliveryDocs(s); // best-effort，config 门控，绝不 push
+    await approveOrThrow(); // epic.sh set <slug> 3, and the tech-design document becomes active
+    await maybeCommitDeliveryDocs(s); // best-effort, gated by config, and it never pushes
     return { ok: true, stdout: publishOut + stdout, issues, published };
   }
 
   const spec = env.issue_specs[0];
   let issues = resume;
-  let stdout = '(已建 issue，跳过重建，仅补跑 labels/approve)';
+  let stdout = '(the issues already exist; recreating is skipped and only labelling and approval are re-run)';
   if (issues.length === 0) {
-    // 单仓 issue 正文 = 评审编号 + 方案背景 + 本仓外环验收（Done 定义，工程师据此补内环单测/集测）。
+    // A single-repo issue's body is the review reference, the plan's background, and that repo's outer-ring
+    // acceptance (the definition of done, which the engineer adds inner-ring unit and integration tests
+    // against).
     const body = [refLine, spec.body, acceptanceMarkdown(env.acceptance, spec.repo)].filter(Boolean).join('\n\n');
     const r = await pa.createSingle(spec.repo, spec.title, {
       type: spec.type, prio: spec.prio, area: spec.area, assignee: sessionDri ?? spec.assignee, docUrl: prd, body, dryRun: opts.dryRun,
     });
     if (opts.dryRun) return { ok: r.ok, stdout: publishOut + r.stdout, issues: r.issues, published };
-    if (!r.ok || r.issues.length === 0) throw new Error(`建 issue 失败：${r.stderr.slice(0, 300)}`);
+    if (!r.ok || r.issues.length === 0) throw new Error(`creating the issue failed: ${r.stderr.slice(0, 300)}`);
     opts.onCreated?.(r.issues);
     issues = r.issues;
     stdout = r.stdout;
   }
   failIfLabelsFailed(await applySizeLabels(issues, (spec.size ? normSize(spec.size) : null) ?? normSize(s.size ?? ''), env.issue_specs, repoMap, pa));
   await approveOrThrow(`${spec.repo}:${issues[0].number}`);
-  await maybeCommitDeliveryDocs(s); // best-effort，config 门控，绝不 push
+  await maybeCommitDeliveryDocs(s); // best-effort, gated by config, and it never pushes
   return { ok: true, stdout: publishOut + stdout, issues, published };
 }

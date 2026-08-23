@@ -124,7 +124,7 @@ test('go 生产流：多仓部分创建失败停在 WRITE_FAILED，人工补 chi
 
   const first = await actions.go(slug, 'M');
   assert.equal(first.ok, false);
-  assert.match(first.msg, /子 issue 缺失/);
+  assert.match(first.msg, /sub-issues are missing/);
   assert.equal((await sessions.get(slug))!.state, 'WRITE_FAILED');
   assert.deepEqual(await issueRepos(slug), ['demo', 'example-project']);
   assert.equal(epicCreates, 1);

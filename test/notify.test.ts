@@ -53,7 +53,7 @@ test('needs_go：含 DRI 指派下拉（go_form），有推荐时默认选推荐
   const c = json(buildCard('needs_go', sess({ assignee: 'EO', assign_snapshot: snapshot } as Partial<Session>)));
   assert.match(c, /"name":"assignee"/); // DRI 下拉
   assert.match(c, /"initial_option":"EO"/); // 默认采纳推荐人
-  assert.match(c, /建议 DRI：EO/); // 推荐理由块
+  assert.match(c, /Suggested DRI: EO/); // 推荐理由块
   assert.match(c, /"action":"go"/); // 提交仍回调 go
 });
 
@@ -69,9 +69,9 @@ test('needs_go：自动推荐失败时不默认旧人，提示 M 必须手动选
     ],
   });
   const c = json(buildCard('needs_go', sess({ assignee: null, assign_snapshot: snapshot } as Partial<Session>)));
-  assert.match(c, /未算出推荐/);
-  assert.match(c, /请手动选/);
-  assert.match(c, /负载未知/);
+  assert.match(c, /no recommendation could be computed/);
+  assert.match(c, /please pick someone/);
+  assert.match(c, /load unknown/);
   assert.doesNotMatch(c, /"initial_option"/); // 没有可靠推荐时，不能让旧默认人蒙混过关
 });
 
@@ -93,7 +93,7 @@ test('needs_gateb_input：每问题=交互下拉(select_static, name=ask_<id>) +
   assert.match(c, /退款退到余额还是原路/);
   assert.match(c, /"tag":"select_static"/); // 真·交互选择框
   assert.match(c, /"name":"ask_H1"/); // 按位置 H{n} 命名，回调同序拼回
-  assert.match(c, /其他/); // 「其他·手填」兜底项
+  assert.match(c, /Other/); // 「其他·手填」兜底项
   assert.match(c, /"name":"notes"/); // 补充说明框
   assert.match(c, /finance-report/);
 });
@@ -178,7 +178,7 @@ test('done：列出 issue 链接，无回调按钮', () => {
 
 test('needs_go：有残留时标注条数', () => {
   const c = json(buildCard('needs_go', sess({ adversarial_residual: JSON.stringify({ findings: [{ issue: 'a' }, { issue: 'b' }] }) })));
-  assert.match(c, /2 条/);
+  assert.match(c, /\b2\b/);
 });
 
 // 群状态卡：回复 PM 那条、原地编辑的那张卡
@@ -192,7 +192,7 @@ test('群状态卡 待产品确认：@PM + 确认表单 + 人话状态，不泄�
 
 test('群状态卡 待产品确认：PM 多轮时副标题 + 待拍板标题展示「第N轮」', () => {
   const c = json(buildStatusCard(sess({ state: 'AWAITING_PM_CONFIRM', gate_a_round: 2, gate_a_output_path: null } as never)));
-  assert.match(c, /第2轮/);
+  assert.match(c, /round 2/);
   assert.doesNotMatch(c, /闸A|GATE_/); // 仍不泄漏黑话
 });
 
@@ -207,7 +207,7 @@ test('群状态卡 待产品确认：confirm_submit 按轮次带 round（去重�
 
 test('群状态卡 复评轮（第2轮起）：醒目红横幅，跟首轮一眼可辨', () => {
   const c = json(buildStatusCard(sess({ state: 'AWAITING_PM_CONFIRM', gate_a_round: 2, gate_a_output_path: null } as never)));
-  assert.match(c, /复评第 2 轮/);
+  assert.match(c, /Re-review, round 2/);
 });
 
 test('群状态卡 复评中：人话「依答复复评」、无残留表单按钮', () => {
@@ -231,7 +231,7 @@ test('群状态卡 已立项：列出 issue', () => {
 test('群状态卡：藏成本($)、显示宠物彩蛋(进化树 + 投喂)', () => {
   const c = json(buildStatusCard(sess({ state: 'GATE_A_RUNNING' }))); // sess 成本 $3
   assert.doesNotMatch(c, /\$/); // 群里不露金额
-  assert.match(c, /进化树/);
+  assert.match(c, /Evolution/);
   assert.match(c, /Fed \d+ bites/);
 });
 
@@ -243,12 +243,12 @@ test('私聊卡 needs_go：保留真实成本($) + 带宠物彩蛋', () => {
 
 test('复杂度：群卡副标题 + 小字脚注都展示档位', () => {
   const c = json(buildStatusCard(sess({ state: 'GATE_A_RUNNING', size: 'L', size_source: 'ai' } as never)));
-  assert.match(c, /复杂度 L/); // 副标题可见
+  assert.match(c, /Complexity L/); // 副标题可见
   assert.match(c, /8pt/); // 脚注带分值（L=8，对齐主仓）
 });
 
 test('私聊卡 needs_confirm：复杂度作为统计字段', () => {
   const c = json(buildCard('needs_confirm', sess({ size: 'XL' } as never)));
-  assert.match(c, /复杂度/);
+  assert.match(c, /Complexity/);
   assert.match(c, /XL/);
 });

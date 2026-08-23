@@ -34,9 +34,9 @@ test('./forge show：闸B 待拍板项兼容旧 string[] 与新推荐/影响选�
     encoding: 'utf8',
   });
 
-  assert.match(text, /闸B 改方升级·待 M 答复/);
-  assert.match(text, /退款退到哪里？（选项：原路退回 \/ 退到余额）/);
-  assert.match(text, /是否接受到账延迟？（选项：★接受延迟 \/ 加急到账）/);
+  assert.match(text, /Gate B's revision escalated, waiting on the maintainer/);
+  assert.match(text, /\u9000\u6b3e\u9000\u5230\u54ea\u91cc\uff1f \(options: \u539f\u8def\u9000\u56de \/ \u9000\u5230\u4f59\u989d\)/);
+  assert.match(text, /\u662f\u5426\u63a5\u53d7\u5230\u8d26\u5ef6\u8fdf\uff1f \(options: \u2605\u63a5\u53d7\u5ef6\u8fdf \/ \u52a0\u6025\u5230\u8d26\)/);
   assert.doesNotMatch(text, /\[object Object\]/);
   assert.match(text, /forge gateb-answer show-human-asks/);
 });
@@ -78,9 +78,9 @@ test('./forge cost：管理看板从真实库读取并展示闸C/闸D分项，�
     encoding: 'utf8',
   });
 
-  assert.match(text, /REQ\s+STATE\s+闸A\s+闸B\s+闸C\s+闸D\s+合计\s+SLUG/);
+  assert.match(text, /REQ\s+STATE\s+GATE A\s+GATE B\s+GATE C\s+GATE D\s+TOTAL\s+SLUG/);
   assert.match(text, /cost-dashboard-downstream/);
   assert.match(text, /\$1\.0000\s+\$2\.0000\s+\$8\.0000\s+\$4\.0000\s+\$15\.0000/);
-  assert.match(text, /合计 .*闸A .*闸B .*闸C .*闸D /);
-  assert.match(text, /私有·管理面/);
+  assert.match(text, /Total .*Gate A .*Gate B .*Gate C .*Gate D /);
+  assert.match(text, /private, management-facing/);
 });
