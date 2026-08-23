@@ -1,9 +1,14 @@
-// PRD 真源（已多轮评审）——闸A 评审封口时机械合成的单一文档，是闸B 技术方案的**唯一需求输入**。
-// 设计要点：
-// - **机械拼接，不调 claude**：纯字符串合成（PRD 原文 + 闸A 评审定稿 + PM 多轮确认），可复现、可快照测；
-//   不引入 Date.now 等非确定量，便于单测与 drift 对账。
-// - **封口语义**：在闸A 收口（CONFIRMED）那一刻写盘，冻结「此刻已收敛的需求真源」；闸B 只读这一份。
-// - **健壮兜底**：闸B 读时若文档缺（M 强制确认 / 老 session / 被清），即时合成并尽力补写——绝不让闸B 拿空需求。
+// The PRD source of truth (already reviewed over several rounds) — a single document synthesised
+// mechanically when the Gate A review is sealed, and the **only** requirement input Gate B reads.
+// Design points:
+// - **Mechanical concatenation, no claude call**: pure string synthesis (PRD source text + the Gate A review
+//   final draft + the PM's multi-round confirmations). Reproducible and snapshot-testable; it pulls in no
+//   Date.now or other non-deterministic value, which keeps unit tests and drift reconciliation simple.
+// - **Sealing semantics**: written to disk the moment Gate A closes (CONFIRMED), freezing "the requirement
+//   truth as converged at this instant". Gate B reads only this one file.
+// - **Robust fallback**: if the document is missing when Gate B reads it (an M forced the confirmation, an old
+//   session, or it was cleaned up), it is synthesised on the spot and best-effort written back — Gate B must
+//   never be handed an empty requirement.
 import { readFileSync, writeFileSync, existsSync } from 'node:fs';
 import { resolve, dirname } from 'node:path';
 import { projectForSession } from '../projects.ts';
@@ -12,93 +17,105 @@ import type { GateAEnvelope } from './envelopes.ts';
 import { sizeBadge } from '../util/sizing.ts';
 import type { Session } from '../types.ts';
 
-// 交付目录下的真源文档路径（与 req-review.md / tech-design.md 同处 <deliveryDir>/<slug>/，确定性派生、不入库列）。
+// Path to the source-of-truth document under the delivery directory (it sits alongside req-review.md /
+// tech-design.md in <deliveryDir>/<slug>/, is derived deterministically, and is not stored as a DB column).
 export function prdTruthPath(s: Session): string {
   return resolve(projectForSession(s).deliveryDir, s.slug, 'prd-truth.md');
 }
 
-// 纯函数合成：PRD 原文 + 闸A 评审定稿 + PM 确认定稿 → 单一 markdown。无 IO、无时间量，便于快照测。
+// Pure synthesis: PRD source text + the Gate A review final draft + the PM's confirmations -> a single
+// markdown document. No IO and no time values, which keeps it snapshot-testable.
 export function buildPrdTruth(prdText: string, env: GateAEnvelope, confirmedNotes: string): string {
-  const repos = (env.repos_touched ?? []).join(' / ') || '（未判定）';
+  const repos = (env.repos_touched ?? []).join(' / ') || '(undetermined)';
   const risks = env.risks.length
-    ? env.risks.map((r) => `- [${r.area || '通用'}] ${r.detail}${r.evidence ? `（证据：${r.evidence}）` : ''}`).join('\n')
-    : '- （无）';
-  // 收口后 open_questions 应为空（已答尽）；若非空（M 强制放行残留）则列出，供闸B 知悉「带问题放行」。
+    ? env.risks.map((r) => `- [${r.area || 'general'}] ${r.detail}${r.evidence ? ` (evidence: ${r.evidence})` : ''}`).join('\n')
+    : '- (none)';
+  // After the close, open_questions should be empty (all answered). If it is not (residue from an M forcing
+  // the gate open) the questions are listed so Gate B knows it is proceeding with open points.
   const oq = env.open_questions.length
-    ? env.open_questions.map((q, i) => `${i + 1}. [${q.severity}] ${q.q}${q.suggestion ? `\n   - 倾向：${q.suggestion}` : ''}`).join('\n')
-    : '（已全部澄清，PM 答复见「三、PM 确认定稿」）';
+    ? env.open_questions.map((q, i) => `${i + 1}. [${q.severity}] ${q.q}${q.suggestion ? `\n   - Leaning: ${q.suggestion}` : ''}`).join('\n')
+    : '(everything is clarified; the PM answers are in "3. PM confirmations")';
   return [
-    '# PRD 真源（已多轮评审）',
+    '# PRD source of truth (reviewed over several rounds)',
     '',
-    '> Forge 在闸A 评审封口时**机械合成**（非 AI 再创作）：PRD 原文 + claude 评审·codex 对抗复审定稿 + PM 多轮确认。',
-    '> 这是闸B 技术方案的**唯一需求输入**——闸B 只读这一份（+ 实时代码真源），不再各自拼三源。',
+    '> Forge synthesises this **mechanically** (no further AI authoring) when the Gate A review is sealed:',
+    '> the PRD source text + the claude review / codex adversarial re-review final draft + the PM confirmations.',
+    '> This is the **only** requirement input to the Gate B tech design — Gate B reads this file (plus the live',
+    '> source of truth in the code) and never re-assembles the three sources itself.',
     '',
-    '## 一、PRD 原文',
+    '## 1. PRD source text',
     '',
-    prdText.trim() || '（未提供 PRD 正文）',
+    prdText.trim() || '(no PRD body was provided)',
     '',
-    '## 二、闸A 评审定稿（claude 评审 + codex 对抗复审，已收敛）',
+    '## 2. Gate A review, final draft (claude review + codex adversarial re-review, converged)',
     '',
-    `- **概述**：${env.summary || '（无）'}`,
-    `- **涉及仓**：${repos}`,
-    `- **复杂度**：${sizeBadge(env.size)}${env.size_reason ? `（${env.size_reason}）` : ''}`,
-    `- **置信度**：${env.confidence}`,
+    `- **Summary**: ${env.summary || '(none)'}`,
+    `- **Repos touched**: ${repos}`,
+    `- **Complexity**: ${sizeBadge(env.size)}${env.size_reason ? ` (${env.size_reason})` : ''}`,
+    `- **Confidence**: ${env.confidence}`,
     '',
-    '### 风险 / 冲突',
+    '### Risks / conflicts',
     risks,
     '',
-    '### 开放问题（评审收敛后）',
+    '### Open questions (after the review converged)',
     oq,
     '',
-    '## 三、PM 确认定稿（多轮答复，闸B 据此落方案）',
+    '## 3. PM confirmations (multi-round answers; Gate B builds the design from these)',
     '',
-    confirmedNotes.trim() || '（无额外备注）',
+    confirmedNotes.trim() || '(no additional notes)',
     '',
   ].join('\n');
 }
 
-// 读 session 的闸A 信封。区分两种「缺」，绝不把「坏」静默降级成「空」（守「失败不静默」纪律）：
-// - **无 gate_a_output_path**（老 session 从没产出过闸A 信封）→ 空信封兜底（legacy；实质仍由 PRD 原文 + PM 确认承载）。
-// - **有路径但读不出/JSON 坏/不合约**（被截断 / 写坏 / 迁移后字段漂移）→ **抛错**，绝不返回标着「已多轮评审」的空壳。
-//   抛错经 composePrdTruth → loadPrdTruth → runGateB 冒泡 → worker 停泊 GATE_B_FAILED 等人（解析失败属永久错，不自动重试）。
+// Read the session's Gate A envelope. It distinguishes two kinds of "missing" and never silently degrades
+// "broken" into "empty" (holding the no-silent-failures line):
+// - **no gate_a_output_path** (an old session that never produced a Gate A envelope) -> fall back to an empty
+//   envelope (legacy; the PRD source text and the PM confirmations still carry the requirement).
+// - **a path that is present but unreadable / broken JSON / off-contract** (truncated, written badly, or field
+//   drift after a migration) -> **throw**. It must never return a shell labelled "reviewed over several rounds".
+//   The throw bubbles through composePrdTruth -> loadPrdTruth -> runGateB, and the worker parks at
+//   GATE_B_FAILED for a human (a parse failure is a permanent error, so it is not retried automatically).
 function readGateAEnv(s: Session): GateAEnvelope {
-  if (!s.gate_a_output_path) return GateASchema.parse({}); // legacy：从无闸A 信封
+  if (!s.gate_a_output_path) return GateASchema.parse({}); // legacy: there never was a Gate A envelope
   const p = s.gate_a_output_path;
   let raw: string;
   try {
     raw = readFileSync(p, 'utf8');
   } catch (e) {
-    throw new Error(`PRD 真源：闸A 信封读不出（${p}）— ${String(e).slice(0, 160)}`);
+    throw new Error(`PRD source of truth: the Gate A envelope could not be read (${p}) - ${String(e).slice(0, 160)}`);
   }
   let json: unknown;
   try {
     json = JSON.parse(raw);
   } catch (e) {
-    throw new Error(`PRD 真源：闸A 信封 JSON 解析失败（${p}，疑被截断/写坏）— ${String(e).slice(0, 160)}`);
+    throw new Error(`PRD source of truth: the Gate A envelope failed to parse as JSON (${p}, likely truncated or written badly) - ${String(e).slice(0, 160)}`);
   }
   try {
     return GateASchema.parse(json);
   } catch (e) {
-    throw new Error(`PRD 真源：闸A 信封不合约（${p}，疑迁移后字段漂移）— ${String(e).slice(0, 160)}`);
+    throw new Error(`PRD source of truth: the Gate A envelope is off-contract (${p}, likely field drift after a migration) - ${String(e).slice(0, 160)}`);
   }
 }
 
-// 从 session 的三源即时合成真源内容（读 PRD 原文 + 闸A 信封 + confirmed_notes）。不写盘。
+// Synthesise the source-of-truth content from the session's three sources on the spot (reading the PRD source
+// text, the Gate A envelope and confirmed_notes). Writes nothing to disk.
 export function composePrdTruth(s: Session): string {
   const prdText = s.prd_text_path && existsSync(s.prd_text_path) ? readFileSync(s.prd_text_path, 'utf8') : '';
   return buildPrdTruth(prdText, readGateAEnv(s), s.confirmed_notes ?? '');
 }
 
-// 封口写盘：仅当 <slug> 交付目录已就绪（闸A 已 scaffold req-review.md）才落盘——与 markReviewActive /
-// appendMachineSection 同纪律，避免在未 scaffold（如测试）时凭空在交付目录造文件。返回是否写了。
+// Seal and write: only once the <slug> delivery directory exists (Gate A has scaffolded req-review.md). Same
+// discipline as markReviewActive / appendMachineSection — it avoids conjuring files into the delivery
+// directory when nothing has been scaffolded (in tests, for instance). Returns whether it wrote.
 export function writePrdTruth(s: Session): boolean {
   const p = prdTruthPath(s);
-  if (!existsSync(dirname(p))) return false; // 交付目录未就绪 → 不凭空造（闸B loadPrdTruth 会即时合成兜底）
+  if (!existsSync(dirname(p))) return false; // delivery directory not ready -> do not conjure it (Gate B's loadPrdTruth synthesises a fallback)
   writeFileSync(p, composePrdTruth(s));
   return true;
 }
 
-// 闸B 读取：优先封口文档；缺则即时合成并尽力补写（drift loop 之后也能读到同一份）。始终返回内容。
+// The Gate B read: prefer the sealed document; if it is missing, synthesise on the spot and best-effort write
+// it back (so a later drift loop reads the same file). Always returns content.
 export function loadPrdTruth(s: Session): string {
   const p = prdTruthPath(s);
   if (existsSync(p)) return readFileSync(p, 'utf8');
@@ -106,7 +123,7 @@ export function loadPrdTruth(s: Session): string {
   try {
     if (existsSync(dirname(p))) writeFileSync(p, content);
   } catch {
-    /* best-effort 补写，失败不挡闸B */
+    /* best-effort write-back; a failure must not block Gate B */
   }
   return content;
 }

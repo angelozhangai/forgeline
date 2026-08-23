@@ -1,5 +1,8 @@
-// 单测：多仓「每仓一腿」模型 helpers（src/gates/legs.ts）。纯函数（mkLeg/getLegs/buildLegs）+ setLegs/patchLeg 落库。
-// 真 sessions(:memory:)——patchLeg 从 DB 重读 legs（防同一 stale 引用连写多条互相覆盖），故须真库验证该不变量。
+// Unit tests: the helpers behind the multi-repo "one leg per repo" model (src/gates/legs.ts). The pure
+// functions (mkLeg / getLegs / buildLegs) plus setLegs / patchLeg persisting to the store.
+// It uses a real sessions store (:memory:) - patchLeg re-reads the legs from the DB (so that writing several
+// legs in a row from one stale reference does not have them overwrite each other), and only a real store can
+// verify that invariant.
 process.env.FORGE_DB = ':memory:';
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
@@ -14,7 +17,7 @@ async function mk(): Promise<string> {
   return id;
 }
 
-test('mkLeg：仅锚仓名，其余字段空(pending)；fields 可覆盖', () => {
+test('mkLeg: anchors the repo name only, leaving every other field empty (pending); fields can override', () => {
   const l = mkLeg('demo');
   assert.equal(l.repo, 'demo');
   assert.equal(l.worktree_path, null);
@@ -25,14 +28,14 @@ test('mkLeg：仅锚仓名，其余字段空(pending)；fields 可覆盖', () =>
   assert.equal(built.base_sha, 'abc');
 });
 
-test('getLegs：坏/空/非数组 json → []；正常解析', () => {
+test('getLegs: broken, empty or non-array JSON -> []; valid JSON parses normally', () => {
   assert.deepEqual(getLegs({ legs: null }), []);
-  assert.deepEqual(getLegs({ legs: '{坏json' }), []);
-  assert.deepEqual(getLegs({ legs: '"非数组"' }), []);
+  assert.deepEqual(getLegs({ legs: '{broken json' }), []);
+  assert.deepEqual(getLegs({ legs: '"not an array"' }), []);
   assert.equal(getLegs({ legs: JSON.stringify([mkLeg('demo')]) }).length, 1);
 });
 
-test('buildLegs：保序，builder 填字段(primary 建树、其余 pending)', () => {
+test('buildLegs: preserves order, and the builder fills the fields (the primary gets a worktree, the rest stay pending)', () => {
   const legs = buildLegs(['demo', 'example-web'], (_r, i) => (i === 0 ? { worktree_path: '/wt/demo' } : {}));
   assert.deepEqual(
     legs.map((l) => l.repo),
@@ -42,7 +45,7 @@ test('buildLegs：保序，builder 填字段(primary 建树、其余 pending)', 
   assert.equal(legs[1].worktree_path, null);
 });
 
-test('setLegs：整组落库', async () => {
+test('setLegs: persists the whole set', async () => {
   const id = await mk();
   await setLegs({ id }, [mkLeg('demo')]);
   assert.deepEqual(
@@ -51,64 +54,64 @@ test('setLegs：整组落库', async () => {
   );
 });
 
-test('patchLeg：按 repo 更新一条；repo 不存在则不变(不冒进新增)', async () => {
+test('patchLeg: updates one leg by repo; an unknown repo changes nothing (it never speculatively adds one)', async () => {
   const id = await mk();
   await setLegs({ id }, [mkLeg('demo'), mkLeg('example-web')]);
   await patchLeg({ id }, 'example-web', { ci_ok: true });
   const legs = getLegs((await sessions.get(id))!);
   assert.equal(legs.find((l) => l.repo === 'example-web')!.ci_ok, true);
-  assert.equal(legs.find((l) => l.repo === 'demo')!.ci_ok, null); // 只动目标腿
+  assert.equal(legs.find((l) => l.repo === 'demo')!.ci_ok, null); // only the targeted leg changes
   await patchLeg({ id }, 'nope-repo', { ci_ok: true });
-  assert.equal(getLegs((await sessions.get(id))!).length, 2); // 不存在的 repo 不新增
+  assert.equal(getLegs((await sessions.get(id))!).length, 2); // a repo that does not exist is not added
 });
 
-test('planLegAdvance：标记当前 leg 绿后，返回下一条未绿且已建树的 repo；全绿 → null', () => {
+test('planLegAdvance: once the current leg is marked green, return the next repo that is not green and already has a worktree; all green -> null', () => {
   const legs = [
     mkLeg('demo', { worktree_path: '/wt/c' }),
     mkLeg('example-web', { worktree_path: '/wt/u' }),
     mkLeg('example-admin', { worktree_path: '/wt/a' }),
   ];
-  assert.equal(planLegAdvance(legs, 'demo').nextRepo, 'example-web'); // 绿了 demo → 下一条
+  assert.equal(planLegAdvance(legs, 'demo').nextRepo, 'example-web'); // demo went green -> move to the next
   const after1 = legs.map((l) => (['demo', 'example-web'].includes(l.repo) ? { ...l, ci_ok: true } : l));
-  assert.equal(planLegAdvance(after1, 'example-admin').nextRepo, null); // 绿了最后一条 → 全绿
-  assert.equal(planLegAdvance([mkLeg('demo', { worktree_path: '/wt/c' })], 'demo').nextRepo, null); // 单仓绿 → null
-  // 未建树的 leg（worktree 空）不作为下一步（2b setup 全建了，此为防御）
+  assert.equal(planLegAdvance(after1, 'example-admin').nextRepo, null); // the last one went green -> all green
+  assert.equal(planLegAdvance([mkLeg('demo', { worktree_path: '/wt/c' })], 'demo').nextRepo, null); // a single repo going green -> null
+  // A leg with no worktree is never the next step (setup creates one for every leg; this is a defensive guard)
   assert.equal(planLegAdvance([mkLeg('demo', { worktree_path: '/wt/c' }), mkLeg('example-web')], 'demo').nextRepo, null);
 });
 
-test('planGateDAdvance：标记当前 leg 过闸D 后，返回下一条已开 PR、已建树、未过闸D 的 repo；全过 → null', () => {
+test('planGateDAdvance: once the current leg is marked through Gate D, return the next repo that has a PR open, has a worktree and has not been through Gate D; all through -> null', () => {
   const legs = [
     mkLeg('demo', { worktree_path: '/wt/c', pr_url: 'PC' }),
     mkLeg('example-web', { worktree_path: '/wt/u', pr_url: 'PU' }),
     mkLeg('example-admin', { worktree_path: '/wt/a', pr_url: 'PA' }),
   ];
-  assert.equal(planGateDAdvance(legs, 'demo').nextRepo, 'example-web'); // demo 补强完 → 下一条
-  // demo/example 都过闸D（有 verified sha）→ 下一条 admin
+  assert.equal(planGateDAdvance(legs, 'demo').nextRepo, 'example-web'); // demo finished hardening -> move to the next
+  // demo and example-web are both through Gate D (they have a verified sha) -> admin is next
   const after2 = legs.map((l) => (['demo', 'example-web'].includes(l.repo) ? { ...l, gate_d_harden_verified_sha: 'V' } : l));
-  assert.equal(planGateDAdvance(after2, 'example-admin').nextRepo, null); // 最后一条补强完 → 全过
-  assert.equal(planGateDAdvance([mkLeg('demo', { worktree_path: '/wt/c', pr_url: 'PC' })], 'demo').nextRepo, null); // 单仓 → null
+  assert.equal(planGateDAdvance(after2, 'example-admin').nextRepo, null); // the last one finished hardening -> all through
+  assert.equal(planGateDAdvance([mkLeg('demo', { worktree_path: '/wt/c', pr_url: 'PC' })], 'demo').nextRepo, null); // a single repo -> null
 });
 
-test('planGateDAdvance：未开 PR / 未建树的 leg 不作为下一步（防御：理论上闸C/openReviewPr 全建全开）', () => {
-  // 下一条无 pr_url → 不推进（PR 没开过，不能审）
+test('planGateDAdvance: a leg with no PR or no worktree is never the next step (a defensive guard - in practice Gate C and openReviewPr create and open them all)', () => {
+  // The next leg has no pr_url -> do not advance (there is no PR to review)
   assert.equal(
     planGateDAdvance([mkLeg('demo', { worktree_path: '/wt/c', pr_url: 'PC' }), mkLeg('example-web', { worktree_path: '/wt/u' })], 'demo').nextRepo,
     null,
   );
-  // 下一条无 worktree → 不推进
+  // The next leg has no worktree -> do not advance
   assert.equal(
     planGateDAdvance([mkLeg('demo', { worktree_path: '/wt/c', pr_url: 'PC' }), mkLeg('example-web', { pr_url: 'PU' })], 'demo').nextRepo,
     null,
   );
 });
 
-test('patchLeg：从 DB 重读——同一 stale 引用连写多条 leg 不互相覆盖（openReviewPr 逐 leg 开 PR 场景）', async () => {
+test('patchLeg: re-reads from the DB - writing several legs in a row from one stale reference does not have them overwrite each other (the openReviewPr per-leg case)', async () => {
   const id = await mk();
   await setLegs({ id }, [mkLeg('demo'), mkLeg('example-web')]);
-  const stale = (await sessions.get(id))!; // 旧快照：legs 两条均无 pr_url
+  const stale = (await sessions.get(id))!; // a stale snapshot: neither leg has a pr_url yet
   await patchLeg(stale, 'demo', { pr_url: 'A' });
-  await patchLeg(stale, 'example-web', { pr_url: 'B' }); // 仍用 stale，但 patchLeg 内部从 DB 重读最新
+  await patchLeg(stale, 'example-web', { pr_url: 'B' }); // still the stale snapshot, but patchLeg re-reads the latest from the DB
   const legs = getLegs((await sessions.get(id))!);
-  assert.equal(legs.find((l) => l.repo === 'demo')!.pr_url, 'A'); // 没被第二次 patch 覆盖（旧实现这里会变 null）
+  assert.equal(legs.find((l) => l.repo === 'demo')!.pr_url, 'A'); // not overwritten by the second patch (the old implementation turned this into null)
   assert.equal(legs.find((l) => l.repo === 'example-web')!.pr_url, 'B');
 });

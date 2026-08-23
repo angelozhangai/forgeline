@@ -1,8 +1,13 @@
-// 闸D「PR 对抗 review」循环：复用 reviewFixLoop 引擎，**这是 claude+codex 异质互审真正发力处**：
-//  · review() = codex（cwd=worktree，只读）审 base..HEAD 的 diff → VerdictSchema（LGTM / CHANGES + findings）。
-//  · fix()    = claude（cwd=worktree）按 codex 意见改文件 → forge 落提交 → **本地 CI 必须绿才推**分支更新 PR。
-//  · 被对抗的产物是 worktree 状态：diff 由 forge 现场重建（git），绝不从模型输出解析代码（同闸C）。
-// 复用引擎 → 自动获得：轮次/每-tick 上限/needs_human 升级/到上限停泊/解析自愈/残留落库/双侧会话 resume。
+// The Gate D "PR adversarial review" loop: it reuses the reviewFixLoop engine, and **this is where the
+// heterogeneous claude + codex cross-review really earns its keep**:
+//  - review() has codex (cwd = worktree, read-only) review the base..HEAD diff -> VerdictSchema (LGTM, or
+//    CHANGES_REQUESTED with findings).
+//  - fix() has claude (cwd = worktree) edit files per codex's findings -> forge makes the commit -> **the local
+//    CI must be green before the branch is pushed** to update the PR.
+//  - The artifact under adversarial review is the worktree state: the diff is rebuilt on the spot by forge
+//    (through git), never parsed as code out of the model's output (same as Gate C).
+// Reusing the engine gives all of this for free: round counting, the per-tick cap, needs_human escalation,
+// parking at the cap, parse self-healing, persisting the residue, and resuming both sides' sessions.
 import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
@@ -11,7 +16,7 @@ import { strictParse } from '../llm/structured.ts';
 import { loadConfig } from '../config.ts';
 import { log } from '../util/log.ts';
 import { store } from '../store/index.ts';
-const { patch, get, appendEvent } = store; // 经 SessionStore 接缝取本地实现方法（自由函数无 this，解构安全）
+const { patch, get, appendEvent } = store; // take the local implementation methods through the SessionStore seam (free functions have no `this`, so destructuring is safe)
 import {
   VerdictSchema,
   GateCFixResultSchema,
@@ -31,19 +36,21 @@ import { runReviewFixLoop } from '../review/reviewFixLoop.ts';
 import type { ReviewFixConfig, ReviewFixDrivers, ReviewFixOutcome } from '../review/reviewFixLoop.ts';
 import type { Session } from '../types.ts';
 
-// fix 内「CI 红→claude 自修」的有限轮数（CI 夹在 fix 内）：超过仍红才停泊交人。初始改方 + 这么多轮自修。
-// 一次 drv.fix 内「初轮 + ≤本数 次 CI 自修」的 CI 自修轮上限。导出供 tick 锁宽限估算单 tick 最长合法时长。
+// How many bounded "CI is red -> claude fixes it itself" rounds happen inside one fix (CI is sandwiched inside
+// fix): only once those are exhausted and it is still red does it park for a human. So one drv.fix call is the
+// initial revision plus at most this many CI-fix rounds.
+// Exported so the tick-lock grace period can estimate the longest legitimate duration of a single tick.
 export const MAX_CI_FIX_ATTEMPTS = 2;
 
 function gateDConfig(s: Session): ReviewFixConfig<ImplEnvelope> {
   const cfg = loadConfig();
   const max = Math.max(1, cfg.runtime.gate_d?.max_rounds ?? 3);
   const perTick = Math.max(1, Math.min(max, cfg.runtime.gate_d?.max_rounds_per_tick ?? 1));
-  const cur = async (): Promise<Session> => (await get(s.id))!; // 每次现读 DB（get 现 async）
+  const cur = async (): Promise<Session> => (await get(s.id))!; // read the DB fresh each time (get is async now)
   const pid = projectForSession(s).id;
 
   return {
-    label: '闸D PR 复审',
+    label: 'Gate D PR review',
     maxRounds: max,
     maxRoundsPerTick: perTick,
     maxParseRepairRetries: Math.max(0, cfg.runtime.parse_repair_retries ?? 2),
@@ -84,7 +91,7 @@ function gateDConfig(s: Session): ReviewFixConfig<ImplEnvelope> {
         const r = c.gate_d_residual ? (JSON.parse(c.gate_d_residual) as { findings?: Verdict['findings'] }) : null;
         if (r?.findings?.length) ctx += `codex findings still unresolved:\n${findingsToMd(r.findings)}\n\n`;
       } catch {
-        /* 残留坏 JSON 忽略 */
+        /* a broken residue JSON is ignored */
       }
       return `${ctx}**The owner's (M) decision**:\n${pending}`;
     },
@@ -93,7 +100,8 @@ function gateDConfig(s: Session): ReviewFixConfig<ImplEnvelope> {
       await patch(s.id, { gate_d_pending_input: null, gate_d_human_asks: null });
       await appendEvent(s.id, 'gated_human_answer_consumed', { round: c.gate_d_round });
     },
-    // 纯构造器保持同步：用进入循环时的 session 快照 s（context/base_sha/worktree_path 进 loop 前已定）。
+    // The pure constructors stay synchronous: they use the session snapshot `s` taken when the loop was
+    // entered (context, base_sha and worktree_path are all fixed before the loop).
     buildInitialReviewPrompt: () =>
       render(loadPrompt('gate-d-pr-review.md', pid), {
         CONTEXT: gateCContext(s),
@@ -122,8 +130,10 @@ function gateDConfig(s: Session): ReviewFixConfig<ImplEnvelope> {
     parseFixResult: (text) => {
       try {
         const r = strictParse(GateCFixResultSchema, text);
-        // 重建信封：claude 改了 worktree 文件（代码不在 text 里），diff/files 从 git 现场读。
-        // 同步解析钩子：用 session 快照 s 读信封（draft_path 进 loop 前已定，循环内不变）。
+        // Rebuild the envelope: claude edited files in the worktree (the code is not in `text`), so the diff
+        // and the file list are read live from git.
+        // This parse hook is synchronous: it reads the envelope through the session snapshot `s` (draft_path is
+        // fixed before the loop and does not change inside it).
         const env = readImplEnvelope(s);
         const wt = env.worktree_path;
         const merged: ImplEnvelope = {
@@ -135,7 +145,7 @@ function gateDConfig(s: Session): ReviewFixConfig<ImplEnvelope> {
         };
         return { artifact: merged, needsHuman: r.needs_human };
       } catch (e) {
-        log.warn(`闸D 改方输出解析失败 → 交引擎自愈/停泊：${String(e).slice(0, 160)}`);
+        log.warn(`Gate D revision output failed to parse -> handing it to the engine to self-heal or park: ${String(e).slice(0, 160)}`);
         return null;
       }
     },
@@ -153,18 +163,19 @@ function gateDDrivers(s: Session): ReviewFixDrivers {
     try {
       writeFileSync(resolve(sessionLogDir(s.id), name), raw);
     } catch {
-      /* 落盘失败不阻断 */
+      /* a failed dump must not block the flow */
     }
   };
   return {
-    // codex 审 worktree 的 diff（cwd=worktree，只读）。on_missing 降级/跳过/报错同闸B。
+    // codex reviews the worktree's diff (cwd = worktree, read-only). on_missing degrades, skips or errors
+    // exactly as it does in Gate B.
     review: async (prompt, opts) => {
       const cfg = loadConfig();
       const wt = (await cur()).worktree_path ?? proj.root;
       if (cfg.runtime.adversarial.reviewer === 'codex') {
         const c = await runCodex(
           prompt,
-          opts.sessionId ? { threadId: opts.sessionId, label: '闸D·PR审', cwd: wt } : { label: '闸D·PR审', readOnly: true, cwd: wt },
+          opts.sessionId ? { threadId: opts.sessionId, label: 'Gate D · PR review', cwd: wt } : { label: 'Gate D · PR review', readOnly: true, cwd: wt },
         );
         dump('gated-review.raw.txt', c.raw ?? '');
         if (c.ok) {
@@ -173,25 +184,32 @@ function gateDDrivers(s: Session): ReviewFixDrivers {
         }
         if (!c.available) {
           if (cfg.runtime.adversarial.on_missing === 'skip') {
-            log.warn('codex 未安装，on_missing=skip → 跳过闸D PR 对抗复审');
+            log.warn('codex is not installed and on_missing=skip -> skipping the Gate D PR adversarial review');
             return { ok: false, text: '', sessionId: null, available: false, used: 'codex' };
           }
-          if (cfg.runtime.adversarial.on_missing === 'error') throw new Error('codex 不可用且 on_missing=error');
-          log.warn('codex 未安装，降级用 claude 自审 PR（独立性弱，装上 codex 自动切回）');
+          if (cfg.runtime.adversarial.on_missing === 'error') throw new Error('codex is unavailable and on_missing=error');
+          log.warn('codex is not installed; degrading to a claude self-review of the PR (weaker independence - install codex and it switches back automatically)');
         } else {
-          log.warn(`闸D codex 复审失败（${c.error}），降级用 claude`);
+          log.warn(`The Gate D codex review failed (${c.error}); degrading to claude`);
         }
       }
-      // claude 自审降级（cwd=worktree，无会话续接，每轮重发——独立性弱，仅 codex 缺失时兜底；失败上抛停泊不静默放行）。
-      // 审整份 PR diff 同属下游重调用 → 用 gate_d.claude_timeout_sec（缺省回退全局）。
-      const r = await runClaude(prompt, { label: '闸D·PR审·claude', cwd: wt, timeoutSec: loadConfig().runtime.gate_d?.claude_timeout_sec });
+      // The degraded claude self-review (cwd = worktree, no session continuation, so every round resends -
+      // weaker independence, used only as a fallback when codex is missing; a failure propagates up and parks
+      // rather than being let through silently).
+      // Reviewing a whole PR diff is a heavy downstream call too, so it uses gate_d.claude_timeout_sec (falling
+      // back to the global value when unset).
+      const r = await runClaude(prompt, { label: 'Gate D · PR review · claude', cwd: wt, timeoutSec: loadConfig().runtime.gate_d?.claude_timeout_sec });
       dump('gated-review.raw.txt', r.raw ?? '');
       if (!r.ok) return { ok: false, text: '', sessionId: null, available: true, used: 'claude', error: r.error };
       return { ok: true, text: r.result, sessionId: null, available: true, used: 'claude' };
     },
-    // claude 按意见改 worktree → 落提交 → **CI 必须绿且 worktree 干净才推**（绝不推红/未验证进 PR）。CI 夹在 fix 内：
-    // 红了带 CI 摘要让 claude 有限轮自修；耗尽/基础设施错/任何「未达 CI 绿并推」→ **回滚到 fix 前 HEAD** 再停泊/暂停，
-    // 保证「被 review-first 看到的 committed HEAD 永远是 CI 绿的那个」，否则下个 tick codex LGTM 一个红 HEAD 就绕过了 CI 闸（Codex 闸D Blocker）。
+    // claude edits the worktree per the findings -> forge commits -> **it only pushes once CI is green and the
+    // worktree is clean** (a red or unverified state is never pushed into the PR). CI is sandwiched inside fix:
+    // when it is red, claude gets the CI summary and fixes it for a bounded number of rounds; if those are
+    // exhausted, an infrastructure error occurs, or anything else stops it reaching "CI green and pushed", the
+    // worktree is **rolled back to the pre-fix HEAD** before parking or pausing. That guarantees "the committed
+    // HEAD that review-first sees is always the CI-green one" - otherwise the next tick's codex could LGTM a red
+    // HEAD and walk straight past the CI gate (Codex Gate D blocker).
     fix: async (prompt, opts) => {
       const env = readImplEnvelope(await cur());
       const wt = env.worktree_path || proj.root;
@@ -199,26 +217,29 @@ function gateDDrivers(s: Session): ReviewFixDrivers {
       const ciScript = proj.scripts.ci ? resolve(wt, proj.scripts.ci) : undefined;
       const ciTimeout = (loadConfig().runtime.gate_d?.ci_timeout_sec ?? 1800) * 1000;
       const round = ((await cur()).gate_d_round ?? 0) + 1;
-      const preHead = worktreeHeadSha(wt); // 回滚锚点 = 上一个 CI 绿并已推的 HEAD（闸C 绿态 / 上一 D 轮推的提交）
-      if (!preHead) throw new Error('闸D 改方：取不到 worktree HEAD，无法建立回滚点 → 停泊');
-      const claudeTimeout = loadConfig().runtime.gate_d?.claude_timeout_sec; // PR 级修复重，缺省回退全局
+      const preHead = worktreeHeadSha(wt); // the rollback anchor = the last CI-green HEAD that was pushed (Gate C's green state, or the commit pushed by the previous Gate D round)
+      if (!preHead) throw new Error('Gate D revision: the worktree HEAD could not be read, so no rollback point can be established -> parking');
+      const claudeTimeout = loadConfig().runtime.gate_d?.claude_timeout_sec; // a PR-level fix is heavy; falls back to the global value when unset
       let sid = opts.sessionId;
       const runStep = (p: string): Promise<Awaited<ReturnType<typeof runClaude>>> => {
-        if (sid) return runClaude(p, { label: '闸D·改方', resume: sid, cwd: wt, timeoutSec: claudeTimeout });
+        if (sid) return runClaude(p, { label: 'Gate D · revise', resume: sid, cwd: wt, timeoutSec: claudeTimeout });
         sid = randomUUID();
-        return runClaude(p, { label: '闸D·改方', sessionId: sid, cwd: wt, timeoutSec: claudeTimeout });
+        return runClaude(p, { label: 'Gate D · revise', sessionId: sid, cwd: wt, timeoutSec: claudeTimeout });
       };
-      // 复位到 preHead；复位失败 → 落毒丸标记后抛（绝不带红/脏 HEAD 回到 review-first）。
-      // 关键：复位本身失败时，worktree 处于「未确认复位」态。仅抛错不够——worker 停泊 GATE_D_FAILED 后，
-      // planRetry 会把已开 PR 的 GATE_D_FAILED 直接送回 GATE_D_LOOP（无论该失败被分类为瞬时/永久），
-      // 让红/脏 HEAD 跑进下一次 review-first、绕过 CI 绿前置（Codex 闸D Blocker）。故记 gate_d_rollback_to，
-      // 由进 loop 前的 recoverPendingRollback 强制先复位确认才放行。
+      // Reset to preHead; if the reset fails, record a poison pill and throw (a red or dirty HEAD must never
+      // make it back to review-first).
+      // The key point: when the reset itself fails, the worktree is left in an "unconfirmed reset" state.
+      // Throwing is not enough - after the worker parks at GATE_D_FAILED, planRetry sends a GATE_D_FAILED with
+      // an open PR straight back to GATE_D_LOOP (whichever way that failure was classified), which would let a
+      // red or dirty HEAD into the next review-first and bypass the CI-green precondition (Codex Gate D
+      // blocker). So it records gate_d_rollback_to, and recoverPendingRollback forces a confirmed reset before
+      // the loop is entered again.
       const rollback = async (): Promise<void> => {
         const r = resetWorktree(wt, preHead);
         await appendEvent(s.id, 'gated_rollback', { to: preHead.slice(0, 12), ok: r.ok, output: r.output.slice(0, 120) });
         if (!r.ok) {
-          await patch(s.id, { gate_d_rollback_to: preHead }); // 毒丸：未确认复位，下次进 loop 前必先复位确认
-          throw new Error(`闸D 回滚 worktree 到 ${preHead.slice(0, 12)} 失败 → 停泊（避免红 HEAD 被后续 review 误进）：${r.output.slice(0, 160)}`);
+          await patch(s.id, { gate_d_rollback_to: preHead }); // the poison pill: the reset is unconfirmed, so it must be confirmed before the loop runs again
+          throw new Error(`Gate D failed to roll the worktree back to ${preHead.slice(0, 12)} -> parking (so a red HEAD cannot slip into a later review): ${r.output.slice(0, 160)}`);
         }
       };
       const bail = async (msg: string): Promise<never> => {
@@ -228,31 +249,36 @@ function gateDDrivers(s: Session): ReviewFixDrivers {
 
       let res = await runStep(prompt);
       dump('gated-fix.raw.txt', res.raw ?? '');
-      // claude 调用失败（瞬时）→ 回滚 + ok:false：引擎暂停重试（不推进 round），且不留任何半成品在 HEAD/worktree。
+      // A failed claude call (transient) -> roll back and return ok:false: the engine pauses and retries
+      // (without advancing the round), and nothing half-finished is left in HEAD or the worktree.
       if (!res.ok) {
         await rollback();
         return { ok: false, text: res.result, sessionId: null, costUsd: res.costUsd, error: res.error };
       }
       if (res.costUsd != null) await patch(s.id, { gate_d_cost_usd: ((await cur()).gate_d_cost_usd ?? 0) + res.costUsd });
 
-      // 落提交 + CI；红则有限轮自修。提交失败/CI 前后非 clean/CI 跑不起来/耗尽 → 回滚 + 停泊。
+      // Commit and run CI; when it is red, fix it for a bounded number of rounds. A failed commit, a tree that
+      // is not clean before or after CI, CI failing to run, or the rounds being exhausted -> roll back and park.
       for (let attempt = 0; ; attempt++) {
-        const cm = commitWorktree(wt, `forge(闸D ${s.slug}): round ${round}${attempt ? ` CI 修${attempt}` : ' fix'}`);
+        const cm = commitWorktree(wt, `forge(gate D ${s.slug}): round ${round}${attempt ? ` ci-fix ${attempt}` : ' fix'}`);
         await appendEvent(s.id, 'gated_commit', { ok: cm.ok, committed: cm.committed, attempt, output: cm.output.slice(0, 160) });
-        if (!cm.ok) await bail(`闸D 落提交失败 → 停泊（worktree 可能脏）：${cm.output.slice(0, 200)}`);
-        if (!worktreeClean(wt)) await bail('闸D 提交后 worktree 非 clean → 停泊（CI 须验 HEAD，不验脏树）');
+        if (!cm.ok) await bail(`Gate D failed to make the commit -> parking (the worktree may be dirty): ${cm.output.slice(0, 200)}`);
+        if (!worktreeClean(wt)) await bail('the Gate D worktree is not clean after the commit -> parking (CI must verify HEAD, not a dirty tree)');
 
         const ci = await runCi(wt, ciScript, { base: env.base_sha || env.base_ref || undefined, timeoutMs: ciTimeout });
         dump('gated-ci.raw.txt', ci.summary);
-        if (!ci.ran) await bail(`闸D CI 跑不起来（基础设施）：${ci.summary.slice(0, 200)}`);
+        if (!ci.ran) await bail(`Gate D CI could not be run (infrastructure): ${ci.summary.slice(0, 200)}`);
         if (ci.ok) {
-          // CI 绿后再验一次 clean：委托的 CI 脚本若自身改了 tracked 文件（codegen/format）并退 0，
-          // CI 验的就是 HEAD+脏，而 push 只有 HEAD → 仍是「CI 验的对象 ≠ push 的对象」（Codex 二审 Blocker）。
-          if (!worktreeClean(wt)) await bail('闸D CI 后 worktree 被改脏 → 停泊（CI 验的对象 ≠ 被 push 的 HEAD；CI 不应改 tracked 文件）');
-          break; // 绿 + 前后皆 clean → HEAD 即被验证的提交，去 push
+          // Check cleanliness once more after CI goes green: if the delegated CI script modified tracked files
+          // itself (codegen or formatting) and still exited 0, what CI verified was HEAD-plus-dirt while only
+          // HEAD gets pushed - so "what CI verified" would still differ from "what is pushed" (Codex, second
+          // review, blocker).
+          if (!worktreeClean(wt)) await bail('the Gate D worktree was dirtied after CI -> parking (what CI verified is not the HEAD being pushed; CI must not modify tracked files)');
+          break; // green and clean on both sides -> HEAD is exactly the verified commit, so push it
         }
-        if (attempt >= MAX_CI_FIX_ATTEMPTS) await bail(`闸D 改方 + ${attempt} 轮自修后本地 CI 仍红 → 停泊交 M（绝不推红进 PR）：${ci.summary.slice(0, 200)}`);
-        // 红：带 CI 摘要让 claude 再修一轮（同会话 resume）。自修 claude 瞬断 → 回滚 + 暂停（绝不留红 commit 在 HEAD）。
+        if (attempt >= MAX_CI_FIX_ATTEMPTS) await bail(`the local Gate D CI is still red after the revision plus ${attempt} self-fix round(s) -> parking for the owner (a red state is never pushed into the PR): ${ci.summary.slice(0, 200)}`);
+        // Red: hand claude the CI summary for another fix round (resuming the same session). If that self-fix
+        // claude call drops out, roll back and pause (a red commit must never be left at HEAD).
         res = await runStep(render(loadPrompt('gate-d-ci-fix.md', pid), { CI: ci.summary.slice(0, 3000), WORKTREE: wt }));
         dump('gated-fix.raw.txt', res.raw ?? '');
         if (!res.ok) {
@@ -263,18 +289,23 @@ function gateDDrivers(s: Session): ReviewFixDrivers {
       }
 
       const pushed = pushWorktree(wt);
-      if (!pushed.ok) await bail(`闸D 推分支更新 PR 失败：${pushed.output.slice(0, 200)}`);
+      if (!pushed.ok) await bail(`Gate D failed to push the branch to update the PR: ${pushed.output.slice(0, 200)}`);
       await appendEvent(s.id, 'gated_pushed', { round });
       return { ok: true, text: res.result, sessionId: sid, costUsd: res.costUsd };
     },
   };
 }
 
-// 进 loop 前的毒丸守门：上一轮改方回滚失败会留 gate_d_rollback_to（worktree 处「未确认复位」态）。
-// 无论该失败被 classifyError 判瞬时(reconcile 自动退避重试)还是永久(人工 retry)，planRetry 都会把已开 PR 的
-// GATE_D_FAILED 送回 GATE_D_LOOP——若不在 review-first 跑之前强制复位确认，就会让红/脏 HEAD 进 review、绕过 CI 绿前置。
-// 故：标记在 → 先 resetWorktree 复位（其内部已再验 clean）→ 成功才清标记放行；失败抛错继续停泊/死信。
-// 放行只认「复位确认成功」这一确定性事实，绝不靠错误文案分类（Codex 闸D Blocker）。
+// The poison-pill gate that runs before the loop: a failed rollback in the previous revision round leaves
+// gate_d_rollback_to behind (the worktree is in an "unconfirmed reset" state).
+// Whether classifyError judged that failure transient (reconcile retries it with a backoff) or permanent (a
+// human retries it), planRetry sends a GATE_D_FAILED with an open PR back to GATE_D_LOOP - so without forcing a
+// confirmed reset before review-first runs, a red or dirty HEAD would enter the review and bypass the CI-green
+// precondition.
+// Hence: if the mark is set -> resetWorktree first (which re-checks cleanliness internally) -> only clear the
+// mark and continue on success; on failure, throw and stay parked or go to the dead-letter queue.
+// Continuing is gated on the deterministic fact "the reset was confirmed", never on classifying error text
+// (Codex Gate D blocker).
 async function recoverPendingRollback(s: Session): Promise<void> {
   const c = (await get(s.id))!;
   const target = (c.gate_d_rollback_to ?? '').trim();
@@ -282,17 +313,19 @@ async function recoverPendingRollback(s: Session): Promise<void> {
   const wt = c.worktree_path;
   if (!wt) {
     await appendEvent(s.id, 'gated_rollback_recover', { ok: false, reason: 'missing_worktree_path', to: target.slice(0, 12) });
-    throw new Error('闸D 回滚恢复：标记要求复位但 worktree_path 缺失 → 继续停泊');
+    throw new Error('Gate D rollback recovery: the mark demands a reset but worktree_path is missing -> staying parked');
   }
   const r = resetWorktree(wt, target);
   await appendEvent(s.id, 'gated_rollback_recover', { to: target.slice(0, 12), ok: r.ok, output: r.output.slice(0, 120) });
-  if (!r.ok) throw new Error(`闸D 回滚恢复失败：worktree 仍无法复位到 ${target.slice(0, 12)} → 继续停泊（绝不带红/脏 HEAD 进 review）：${r.output.slice(0, 160)}`);
-  await patch(s.id, { gate_d_rollback_to: null }); // 复位确认成功 → 清毒丸，放行进 review-first
+  if (!r.ok) throw new Error(`Gate D rollback recovery failed: the worktree still cannot be reset to ${target.slice(0, 12)} -> staying parked (a red or dirty HEAD must never enter the review): ${r.output.slice(0, 160)}`);
+  await patch(s.id, { gate_d_rollback_to: null }); // the reset is confirmed -> clear the poison pill and continue into review-first
 }
 
-// 跑一段闸D PR 对抗循环（worker 在 GATE_D_LOOP / GATE_D_REVISION_REQUESTED 调），返回结论交 worker 转移。
-// async：让 recoverPendingRollback 的同步抛也成为 promise rejection（worker await-in-try 统一捕获停泊）。
+// Run a stretch of the Gate D PR adversarial loop (the worker calls this in GATE_D_LOOP /
+// GATE_D_REVISION_REQUESTED) and return the conclusion for the worker to transition on.
+// It is async so that a synchronous throw from recoverPendingRollback also becomes a promise rejection (the
+// worker's await-in-try catches both the same way and parks).
 export async function runGateDLoop(s: Session): Promise<ReviewFixOutcome> {
-  await recoverPendingRollback(s); // 毒丸守门：未确认复位的 worktree 绝不进 review-first
+  await recoverPendingRollback(s); // the poison-pill gate: a worktree with an unconfirmed reset never enters review-first
   return runReviewFixLoop(gateDConfig(s), gateDDrivers(s));
 }

@@ -1,8 +1,17 @@
-// 集成：runGateDHarden（闸D 测试补强）。mock LLM/CI/git 边界，锁补强不变量：
-// ①happy：reset 到 **pin 的绿态 sha**（绝不用移动 ref）→harden→commit→CI 绿→pin verified_sha→写报告→推；
-// ②CI 红→有限轮自修→绿；③持续红→回滚(到 pin 绿态)+抛；④幂等 fast-path：merge_readiness_path 在且 HEAD==verified 且干净→只补推；
-// ⑤fast-path HEAD≠verified→**绝不盲推**，落全量补强重来；⑥缺 pin 绿态 sha→抛（不在未知基线上补强）；
-// ⑦规范化 reset 失败→抛；⑧harden claude 失败→回滚+抛；⑨CI 绿写报告后 push 失败→抛但不回滚（verified_sha 留存供幂等补推）。
+// Integration: runGateDHarden (Gate D test hardening). The LLM / CI / git boundaries are mocked, and it pins
+// the hardening invariants:
+// 1. happy path: reset to the **pinned green sha** (never a moving ref) -> harden -> commit -> CI green -> pin
+//    verified_sha -> write the report -> push;
+// 2. CI red -> a bounded number of self-fix rounds -> green;
+// 3. still red -> roll back (to the pinned green sha) and throw;
+// 4. the idempotent fast path: merge_readiness_path is set, HEAD == verified and the tree is clean -> only
+//    re-push;
+// 5. on the fast path with HEAD != verified -> **never push blindly**, fall through to a full re-hardening;
+// 6. no pinned green sha -> throw (never harden on an unknown baseline);
+// 7. the normalising reset fails -> throw;
+// 8. the hardening claude fails -> roll back and throw;
+// 9. the push fails after CI went green and the report was written -> throw but do **not** roll back
+//    (verified_sha is kept so the next round re-pushes it idempotently).
 process.env.FORGE_DB = ':memory:';
 import { test, mock, beforeEach } from 'node:test';
 import assert from 'node:assert/strict';
@@ -10,7 +19,7 @@ import { mkdtempSync, existsSync, readFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 
-let claudeFix = JSON.stringify({ summary: '补了失败路径 + 权限路径测试', needs_human: [] });
+let claudeFix = JSON.stringify({ summary: 'added failure-path and permission-path tests', needs_human: [] });
 let claudeOkQueue: boolean[] = [];
 let ciOkQueue: boolean[] = [];
 let ciRan = true;
@@ -18,7 +27,7 @@ let commitResult = { ok: true, committed: true, output: 'committed' };
 let cleanQueue: boolean[] = [];
 let resetOk = true;
 let pushOk = true;
-let headQueue: string[] = []; // worktreeHeadSha 按调用 shift；空则用 headDefault
+let headQueue: string[] = []; // worktreeHeadSha shifts one per call; when empty it uses headDefault
 let headDefault = 'GREENHEAD';
 let resetArgs: string[] = [];
 let pushCalls = 0;
@@ -27,7 +36,7 @@ let ciCalls = 0;
 let claudeCalls = 0;
 let resetCalls = 0;
 
-let lastClaudePrompt = ''; // 真渲染产物捕获（证明 code 喂全 gate-d-harden-tests / gate-d-ci-fix 模板变量）
+let lastClaudePrompt = ''; // capture the really-rendered prompt (proving the code feeds every gate-d-harden-tests / gate-d-ci-fix template variable)
 mock.module('../src/llm/runClaude.ts', {
   namedExports: {
     runClaude: async (prompt: string) => {
@@ -36,7 +45,7 @@ mock.module('../src/llm/runClaude.ts', {
       const ok = claudeOkQueue.length ? (claudeOkQueue.shift() as boolean) : true;
       return ok
         ? { ok: true, result: claudeFix, sessionId: null, costUsd: 0.01, raw: claudeFix, error: null }
-        : { ok: false, result: '', sessionId: null, costUsd: null, raw: '', error: 'claude 瞬断' };
+        : { ok: false, result: '', sessionId: null, costUsd: null, raw: '', error: 'claude dropped out' };
     },
   },
 });
@@ -66,7 +75,7 @@ const env = {
   implemented: true, diff_stat: ' a.ts | 2 +-', files_changed: ['a.ts'], ci_ok: true, ci_summary: '', last_summary: '',
 };
 mock.module('../src/gates/gateC.ts', {
-  namedExports: { readImplEnvelope: () => env, persistGateC: () => {}, gateCContext: () => '技术方案：做 X' },
+  namedExports: { readImplEnvelope: () => env, persistGateC: () => {}, gateCContext: () => 'Tech design: build X' },
 });
 mock.module('../src/projects.ts', {
   namedExports: {
@@ -82,12 +91,12 @@ let n = 0;
 async function mk(extra: Record<string, unknown> = {}): Promise<string> {
   const id = `dh${++n}`;
   await sessions.create({ id, slug: id, title: 'T', branch: 'main' });
-  await sessions.patch(id, { gate_d_green_sha: 'GREENHEAD', ...extra } as never); // 默认有 pin 绿态；测试可覆盖/置 null
+  await sessions.patch(id, { gate_d_green_sha: 'GREENHEAD', ...extra } as never); // a pinned green sha by default; individual tests can override it or set it to null
   return id;
 }
 
 beforeEach(() => {
-  claudeFix = JSON.stringify({ summary: '补了失败路径 + 权限路径测试', needs_human: [] });
+  claudeFix = JSON.stringify({ summary: 'added failure-path and permission-path tests', needs_human: [] });
   claudeOkQueue = [];
   ciOkQueue = [];
   ciRan = true;
@@ -106,23 +115,23 @@ beforeEach(() => {
   lastClaudePrompt = '';
 });
 
-test('happy：reset 到 pin 绿态 sha（绝不用移动 ref）→harden→CI 绿→pin verified_sha→写报告→推', async () => {
+test('happy path: reset to the pinned green sha (never a moving ref) -> harden -> CI green -> pin verified_sha -> write the report -> push', async () => {
   const id = await mk();
   await runGateDHarden((await sessions.get(id))!);
   const s = (await sessions.get(id))!;
-  assert.equal(resetArgs[0], 'GREENHEAD'); // 关键回归：基线是 pin 的 sha，不是 origin/forge/x
-  assert.ok(!resetArgs.some((a) => a.startsWith('origin/'))); // 绝不 reset 到移动 ref
-  assert.equal(s.gate_d_harden_verified_sha, 'GREENHEAD'); // pin 下被验证的 HEAD
-  assert.ok(s.merge_readiness_path && existsSync(s.merge_readiness_path)); // 报告落盘（forge 本地）
+  assert.equal(resetArgs[0], 'GREENHEAD'); // the key regression: the baseline is the pinned sha, not origin/forge/x
+  assert.ok(!resetArgs.some((a) => a.startsWith('origin/'))); // it must never reset to a moving ref
+  assert.equal(s.gate_d_harden_verified_sha, 'GREENHEAD'); // the verified HEAD is pinned
+  assert.ok(s.merge_readiness_path && existsSync(s.merge_readiness_path)); // the report is written to disk (forge-local)
   assert.equal(s.gate_d_harden_round, 1);
   assert.equal(claudeCalls, 1);
   assert.equal(ciCalls, 1);
   assert.equal(pushCalls, 1);
-  assert.match(readFileSync(s.merge_readiness_path!, 'utf8'), /严禁自动合并/);
-  assert.doesNotMatch(lastClaudePrompt, /\{\{\w+\}\}/, 'gate-d-harden-tests 真渲染有未喂变量（code 漏喂模板变量）');
+  assert.match(readFileSync(s.merge_readiness_path!, 'utf8'), /Automatic merging is forbidden/);
+  assert.doesNotMatch(lastClaudePrompt, /\{\{\w+\}\}/, 'the real gate-d-harden-tests render has an unfed variable (the code forgot a template variable)');
 });
 
-test('CI 红 → 有限轮自修 → 绿', async () => {
+test('CI red -> a bounded number of self-fix rounds -> green', async () => {
   const id = await mk();
   ciOkQueue = [false, true];
   claudeOkQueue = [true, true];
@@ -130,86 +139,86 @@ test('CI 红 → 有限轮自修 → 绿', async () => {
   assert.equal(claudeCalls, 2);
   assert.equal(ciCalls, 2);
   assert.equal(pushCalls, 1);
-  assert.ok(Math.abs(((await sessions.get(id))!.gate_d_cost_usd ?? 0) - 0.02) < 1e-9, '补强首轮 + CI 红后自修都是真付费调用，成本必须累计可见');
+  assert.ok(Math.abs(((await sessions.get(id))!.gate_d_cost_usd ?? 0) - 0.02) < 1e-9, 'the first hardening round and the self-fix after a red CI are both real billed calls, so the cost must accrue visibly');
   assert.ok((await sessions.get(id))!.merge_readiness_path);
-  assert.doesNotMatch(lastClaudePrompt, /\{\{\w+\}\}/, 'gate-d-ci-fix 真渲染有未喂变量（自修轮次的 prompt）');
+  assert.doesNotMatch(lastClaudePrompt, /\{\{\w+\}\}/, 'the real gate-d-ci-fix render has an unfed variable (the self-fix round\'s prompt)');
 });
 
-test('CI 持续红 → 有限轮自修后仍红 → 回滚(到 pin 绿态)+抛（不推）', async () => {
+test('CI stays red -> still red after the bounded self-fix rounds -> roll back (to the pinned green sha) and throw (nothing is pushed)', async () => {
   const id = await mk();
   ciOkQueue = [false, false, false];
   const s = (await sessions.get(id))!;
-  await assert.rejects(() => runGateDHarden(s), /CI 仍红/);
+  await assert.rejects(() => runGateDHarden(s), /still red/);
   assert.equal(ciCalls, 3);
   assert.equal(claudeCalls, 3);
-  assert.ok(Math.abs(((await sessions.get(id))!.gate_d_cost_usd ?? 0) - 0.03) < 1e-9, '即使最终停泊，已发生的补强/自修付费调用也要累计到账');
+  assert.ok(Math.abs(((await sessions.get(id))!.gate_d_cost_usd ?? 0) - 0.03) < 1e-9, 'even when it ultimately parks, the hardening and self-fix calls that did happen must still be billed and visible');
   assert.equal(pushCalls, 0);
-  assert.deepEqual(resetArgs, ['GREENHEAD', 'GREENHEAD']); // 入口规范化 + 退出回滚都到 pin 绿态
+  assert.deepEqual(resetArgs, ['GREENHEAD', 'GREENHEAD']); // both the entry normalisation and the exit rollback target the pinned green sha
 });
 
-test('幂等 fast-path：merge_readiness_path 在 + HEAD==verified + 干净 → 只补推（不 harden/CI/reset）', async () => {
+test('the idempotent fast path: merge_readiness_path set + HEAD == verified + clean -> only re-push (no harden, CI or reset)', async () => {
   const id = await mk({ merge_readiness_path: '/tmp/already.md', gate_d_harden_verified_sha: 'GREENHEAD', gate_d_harden_round: 1 });
   headDefault = 'GREENHEAD'; // HEAD == verified
   await runGateDHarden((await sessions.get(id))!);
   assert.equal(claudeCalls, 0);
   assert.equal(ciCalls, 0);
   assert.equal(resetCalls, 0);
-  assert.equal(pushCalls, 1); // 仅补推已验证提交
+  assert.equal(pushCalls, 1); // it only re-pushes the already-verified commit
 });
 
-test('fast-path HEAD≠verified（隔离树被改/残留）→ 绝不盲推，落全量补强重来（reset 回 pin 绿态）', async () => {
+test('the fast path with HEAD != verified (the isolated tree was modified, or residue was left) -> never push blindly; fall through to a full re-hardening (resetting to the pinned green sha)', async () => {
   const id = await mk({ merge_readiness_path: '/tmp/already.md', gate_d_harden_verified_sha: 'VHEAD', gate_d_harden_round: 1 });
-  headQueue = ['OTHER']; // fast-path 守门：当前 HEAD=OTHER ≠ verified VHEAD → 不走 fast-path
-  // 后续（reset 后、CI 绿后）worktreeHeadSha 回落 headDefault='GREENHEAD'
+  headQueue = ['OTHER']; // the fast-path guard: the current HEAD is OTHER, which is not the verified VHEAD -> the fast path is skipped
+  // Later calls (after the reset and after CI goes green) fall back to headDefault = 'GREENHEAD'
   await runGateDHarden((await sessions.get(id))!);
-  assert.ok(claudeCalls >= 1); // 走了全量补强（fast-path 会 claudeCalls=0）——证明没盲推
-  assert.equal(resetArgs[0], 'GREENHEAD'); // 重来 reset 到 pin 绿态
-  assert.equal(pushCalls, 1); // 全量补强后才推（验证过的）
+  assert.ok(claudeCalls >= 1); // it ran a full hardening pass (the fast path would leave claudeCalls at 0), proving nothing was pushed blindly
+  assert.equal(resetArgs[0], 'GREENHEAD'); // the retry resets to the pinned green sha
+  assert.equal(pushCalls, 1); // it only pushes after the full hardening pass (so the pushed commit is verified)
 });
 
-test('缺 pin 绿态 sha → 抛（拒绝在未知/移动基线上补强；不 reset/harden）', async () => {
+test('no pinned green sha -> throw (refusing to harden on an unknown or moving baseline; nothing is reset or hardened)', async () => {
   const id = await mk({ gate_d_green_sha: null });
   const s = (await sessions.get(id))!;
-  await assert.rejects(() => runGateDHarden(s), /缺 pin 的绿态 sha/);
+  await assert.rejects(() => runGateDHarden(s), /pinned green sha .* is missing/);
   assert.equal(resetCalls, 0);
   assert.equal(claudeCalls, 0);
 });
 
-test('规范化 reset 到绿态失败 → 抛（绝不在残留树上 harden）', async () => {
+test('the normalising reset to the green sha fails -> throw (never harden on a tree with residue)', async () => {
   const id = await mk();
   resetOk = false;
   const s = (await sessions.get(id))!;
-  await assert.rejects(() => runGateDHarden(s), /规范化到绿态 .* 失败/);
+  await assert.rejects(() => runGateDHarden(s), /normalising to the green sha .* failed/);
   assert.equal(claudeCalls, 0);
   assert.equal(ciCalls, 0);
   assert.equal(pushCalls, 0);
   assert.equal(resetCalls, 1);
 });
 
-test('harden claude 失败 → 回滚 + 抛（不 commit/CI/推）', async () => {
+test('the hardening claude fails -> roll back and throw (no commit, no CI, no push)', async () => {
   const id = await mk();
   claudeOkQueue = [false];
   const s = (await sessions.get(id))!;
-  await assert.rejects(() => runGateDHarden(s), /补强 claude 失败/);
+  await assert.rejects(() => runGateDHarden(s), /hardening claude failed/);
   assert.equal(commitCalls, 0);
   assert.equal(ciCalls, 0);
   assert.equal(pushCalls, 0);
-  assert.deepEqual(resetArgs, ['GREENHEAD', 'GREENHEAD']); // 规范化 + 回滚
+  assert.deepEqual(resetArgs, ['GREENHEAD', 'GREENHEAD']); // the entry normalisation plus the rollback
 });
 
-test('CI 绿写报告后 push 失败 → 抛但**不回滚**（verified_sha+报告留存供幂等补推）', async () => {
+test('the push fails after CI went green and the report was written -> throw but do **not** roll back (verified_sha and the report are kept so the next round re-pushes idempotently)', async () => {
   const id = await mk();
   pushOk = false;
   const sess = (await sessions.get(id))!;
-  await assert.rejects(() => runGateDHarden(sess), /推分支失败/);
+  await assert.rejects(() => runGateDHarden(sess), /failed to push the branch/);
   const s = (await sessions.get(id))!;
-  assert.equal(s.gate_d_harden_verified_sha, 'GREENHEAD'); // 已 pin
-  assert.ok(s.merge_readiness_path); // 报告已写
-  assert.equal(resetCalls, 1); // 仅入口规范化——报告写后不回滚（绝不丢已验证工作）
+  assert.equal(s.gate_d_harden_verified_sha, 'GREENHEAD'); // already pinned
+  assert.ok(s.merge_readiness_path); // the report was written
+  assert.equal(resetCalls, 1); // only the entry normalisation - nothing rolls back once the report is written (verified work is never thrown away)
   assert.equal(pushCalls, 1);
 });
 
-test('多仓补强：每个 PR 保留独立合并就绪报告，后一个仓不会覆盖前一个仓', async () => {
+test('multi-repo hardening: every PR keeps its own merge-readiness report, and a later repo never overwrites an earlier one', async () => {
   const id = await mk({
     legs: JSON.stringify([
       mkLeg('demo', { worktree_path: '/wt/demo', pr_url: 'https://x/pull/11' }),
@@ -240,18 +249,18 @@ test('多仓补强：每个 PR 保留独立合并就绪报告，后一个仓不�
   const secondPath = (await sessions.get(id))!.merge_readiness_path!;
   const secondText = readFileSync(secondPath, 'utf8');
 
-  assert.notEqual(firstPath, secondPath, '多仓合并证据必须每仓独立，不能共用同一路径被后仓覆盖');
+  assert.notEqual(firstPath, secondPath, 'the merge evidence for several repos must stay per-repo; sharing one path would let a later repo overwrite it');
   assert.match(secondPath, /merge-readiness\.example-web\.md$/);
-  assert.match(readFileSync(firstPath, 'utf8'), /https:\/\/x\/pull\/11/, '第一仓报告仍保留自己的 PR');
-  assert.match(secondText, /https:\/\/x\/pull\/22/, '第二仓报告记录自己的 PR');
+  assert.match(readFileSync(firstPath, 'utf8'), /https:\/\/x\/pull\/11/, 'the first repo\'s report still records its own PR');
+  assert.match(secondText, /https:\/\/x\/pull\/22/, 'the second repo\'s report records its own PR');
 });
 
-test('buildMergeReadiness：含 PR / 改动 / 回滚方案 / 严禁自动合并（纯函数）', () => {
-  const s = { slug: 'x', title: '做个功能', branch: 'main', pr_url: 'https://x/pull/9', gate_d_residual: null } as never;
-  const md = buildMergeReadiness(s, env as never, { context: '需求：做 X', codexRound: 2, hardenSummary: '补了失败路径测试' });
+test('buildMergeReadiness: carries the PR, the changes, the rollback plan and the no-automatic-merge line (a pure function)', () => {
+  const s = { slug: 'x', title: 'build a feature', branch: 'main', pr_url: 'https://x/pull/9', gate_d_residual: null } as never;
+  const md = buildMergeReadiness(s, env as never, { context: 'Requirement: build X', codexRound: 2, hardenSummary: 'added failure-path tests' });
   assert.match(md, /https:\/\/x\/pull\/9/);
-  assert.match(md, /严禁自动合并/);
-  assert.match(md, /回滚方案/);
+  assert.match(md, /Automatic merging is forbidden/);
+  assert.match(md, /Rollback plan/);
   assert.match(md, /a\.ts/);
-  assert.match(md, /第 2 轮 codex LGTM/);
+  assert.match(md, /codex said LGTM in round 2/);
 });
