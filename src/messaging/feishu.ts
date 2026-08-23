@@ -8,7 +8,7 @@
 // 这是「散文内容」而非「结构」，未来 Slack adapter 对散文块统一做 <font>→自家强调的转换即可。
 import * as lark from '@larksuiteoapi/node-sdk';
 import { sendBotCardObject, sendBotCard, botTenantToken, botOpenId, botOpenIdCached, FEISHU_BASE } from '../feishu/dm.ts';
-import { listMessages, type FeishuHistMsg } from '../feishu/history.ts';
+import { chatIsGroup, listMessages, type FeishuHistMsg } from '../feishu/history.ts';
 import { replyCard, patchCard, sendCardToChat } from '../feishu/group.ts';
 import { postCard } from '../feishu/notify.ts';
 import { petImageKey } from '../feishu/petAssets.ts';
@@ -224,7 +224,7 @@ function watchChats(): string[] {
 
 // 历史条目 → provider 无关 InboundMessage。与 parseMessage 保持同样的兜底口径：
 // 正文取 body.content 里的 text，另附整条序列化文本块供核心兜底抽链接（分享卡/富文本的链接不在正文）。
-function histToInbound(m: FeishuHistMsg, chatId: string): InboundMessage {
+function histToInbound(m: FeishuHistMsg, chatId: string, isGroup: boolean): InboundMessage {
   let text = '';
   if (m.body?.content) {
     try {
@@ -248,7 +248,7 @@ function histToInbound(m: FeishuHistMsg, chatId: string): InboundMessage {
     text,
     searchTexts: [JSON.stringify(m)],
     createTime,
-    isGroup: true, // 补拉只针对群/频道历史
+    isGroup, // 由 listHistorySince 判定：条目自带 chat_type 就用它，否则问一次会话类型
     mentionedBot,
   };
 }
@@ -355,7 +355,16 @@ const feishuPort: MessagingPort = {
   async listHistorySince(chatId: string, sinceMs: number): Promise<InboundMessage[]> {
     // 飞书 start_time 是**秒**级：向下取整可能把水位那一秒的消息带回来，核心按 createTime 毫秒再滤一次。
     const items = await listMessages(chatId, Math.floor(sinceMs / 1000));
-    return items.map((m) => histToInbound(m, chatId));
+    // 这个会话是群还是私聊——**不能想当然当成群**。补拉遍历的是游标表（cursors.allChats），
+    // 而游标是每条入站消息都会推进的，私聊自然也在里面。把私聊历史当群消息，就会撞上
+    // 「群里没 @ 我」的入口闸被丢掉：离线期间私聊来的需求静默消失，正好是补拉要防的那件事。
+    // 条目自带 chat_type 就用它（一次往返都省了），否则问一次会话类型（按 chatId 记忆）。
+    const fromItem = items.find((m) => typeof m.chat_type === 'string');
+    const isGroup = fromItem ? fromItem.chat_type === 'group' : ((await chatIsGroup(chatId)) ?? true);
+    // 注意兜底方向：判不出来时**当群**（今天的行为），而不是当私聊。两个方向的代价不对称——
+    // 误当私聊会让群里随手分享的文档全部入闸A（真金白银），误当群只是继续今天这个已知缺口，
+    // 且 chatIsGroup 失败时已经出过一条 warn，不是静默。
+    return items.map((m) => histToInbound(m, chatId, isGroup));
   },
   async probe(): Promise<InboundProbe> {
     // 只读、page_size=1、无副作用：验的正是 listHistorySince 依赖的 im/v1/messages 分页信封。

@@ -114,6 +114,9 @@ Slack 后台(api.slack.com/apps → 建 App)要开的东西:
    - **PM 免 @ 入口**(直接贴链接即评审,体感更好):额外开 `im:message.group_msg`(收**非 @** 的群消息内容)。
      代码侧已就绪——adapter 设了 `policy.requireMention:false`(`src/messaging/feishu.ts`),`handleMessage` 只看有无飞书 doc 链接、不要求 @;**唯一前提就是这条 scope**(服务端不开则飞书根本不推非 @ 消息)。
    - **离线补拉**额外需 `im:message.history:readonly`(读群历史,断连/休眠期间漏的消息开机补回)。
+   - 补拉还会用 `im:chat:readonly` 问一次「这个会话是群还是私聊」(只在历史条目自身不带 `chat_type` 时才问,
+     且按会话记忆,一个进程一次)。**不给也能跑**,但判不出来时一律当群处理——于是**离线期间私聊过来的需求
+     会被「群里没 @ 我」的入口闸丢掉**。只用群入口就无所谓;允许私聊贴需求就该给。
    - 群消息入口还需把 **bot 拉进那个群**。
 4. **私聊推送目标**已通(`union_id`,见 `config/forge.env`);观察群 `FEISHU_WATCH_CHATS`。
 
