@@ -1,13 +1,15 @@
-// ProjectActions 选择点（唯一接线处）。核心只 `import { projectActions } from './project/index.ts'`，
-// 永不直接调某个 adapter。当前唯一 adapter 是 demo 主仓脚本；将来按 proj 选 nativeGithub（直调 gh/API），
-// 核心一行不动——同 messaging/index.ts 的 provider 选择点。
+// The ProjectActions selection point (the one place it is wired). The core only ever does
+// `import { projectActions } from './project/index.ts'` and never calls an adapter directly. Choosing
+// nativeGithub (which calls gh and the API directly) by project needs no change in the core at all — the
+// same shape as the provider selection point in messaging/index.ts.
 //
-// 入参是已解析的 ProjectFull（调用方用 projectForSession(s) 拿，本就在手），故本模块**不**运行时依赖
-// projects.ts——避开「mock projects.ts 缺 project 导出 → 导入期炸」那类测试脆裂（见 0.1b 教训）。
+// The argument is an already-resolved ProjectFull (the caller has one in hand from projectForSession(s)), so
+// this module has **no** runtime dependency on projects.ts — which avoids the "a test mocks projects.ts,
+// leaves out the project export, and it explodes at import time" fragility (the lesson from 0.1b).
 import { makeDemoScriptActions } from './actions.ts';
 import { makeNativeGithubActions } from './github.ts';
 import type { ProjectActions } from './actions.ts';
-import type { ProjectFull } from '../projects.ts'; // type-only，运行时擦除
+import type { ProjectFull } from '../projects.ts'; // type-only, erased at runtime
 
 export function projectActions(proj: ProjectFull): ProjectActions {
   return proj.actions === 'native' ? makeNativeGithubActions(proj) : makeDemoScriptActions(proj);

@@ -57,7 +57,7 @@ test('真 requestGateB：项目 acme 覆盖 gate_b_allowed=[BD] → 全局审批
   await mkConfirmed('s-acme', 'acme');
   const r = await actions.requestGateB('s-acme', 'M'); // M 在**全局** gate_b_allowed，但不在 acme 的
   assert.equal(r.ok, false);
-  assert.match(r.msg, /无闸B 权限/);
+  assert.match(r.msg, /may not run Gate B/);
   assert.equal((await sessions.get('s-acme'))!.state, 'CONFIRMED'); // 未推进
   assert.ok((await sessions.events('s-acme')).some((e) => e.kind === 'permission_denied'));
 });

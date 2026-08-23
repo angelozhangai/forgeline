@@ -7,7 +7,7 @@ import { project, defaultProjectId } from './projects.ts';
 import { parseHumanAsks } from './gates/envelopes.ts';
 import { commandExists, runSync } from './util/proc.ts';
 import { out, log } from './util/log.ts';
-import { store as sessions } from './store/index.ts'; // 经 SessionStore 接缝（选择点），不直连 store/sessions.ts
+import { store as sessions } from './store/index.ts'; // through the SessionStore seam (the selection point), never straight to store/sessions.ts
 import { db } from './store/db.ts';
 import { addPrd, addImplementTask } from './intake.ts';
 import { parseAnyRef, registeredIds } from './docs/index.ts';
@@ -28,7 +28,7 @@ import { initHeartbeat, pingLiveness } from './health/heartbeat.ts';
 import { startHealthServer } from './health/server.ts';
 import { startControlServer } from './control/server.ts';
 import { ACTIVE_GATE_STATES } from './statemachine/states.ts';
-import { loadExtensions, extCommands, activePackName } from './ext/index.ts'; // 扩展接缝：下游产品的 CLI 命令与生命周期钩子
+import { loadExtensions, extCommands, activePackName } from './ext/index.ts'; // the extension seam: a downstream product's CLI commands and lifecycle hooks
 
 type Flags = Record<string, string | boolean>;
 
@@ -58,54 +58,55 @@ function userOf(flags: Flags): string {
 }
 
 function help(): void {
-  out(`forge — Forge · PRD 评审/技术方案自动化服务
+  out(`forge - Forge · automated PRD review and technical planning
 
-用法：./forge <命令> [参数]
+Usage: ./forge <command> [arguments]
 
-  doctor                              环境自检（主仓/三仓/claude/codex/gh/配置/DB）·静态
-  health  [--json]                    运行时活检（守护心跳/长连接/DB/备份/依赖/磁盘）+ 状态页地址
-  status-page                         独立预览状态页（只起健康服务，不跑 tick/不连 IM/不花钱；Ctrl-C 退出）
-  watchdog                            看门狗一次性探活+自愈+告警（launchd StartInterval 调，人工很少手敲）
-  contract-check                      主动探外部 CLI/API 输出契约（codex/claude 各一发付费 trivial + gh/IM 免费）→ 落库+漂移告警
-  add --prd <需求文档链接> [--slug s]  登记一个 PRD（读文档建 session；链接归哪个文档源由注册表判定）
+  doctor                              check the environment (repos / claude / codex / gh / config / DB) · static
+  health  [--json]                    check the running service (heartbeat / connection / DB / backups / dependencies / disk) plus the status page address
+  status-page                         preview the status page on its own (health service only: no tick, no IM, no cost; Ctrl-C to exit)
+  watchdog                            one watchdog pass: probe, self-heal, alert (launchd's StartInterval calls it; rarely typed by hand)
+  contract-check                      actively probe the external CLI/API output contracts (one paid trivial call each for codex and claude, free for gh and IM) -> persist and alert on drift
+  add --prd <document link> [--slug s] register a PRD (read the document and create a session; which source a link belongs to is decided by the registry)
       [--title t] [--branch prod|dev] [--chat <chatId>] [--project <id>]
-  tick                                推进所有 ready session（闸A / 闸B+对抗）
-  listen                              常驻守护：IM 长连接(卡片按钮+群消息入口) + 周期 tick
-  control [--port N] [--host H]        控制面 HTTP server（只 /jobs+/store，不跑编排）；要编排+服务一体用 listen 配 FORGE_CONTROL_PORT（FORGE_CONTROL_* 配端口/鉴权；非回环须 token）
-  list | board  [--project <id>]      列出所有 session 及状态（--project 按项目过滤）
-  show <id|slug>                      查看某 session 详情 + 事件链
-  answer  <id|slug> [--notes ".."] [--user W]  PM 答复开放问题 → 进下一轮复评（下次 tick 跑；群里走卡片更省事）
-  confirm <id|slug> --user W [--notes ".."]   M 强制结束评审 → CONFIRMED（PM 只在群卡答复，多轮复评由 claude/M 终止）
-  size    <id|slug> <S|M|L|XL> [--reason ".."]  评审人定/调复杂度档（建需求时打 size:* 标签）
-  workload [--since D] [--until D] [人...]   人均加权负载（私有·管理面，规模×跨栈×质量）
-  scores  [--sort score] [--min N] [--project <id>]  PRD 质量评分一览（私有·管理面，AI 闸A 打分，不对外）
-  cost    [--since N] [--project <id>]  成本看板（私有·管理面，claude 改方 $ 聚合，--since N 只看近 N 天，--project 按项目）
-  gateb   <id|slug> --user W           触发闸B（需 gate_b_allowed 权限）
-  gateb-answer <id|slug> [--notes ".."] [--user W]  M 答复闸B 改方的升级问题 → 续修（下次 tick 跑；群里走卡片更省事）
-  gateb-go <id|slug> --user W          闸B 停泊裁决时强制立项（需 go_approvers 权限）
-  assign  <id|slug> [<M|EO|CC|DE>] --user W [--auto]  指派 DRI：给短码=手动；无/--auto=按负载+WIP 自动推荐
-  go      <id|slug> --user W [--dry-run] [--assignee <短码>]  一键建需求（需 go_approvers 权限）
-  deny    <id|slug> --user W [--reason ".."]  拒绝 GO
-  retry   <id|slug> --user W           重置失败的 session 重跑（按失败闸鉴权：B→gate_b_allowed/C→gate_c_allowed/D→pr_create_approvers/其它→go_approvers）
-  eval    [--fixture <名>] [--runs N] [--no-save]  golden 离线评测：fixtures/eval 的 PRD 真跑闸A→对照期望报回归 + 落盘 + 与上次趋势对比（⚠️ 调真 claude·花钱·手动跑，不在 ci；--runs N 多样本看抖动）
+  tick                                advance every ready session (Gate A / Gate B plus the adversarial review)
+  listen                              the long-running daemon: the IM connection (card buttons and the channel entry point) plus the periodic tick
+  control [--port N] [--host H]        the control-plane HTTP server (/jobs and /store only; it runs no orchestration). For orchestration and serving in one, use listen with FORGE_CONTROL_PORT (FORGE_CONTROL_* sets the port and auth; a non-loopback address requires a token)
+  list | board  [--project <id>]      list every session and its state (--project filters by project)
+  show <id|slug>                      show one session's detail and its event chain
+  answer  <id|slug> [--notes ".."] [--user W]  product answers the open questions -> the next review round (runs on the next tick; the card in the channel is easier)
+  confirm <id|slug> --user W [--notes ".."]   the maintainer forces the review closed -> CONFIRMED (product only answers on the channel card; the multi-round loop is ended by claude or the maintainer)
+  size    <id|slug> <S|M|L|XL> [--reason ".."]  a reviewer sets or adjusts the complexity tier (it becomes a size:* label on the issues)
+  workload [--since D] [--until D] [people...]   weighted load per person (private, management-facing: size x cross-repo x quality)
+  scores  [--sort score] [--min N] [--project <id>]  the PRD quality scores (private, management-facing: scored by the Gate A AI, never shown outside)
+  cost    [--since N] [--project <id>]  the cost board (private, management-facing: the claude dollars aggregated; --since N limits it to the last N days, --project filters by project)
+  gateb   <id|slug> --user W           trigger Gate B (requires gate_b_allowed)
+  gateb-answer <id|slug> [--notes ".."] [--user W]  the maintainer answers Gate B's escalated question -> the revision carries on (runs on the next tick; the card in the channel is easier)
+  gateb-go <id|slug> --user W          force the work open while Gate B is parked for a decision (requires go_approvers)
+  assign  <id|slug> [<M|EO|CC|DE>] --user W [--auto]  assign the DRI: a short code assigns by hand; nothing or --auto recommends by load and WIP
+  go      <id|slug> --user W [--dry-run] [--assignee <code>]  create the work items in one step (requires go_approvers)
+  deny    <id|slug> --user W [--reason ".."]  refuse the GO
+  retry   <id|slug> --user W           reset a failed session to run again (authorised by the gate that failed: B -> gate_b_allowed / C -> gate_c_allowed / D -> pr_create_approvers / anything else -> go_approvers)
+  eval    [--fixture <name>] [--runs N] [--no-save]  the golden offline evaluation: really run Gate A over the PRDs in fixtures/eval, compare against the expectations and report regressions, persist the run, and compare the trend against last time (⚠️ it calls claude for real, costs money, and is run by hand — never in CI; --runs N takes several samples to see the jitter)
 
-  ── 下游（闸C 实现 + 闸D PR 对抗 review）──
-  implement <slug> --user W                       链式：DONE 后触发闸C（隔离 worktree 实现 + 本地 CI 至绿）
-  implement --issue <repo#n|url> --title t [...]   standalone：裸 issue 直起闸C（--project/--repo/--branch 可选）
-  gatec-answer <id|slug> [--notes ".."] [--user W]  M 答复闸C 实现的升级问题 / 裁决停泊 → 续做
-  review-pr <id|slug> --user W                     闸C 绿后触发开 PR（委托脚本·绝不自动 merge）+ 闸D codex 审 diff⇄claude 修（需 pr_create_approvers）
-  gated-answer <id|slug> [--notes ".."] [--user W]  M 答复闸D PR 复审的升级问题 / 裁决停泊 → 续修
-  merged <id|slug> --user W [--force]              人工合并 PR 后确认 → SHIPPED（先 gh 核验真合并，再清隔离 worktree + 接漂移；需 merge_ack_allowed。--force 越过核验）
+  -- Downstream (Gate C implementation and Gate D PR review) --
+  implement <slug> --user W                       chained: trigger Gate C after DONE (implement in an isolated worktree until local CI is green)
+  implement --issue <repo#n|url> --title t [...]   standalone: start Gate C straight from a bare issue (--project/--repo/--branch optional)
+  gatec-answer <id|slug> [--notes ".."] [--user W]  the maintainer answers Gate C's escalated question, or decides a parked session -> it carries on
+  review-pr <id|slug> --user W                     once Gate C is green, trigger opening the PR (delegated to a script, and never merged automatically) plus Gate D, where codex reviews the diff and claude fixes (requires pr_create_approvers)
+  gated-answer <id|slug> [--notes ".."] [--user W]  the maintainer answers Gate D's escalated question, or decides a parked session -> the revision carries on
+  merged <id|slug> --user W [--force]              acknowledge a human-merged PR -> SHIPPED (it verifies the merge with gh first, then clears the isolated worktree and hands off to the drift loop; requires merge_ack_allowed. --force skips the verification)
 
-阶段：INTAKE→(闸A首轮)→AWAITING_PM_CONFIRM⇄(PM答复→复评·resume)→CONFIRMED→(gateb)→ADVERSARIAL_LOOP⇄(codex审⇄claude改·resume)→AWAITING_GO→(go)→DONE
-      闸A 多轮：PM 每轮答复回喂同一会话复评，直到 claude 判定无剩余开放问题（或 M confirm 强制结束）；到 max_pm_rounds 仍未决→GATE_A_STALLED 待 M 裁决
-      闸B 多轮：Codex 审、Claude 改技术方案各自 resume 续接；改方遇拿不准的点→AWAITING_GATE_B_INPUT 待 M 答复(gateb-answer)；到上限仍未决→GATE_B_STALLED 待 M 裁决(gateb-go 强制立项/gateb-answer 再修)
-      下游：DONE→(implement)→闸C 实现⇄本地CI 至绿→AWAITING_GATE_D→(review-pr)→开 PR→闸D codex审diff⇄claude修(CI 须绿才推)→GATE_D_HARDENING(补内环测试+CI绿+出 merge-readiness)→AWAITING_HUMAN_MERGE(人工合并·永不自动)→(merged)→SHIPPED→漂移对账
-      闸C/D 多轮：升级→AWAITING_GATE_C/D_INPUT 待 M 答复(gatec/gated-answer)；到上限→GATE_C/D_STALLED 待裁决（闸C stall=CI 未绿，只能再修，绝不放行）`);
-  // 扩展包提供的命令（见 src/ext/）。未装扩展时整段不出现——纯 OSS 的 help 输出逐字节不变。
+Stages: INTAKE -> (Gate A, first round) -> AWAITING_PM_CONFIRM <-> (product answers -> re-review, resumed) -> CONFIRMED -> (gateb) -> ADVERSARIAL_LOOP <-> (codex reviews, claude revises, resumed) -> AWAITING_GO -> (go) -> DONE
+      Gate A's rounds: each round of answers from product is fed back into the same session for another review, until claude judges no open question remains (or the maintainer forces it closed with confirm); still unsettled at max_pm_rounds -> GATE_A_STALLED, waiting on the maintainer to decide
+      Gate B's rounds: codex reviewing and claude revising the technical plan each resume their own session; a revision that hits an open point -> AWAITING_GATE_B_INPUT, waiting on the maintainer (gateb-answer); still unsettled at the cap -> GATE_B_STALLED, waiting on the maintainer (gateb-go forces the work open, gateb-answer takes another round)
+      Downstream: DONE -> (implement) -> Gate C implements until local CI is green -> AWAITING_GATE_D -> (review-pr) -> the PR is opened -> Gate D, where codex reviews the diff and claude fixes (CI has to be green before anything is pushed) -> GATE_D_HARDENING (add the inner-ring tests, get CI green, produce the merge-readiness report) -> AWAITING_HUMAN_MERGE (a human merges; never automatic) -> (merged) -> SHIPPED -> drift reconciliation
+      Gate C and D's rounds: an escalation -> AWAITING_GATE_C/D_INPUT, waiting on the maintainer (gatec-answer / gated-answer); at the cap -> GATE_C/D_STALLED, waiting on a decision (a Gate C stall means CI is not green, so the only way on is another round — it is never released)`);
+  // The commands an extension pack provides (see src/ext/). With no pack installed this whole section does
+  // not appear, so the pure open-source help output is unchanged byte for byte.
   const ext = extCommands();
   if (ext.length > 0) {
-    out(`\n  ── 扩展命令（来自扩展包 ${activePackName()}）──`);
+    out(`\n  -- Extension commands (from the pack ${activePackName()}) --`);
     for (const c of ext) out(`  ${c.name.padEnd(36)}${c.summary}`);
   }
 }
@@ -121,22 +122,23 @@ function doctor(extError: string | null): void {
     try {
       return loadConfig();
     } catch (e) {
-      ck('加载配置', false, String(e).slice(0, 120));
+      ck('load the configuration', false, String(e).slice(0, 120));
       return null;
     }
   })();
-  if (cfg) ck('加载配置 yaml', true);
+  if (cfg) ck('load the configuration yaml', true);
 
-  // 逐个注册项目自检：布局 + 该项目的代码真源子仓（闸A 对照）。无注册表 → 仅默认项目。
+  // Check each registered project in turn: its layout, and the code source-of-truth repos Gate A compares
+  // against. With no registry, only the default project.
   const reg = cfg?.projects;
   const defId = defaultProjectId();
   const ids = reg ? Object.keys(reg.projects) : [defId];
   const multi = ids.length > 1;
   for (const id of ids) {
     const p = project(id);
-    const tag = multi ? `[${id}${id === defId ? '·默认' : ''}] ` : '';
+    const tag = multi ? `[${id}${id === defId ? ' · default' : ''}] ` : '';
     out(`${tag}ROOT = ${p.root}`);
-    ck(`${tag}项目布局（CLAUDE.md + scripts）`, p.looksValid());
+    ck(`${tag}the project layout (CLAUDE.md + scripts)`, p.looksValid());
     for (const repo of p.repos) {
       const gitdir = resolve(p.repoPath(repo), '.git');
       const ok = existsSync(gitdir);
@@ -148,13 +150,13 @@ function doctor(extError: string | null): void {
           /* ignore */
         }
       }
-      ck(`${tag}子仓 ${repo}`, ok, ok ? `HEAD ${sha}` : '未 clone（跑项目 ./scripts/bootstrap.sh）');
+      ck(`${tag}the repo ${repo}`, ok, ok ? `HEAD ${sha}` : "not cloned (run the project's ./scripts/bootstrap.sh)");
     }
   }
   if (cfg) {
-    ck('claude CLI', commandExists(cfg.runtime.claude_bin), commandExists(cfg.runtime.claude_bin) ? '已就位' : '缺失');
+    ck('the claude CLI', commandExists(cfg.runtime.claude_bin), commandExists(cfg.runtime.claude_bin) ? 'present' : 'missing');
     const codexOk = commandExists(cfg.runtime.codex_bin);
-    ck(`codex CLI（对抗复审 reviewer=${cfg.runtime.adversarial.reviewer}）`, codexOk, codexOk ? '已就位' : `缺失 → on_missing=${cfg.runtime.adversarial.on_missing}`);
+    ck(`the codex CLI (the adversarial reviewer=${cfg.runtime.adversarial.reviewer})`, codexOk, codexOk ? 'present' : `missing -> on_missing=${cfg.runtime.adversarial.on_missing}`);
   }
   const ghOk = commandExists('gh');
   let ghUser = '';
@@ -165,58 +167,64 @@ function doctor(extError: string | null): void {
       /* ignore */
     }
   }
-  ck('gh CLI 登录', ghOk && !!ghUser, ghUser ? `as ${ghUser}` : '未登录（写脚本需目标项目 GitHub org 写权限）');
+  ck('the gh CLI is logged in', ghOk && !!ghUser, ghUser ? `as ${ghUser}` : "not logged in (the write scripts need write access to the target project's GitHub org)");
   ck('feishu-doc.js', existsSync(resolve(SCRIPTS_DIR, 'feishu-doc.js')));
-  ck('config/forge.env', existsSync(ENV_FILE), existsSync(ENV_FILE) ? '' : '缺（可选；从 .example 复制）');
+  ck('config/forge.env', existsSync(ENV_FILE), existsSync(ENV_FILE) ? '' : 'missing (optional; copy it from the .example)');
   if (cfg) {
-    // 只体检**当前生效的** provider：一台机器不会同时接两个 IM，把没在用的那套也列出来只会制造噪音。
-    out(`  IM provider: ${port.id}（FORGE_MESSAGING_PROVIDER，缺省 feishu）`);
+    // Only the provider **currently in effect** is checked: one machine never runs two IMs at once, and
+    // listing the one that is not in use would be pure noise.
+    out(`  IM provider: ${port.id} (FORGE_MESSAGING_PROVIDER, defaulting to feishu)`);
     if (port.id === 'slack') {
       const e = cfg.env;
-      ck('Slack bot token（发卡/改卡/读历史）', !!e.SLACK_BOT_TOKEN, e.SLACK_BOT_TOKEN ? '已配' : '缺 SLACK_BOT_TOKEN（xoxb-…）');
-      ck('Slack app token（Socket Mode 建连）', !!e.SLACK_APP_TOKEN, e.SLACK_APP_TOKEN ? '已配' : '缺 SLACK_APP_TOKEN（xapp-…，后台需开 Socket Mode）');
-      ck('Slack 私聊推送目标', !!e.SLACK_DM_USER_ID, e.SLACK_DM_USER_ID ? '已配' : '缺 SLACK_DM_USER_ID（降级桌面+日志）');
-      ck('Slack 观察频道（群入口 + 离线补拉）', !!e.SLACK_WATCH_CHANNELS, e.SLACK_WATCH_CHANNELS ? '已配' : '缺 SLACK_WATCH_CHANNELS');
-      // 未配 bot user id → 群消息无法确认「有没有 @ 我」→ 核心保守忽略**全部**群消息。这不是可选项，是哑火。
-      ck('Slack bot user id（群消息 @ 判定）', !!e.SLACK_BOT_USER_ID, e.SLACK_BOT_USER_ID ? '已配' : '缺 SLACK_BOT_USER_ID → 群消息一律被保守忽略');
-      ck('原生 WebSocket（Socket Mode 免依赖建连）', typeof WebSocket === 'function', typeof WebSocket === 'function' ? `Node ${process.version}` : 'Node ≥22 才内置');
+      ck('the Slack bot token (posting, editing and reading history)', !!e.SLACK_BOT_TOKEN, e.SLACK_BOT_TOKEN ? 'configured' : 'SLACK_BOT_TOKEN is missing (xoxb-...)');
+      ck('the Slack app token (connecting in Socket Mode)', !!e.SLACK_APP_TOKEN, e.SLACK_APP_TOKEN ? 'configured' : 'SLACK_APP_TOKEN is missing (xapp-..., and Socket Mode has to be enabled in the app settings)');
+      ck('the Slack direct-message target', !!e.SLACK_DM_USER_ID, e.SLACK_DM_USER_ID ? 'configured' : 'SLACK_DM_USER_ID is missing (it degrades to the desktop notification and the log)');
+      ck('the Slack channels to watch (the channel entry point and the offline backfill)', !!e.SLACK_WATCH_CHANNELS, e.SLACK_WATCH_CHANNELS ? 'configured' : 'SLACK_WATCH_CHANNELS is missing');
+      // With no bot user id, a channel message cannot be checked for "was I mentioned", so the core
+      // conservatively ignores **every** channel message. This is not optional — without it, it is silent.
+      ck('the Slack bot user id (deciding whether a channel message mentions the bot)', !!e.SLACK_BOT_USER_ID, e.SLACK_BOT_USER_ID ? 'configured' : 'SLACK_BOT_USER_ID is missing -> every channel message is conservatively ignored');
+      ck('the native WebSocket (Socket Mode connects with no dependency)', typeof WebSocket === 'function', typeof WebSocket === 'function' ? `Node ${process.version}` : 'only Node >= 22 has it built in');
     } else {
       const botOk = !!(cfg.env.FEISHU_BOT_APP_ID && cfg.env.FEISHU_BOT_APP_SECRET);
       const tgt = cfg.env.FEISHU_DM_OPEN_ID || cfg.env.FEISHU_DM_UNION_ID || cfg.env.FEISHU_DM_CHAT_ID || cfg.env.FEISHU_DM_EMAIL;
-      ck('飞书 bot 私聊通知', botOk && !!tgt, botOk ? (tgt ? '已配' : '缺推送目标 FEISHU_DM_*') : '未配（降级桌面+日志）');
+      ck('the Feishu bot direct-message notification', botOk && !!tgt, botOk ? (tgt ? 'configured' : 'the target FEISHU_DM_* is missing') : 'not configured (it degrades to the desktop notification and the log)');
       const sdkOk = existsSync(resolve(SVC_DIR, 'node_modules/@larksuiteoapi/node-sdk'));
-      ck('飞书长连接 SDK（forge listen 按钮/群入口）', sdkOk, sdkOk ? '已装（后台需开「事件订阅→长连接」见 deploy/README）' : 'npm install');
+      ck('the Feishu connection SDK (forge listen: card buttons and the channel entry point)', sdkOk, sdkOk ? 'installed (the app settings need event subscription over a long connection enabled; see deploy/README)' : 'npm install');
     }
   }
   try {
     db();
-    ck('SQLite 状态库', true);
-    // 外部工具契约：只读上次探测态（不在 doctor 里触发探针——那花钱，走 `forge contract-check` / 每日定时）。
+    ck('the SQLite state store', true);
+    // The external tools' contracts: this only reads the last probe state, and never triggers a probe inside
+    // doctor — that costs money, and belongs to `forge contract-check` or the daily schedule.
     try {
       const probes = allProbes();
       if (probes.length === 0) {
-        ck('外部工具契约（上次探测）', true, '尚未探测（跑 ./forge contract-check）');
+        ck("the external tools' contracts (from the last probe)", true, 'not probed yet (run ./forge contract-check)');
       } else {
         const drifted = probes.filter((p) => !p.ok);
         const ageMin = Math.max(0, Math.round((Date.now() - Math.max(...probes.map((p) => p.checkedAt))) / 60000));
-        ck('外部工具契约（上次探测）', drifted.length === 0, drifted.length ? `漂移：${drifted.map((d) => d.dep).join('、')}（${ageMin} 分钟前）` : `${probes.map((p) => p.dep).join('/')} 正常（${ageMin} 分钟前）`);
+        ck("the external tools' contracts (from the last probe)", drifted.length === 0, drifted.length ? `drifted: ${drifted.map((d) => d.dep).join(', ')} (${ageMin} minutes ago)` : `${probes.map((p) => p.dep).join('/')} are fine (${ageMin} minutes ago)`);
       }
     } catch {
-      /* 契约展示尽力而为 */
+      /* showing the contracts is best-effort */
     }
   } catch (e) {
-    ck('SQLite 状态库', false, String(e).slice(0, 120));
+    ck('the SQLite state store', false, String(e).slice(0, 120));
   }
-  // 扩展包：没配就是没配（纯 OSS 正常路径，不算问题）；配了却装不起来必须显式亮红——
-  // 这正是 doctor 存在的意义：装载失败时其它命令都退非零，只有 doctor 还能告诉你为什么。
-  if (extError) ck('扩展包', false, extError.slice(0, 160));
-  else out(`· 扩展包：${activePackName()}${activePackName() === '(none)' ? `（未配置，纯核心运行；见 ${EXT_DIR}）` : ''}`);
-  out(bad === 0 ? '\n全部就绪。' : `\n${bad} 项需处理。`);
+  // The extension pack: not configured simply means not configured (the normal pure open-source path, and not
+  // a problem). Configured but failing to load must go visibly red — which is exactly why doctor exists: when
+  // loading fails every other command exits non-zero, and only doctor can still tell you why.
+  if (extError) ck('the extension pack', false, extError.slice(0, 160));
+  else out(`· extension pack: ${activePackName()}${activePackName() === '(none)' ? ` (none configured; running the pure core — see ${EXT_DIR})` : ''}`);
+  out(bad === 0 ? '\nEverything is ready.' : `\n${bad} item(s) need attention.`);
   process.exitCode = bad === 0 ? 0 : 1;
 }
 
-// 独立预览状态页：只起健康服务 + 心跳/liveness，【不】跑 tick / 不连飞书 / 不花钱。
-// 用于本机随手看页面；正式常驻看 ./forge listen 或 ./deploy/install.sh。
+// Preview the status page on its own: it starts the health service and the heartbeat/liveness only, and does
+// **not** run a tick, connect to IM, or cost anything.
+// It is for glancing at the page on your own machine; for a real long-running service see ./forge listen or
+// ./deploy/install.sh.
 async function statusPage(): Promise<void> {
   const hcfg = healthConfig();
   initHeartbeat({ pid: process.pid, port: hcfg.port, wsConfigured: false, now: Date.now() });
@@ -225,32 +233,39 @@ async function statusPage(): Promise<void> {
     try {
       pingLiveness(Date.now(), await sessions.countByStates([...ACTIVE_GATE_STATES]));
     } catch {
-      /* ping 尽力而为 */
+      /* the ping is best-effort */
     }
   };
   await ping();
   setInterval(() => void ping(), hcfg.livenessPingSec * 1000);
-  out(`状态页（独立预览，不跑 tick/飞书）：http://127.0.0.1:${hcfg.port}/　—— Ctrl-C 退出`);
-  await new Promise(() => {}); // 常驻直到 Ctrl-C
+  out(`Status page (standalone preview; no tick, no IM): http://127.0.0.1:${hcfg.port}/  -- Ctrl-C to exit`);
+  await new Promise(() => {}); // stays up until Ctrl-C
 }
 
-// 控制面 server（control plane / runner 分离）：对外服务 /jobs（runner 拉 job）+ /store（读写中心状态）。
-// 独立于本地状态页（health/server.ts）。鉴权/端口/绑定地址走 FORGE_CONTROL_* env（forge 包装器从 forge.env 导出）。
-// ⚠️ 本命令**只起 HTTP 面、不跑编排 tick**（reclaim/retry/autonomy/remind/sweep/drift 在 worker.tick 里）。故
-// 「控制面 + 纯 runner」要跑通编排，控制面那台须有人跑 tick——**推荐用 `forge listen` 并配 FORGE_CONTROL_PORT**：
-// 一个 listen 进程 = 编排 + 自身 job + 服务额外 runner（见 daemon/listen.ts）。本独立命令用于只想要纯 HTTP 面、
-// 编排另由同一 sqlite 上的 `forge listen` 提供的场景。常驻直到 Ctrl-C。
+// The control-plane server (the control-plane / runner split): it serves /jobs (where a runner pulls jobs)
+// and /store (reading and writing the central state).
+// It is separate from the local status page (health/server.ts). Auth, port and bind address come from the
+// FORGE_CONTROL_* env vars (the forge wrapper exports them from forge.env).
+// ⚠️ This command **only starts the HTTP surface and runs no orchestration tick** (reclaim, retry, autonomy,
+// reminders, the sweep and drift all live in worker.tick). So for a "control plane plus pure runners" setup
+// to actually orchestrate, something on the control-plane machine has to run a tick — **the recommended way
+// is `forge listen` with FORGE_CONTROL_PORT set**: one listen process is orchestration plus its own jobs plus
+// serving the extra runners (see daemon/listen.ts). This standalone command is for the case where you want
+// only the HTTP surface, with orchestration provided separately by a `forge listen` on the same sqlite.
+// It stays up until Ctrl-C.
 async function controlCmd(flags: Flags): Promise<void> {
   const port = Number(str(flags.port) ?? process.env.FORGE_CONTROL_PORT ?? '4320') || 4320;
   const host = str(flags.host) ?? process.env.FORGE_CONTROL_HOST ?? '127.0.0.1';
   const token = process.env.FORGE_CONTROL_TOKEN || undefined;
-  // 非回环无 token / 设了 FORGE_CONTROL_URL → fail-closed 同步抛；绑定失败 → reject。两者都propagate 到 main().catch 退 1。
+  // A non-loopback address with no token, or FORGE_CONTROL_URL being set, throws synchronously (fail-closed);
+  // a failed bind rejects. Both propagate to main().catch and exit 1.
   await startControlServer({ port, host, token });
-  out(`控制面 server 运行中：http://${host}:${port}/（/jobs /store /healthz）—— Ctrl-C 退出`);
-  await new Promise(() => {}); // 常驻
+  out(`The control-plane server is running: http://${host}:${port}/ (/jobs /store /healthz) -- Ctrl-C to exit`);
+  await new Promise(() => {}); // stays up
 }
 
-// 运行时活检：守护是否活着、长连接/DB/备份/依赖/磁盘 + 本地状态页地址。与静态 doctor 互补。
+// Checking the running service: whether the daemon is alive, the connection, the database, backups,
+// dependencies and disk, plus the local status page address. It complements the static doctor.
 async function healthCmd(flags: Flags): Promise<void> {
   const report = await evaluateHealth();
   if (flags.json) {
@@ -259,25 +274,25 @@ async function healthCmd(flags: Flags): Promise<void> {
     return;
   }
   const icon = (s: string): string => (s === 'healthy' ? '🟢' : s === 'degraded' ? '🟡' : s === 'down' ? '🔴' : '⚪');
-  out('── Forge health ──');
-  out(`${icon(report.status)} 总状态：${report.status}`);
+  out('-- Forge health --');
+  out(`${icon(report.status)} overall: ${report.status}`);
   if (report.daemon.pid != null) {
-    out(`守护 PID ${report.daemon.pid} · 运行 ${report.uptimeSec ?? '—'}s · 周期 ${report.daemon.cycleCount} · 活跃 gate ${report.daemon.activeGates}${report.daemon.wedged ? ' · ⚠️ 卡死' : ''}`);
+    out(`daemon PID ${report.daemon.pid} · up ${report.uptimeSec ?? '—'}s · cycles ${report.daemon.cycleCount} · active gates ${report.daemon.activeGates}${report.daemon.wedged ? ' · ⚠️ wedged' : ''}`);
   } else {
-    out('守护未运行（无心跳）—— 用 ./forge listen 启动，或 launchctl 已托管');
+    out('the daemon is not running (no heartbeat) -- start it with ./forge listen, or let launchctl manage it');
   }
   out('');
-  for (const c of report.checks) out(`${icon(c.status)} ${c.name}　${c.detail}`);
+  for (const c of report.checks) out(`${icon(c.status)} ${c.name}  ${c.detail}`);
   out('');
-  out(`看板：共 ${report.board.total} · 等人决策 ${report.board.awaiting} · 失败 ${report.board.failed}`);
-  out(`状态页：http://127.0.0.1:${healthConfig().port}/`);
+  out(`Board: ${report.board.total} in total · ${report.board.awaiting} waiting on a human · ${report.board.failed} failed`);
+  out(`Status page: http://127.0.0.1:${healthConfig().port}/`);
   process.exitCode = report.status === 'down' ? 1 : 0;
 }
 
 async function listCmd(flags: Flags): Promise<void> {
-  const rows = await sessions.listAll(str(flags.project)); // --project <id>：按项目过滤（缺省全库）
+  const rows = await sessions.listAll(str(flags.project)); // --project <id> filters by project (the default is the whole database)
   if (rows.length === 0) {
-    out('（无 session）');
+    out('(no sessions)');
     return;
   }
   out('STATE                 SLUG                      ROUTING        ID');
@@ -290,19 +305,21 @@ async function listCmd(flags: Flags): Promise<void> {
   }
 }
 
-// PRD 质量评分一览（私有·管理面）：AI 闸A 评审打的分，工程师/对外都看不到。低分 = 这份 PRD 待打磨的信号。
-// 默认按需求编号倒序（最新在上）；`--sort score` 改为分低在前（先盯差的）；`--min N` 只看 ≥N 分。
+// The PRD quality scores (private, management-facing): the score the Gate A AI review gave, which neither
+// engineers nor anyone outside can see. A low score signals a PRD that needs work.
+// The default order is by requirement number, descending (newest first); `--sort score` puts the lowest
+// scores first (so the worst get attention); `--min N` shows only those at or above N.
 async function scoresCmd(flags: Flags): Promise<void> {
   const byScore = str(flags.sort) === 'score';
   const min = str(flags.min) !== undefined ? Number(str(flags.min)) : undefined;
-  let rows = (await sessions.listAll(str(flags.project))).filter((s) => s.prd_score != null); // --project <id>：按项目过滤
+  let rows = (await sessions.listAll(str(flags.project))).filter((s) => s.prd_score != null); // --project <id> filters by project
   if (min !== undefined && !Number.isNaN(min)) rows = rows.filter((s) => (s.prd_score ?? 0) >= min);
   if (rows.length === 0) {
-    out('（暂无 PRD 评分——闸A 评审过的需求才有）');
+    out('(no PRD scores yet — only a requirement that has been through the Gate A review has one)');
     return;
   }
   if (byScore) rows = rows.slice().sort((a, b) => (a.prd_score ?? 0) - (b.prd_score ?? 0));
-  out('REQ       SCORE  档   清/完/行/测          SIZE  SLUG');
+  out('REQ       SCORE  BAND       CLR/CMP/FEA/TST     SIZE  SLUG');
   for (const s of rows) {
     const score = s.prd_score ?? 0;
     const d = parseDims(s.prd_score_dims);
@@ -310,17 +327,19 @@ async function scoresCmd(flags: Flags): Promise<void> {
     const ref = s.ref_num != null ? `REQ-${s.ref_num}` : s.id.slice(0, 8);
     const flag = score < 55 ? ' ⚠' : '';
     out(
-      `${ref.padEnd(9)} ${String(score).padStart(3)}    ${scoreBand(score).padEnd(2)}  ${dims.padEnd(18)}  ${(s.size ?? '-').padEnd(4)}  ${s.slug.slice(0, 24)}${flag}`,
+      `${ref.padEnd(9)} ${String(score).padStart(3)}    ${scoreBand(score).padEnd(10)} ${dims.padEnd(18)}  ${(s.size ?? '-').padEnd(4)}  ${s.slug.slice(0, 24)}${flag}`,
     );
   }
   const avg = Math.round(rows.reduce((a, s) => a + (s.prd_score ?? 0), 0) / rows.length);
-  out(`\n${rows.length} 条 · 均分 ${avg}（私有，仅本服务可见）`);
+  out(`\n${rows.length} rows · average ${avg} (private; visible only to this service)`);
 }
 
-// 成本看板（私有·管理面）：每条需求 claude 改方 $ 聚合 + 按状态汇总 + 总计。
-// `--since N` 只看近 N 天有更新的需求（按 updated_at）。⚠️ 不对外，与 scores/workload 同属管理面。
+// The cost board (private, management-facing): the claude dollars aggregated per requirement, summarised by
+// state, plus the total.
+// `--since N` limits it to requirements updated in the last N days (by updated_at). ⚠️ Never shown outside;
+// like scores and workload it belongs to the management surface.
 async function costCmd(flags: Flags): Promise<void> {
-  let rows = await sessions.listAll(str(flags.project)); // --project <id>：按项目过滤（缺省全库）
+  let rows = await sessions.listAll(str(flags.project)); // --project <id> filters by project (the default is the whole database)
   const since = str(flags.since) !== undefined ? Number(str(flags.since)) : undefined;
   if (since !== undefined && !Number.isNaN(since)) {
     const cutoff = Date.now() - days(since);
@@ -333,7 +352,7 @@ async function costCmd(flags: Flags): Promise<void> {
 async function showCmd(idOrSlug: string): Promise<void> {
   const s = await sessions.resolve(idOrSlug);
   if (!s) {
-    out(`找不到：${idOrSlug}`);
+    out(`not found: ${idOrSlug}`);
     process.exitCode = 1;
     return;
   }
@@ -344,18 +363,18 @@ async function showCmd(idOrSlug: string): Promise<void> {
   out(`prd:     ${s.prd_url ?? '-'}`);
   if (s.routing) out(`routing: ${s.routing}`);
   if (s.gate_a_round != null) {
-    out(`闸A 评审: 第 ${s.gate_a_round} 轮${s.gate_a_session_id ? `  (会话 ${s.gate_a_session_id.slice(0, 8)}…，复评 resume 续接)` : ''}`);
+    out(`Gate A review: round ${s.gate_a_round}${s.gate_a_session_id ? `  (session ${s.gate_a_session_id.slice(0, 8)}..., the re-review resumes it)` : ''}`);
   }
   if (s.gate_a_residual) {
-    out('── 闸A 多轮到上限未消解开放问题（待 M 裁决）──');
+    out('-- Gate A hit its round cap with open questions unresolved (waiting on the maintainer) --');
     try {
       const r = JSON.parse(s.gate_a_residual) as { round: number; open_questions: { q: string; severity?: string; suggestion?: string }[] };
-      out(`  到第 ${r.round} 轮仍有 ${r.open_questions.length} 条：`);
+      out(`  ${r.open_questions.length} still open at round ${r.round}:`);
       r.open_questions.forEach((q, i) => {
         out(`  ${i + 1}. [${q.severity ?? 'med'}] ${q.q}`);
-        if (q.suggestion) out(`      建议：${q.suggestion}`);
+        if (q.suggestion) out(`      suggestion: ${q.suggestion}`);
       });
-      out(`  强制通过：./forge confirm ${s.slug} --user M`);
+      out(`  Force it through: ./forge confirm ${s.slug} --user M`);
     } catch {
       out(`  ${s.gate_a_residual}`);
     }
@@ -363,22 +382,23 @@ async function showCmd(idOrSlug: string): Promise<void> {
   if (s.gate_b_round != null && s.gate_b_round > 0) {
     const rev = s.gate_b_reviewer_session ? `codex ${s.gate_b_reviewer_session.slice(0, 8)}…` : '-';
     const fix = s.gate_b_fixer_session ? `claude ${s.gate_b_fixer_session.slice(0, 8)}…` : '-';
-    out(`闸B 对抗: 第 ${s.gate_b_round} 轮（reviewer ${rev} / fixer ${fix}，均 resume 续接）`);
+    out(`Gate B adversarial: round ${s.gate_b_round} (reviewer ${rev} / fixer ${fix}, both resumed)`);
   }
   {
-    // 经 schema 归一（兼容旧 string[] 选项）——与卡片/gateBLoop 同走 parseHumanAsks，绝不渲染 [object Object]。
+    // Normalised by the schema (an older string[] of options still works) — it goes through parseHumanAsks
+    // like the cards and gateBLoop, so [object Object] is never rendered.
     const asks = parseHumanAsks(s.gate_b_human_asks);
     if (asks.length) {
-      out('── 闸B 改方升级·待 M 答复 ──');
+      out("-- Gate B's revision escalated, waiting on the maintainer --");
       asks.forEach((a, i) => {
         const opts = a.options.map((o) => `${o.recommended ? '★' : ''}${o.label}`).join(' / ');
-        out(`  ${i + 1}. [${a.severity}] ${a.question}${opts ? `（选项：${opts}）` : ''}`);
+        out(`  ${i + 1}. [${a.severity}] ${a.question}${opts ? ` (options: ${opts})` : ''}`);
       });
-      out(`  答复：./forge gateb-answer ${s.slug} --notes "…"`);
+      out(`  Answer: ./forge gateb-answer ${s.slug} --notes "..."`);
     }
   }
   if (s.prd_score != null) {
-    out(`prd score: ${scoreBadge(s.prd_score, parseDims(s.prd_score_dims))}${s.prd_score_reason ? ` — ${s.prd_score_reason}` : ''}  (私有)`);
+    out(`prd score: ${scoreBadge(s.prd_score, parseDims(s.prd_score_dims))}${s.prd_score_reason ? ` — ${s.prd_score_reason}` : ''}  (private)`);
   }
   if (s.confirmed_by) out(`confirmed: ${s.confirmed_by} ${s.confirmed_notes ?? ''}`);
   if (s.created_issues) out(`issues:  ${s.created_issues}`);
@@ -386,18 +406,18 @@ async function showCmd(idOrSlug: string): Promise<void> {
   const cost = (s.gate_a_cost_usd ?? 0) + (s.gate_b_cost_usd ?? 0) + (s.gate_c_cost_usd ?? 0) + (s.gate_d_cost_usd ?? 0);
   if (cost) out(`cost:    $${cost.toFixed(4)}`);
   if (s.adversarial_residual) {
-    out('── 对抗复审未裁决意见（GO 前须人工裁决）──');
+    out('-- Adversarial review comments still undecided (a human has to decide before GO) --');
     try {
       const r = JSON.parse(s.adversarial_residual) as {
         round: number;
         used: string;
         findings: { severity: string; issue: string; where?: string; fix?: string; evidence?: string }[];
       };
-      out(`  到上限第 ${r.round} 轮（reviewer=${r.used}），${r.findings.length} 条未消解：`);
+      out(`  At the cap, round ${r.round} (reviewer=${r.used}), ${r.findings.length} unresolved:`);
       r.findings.forEach((f, i) => {
         out(`  ${i + 1}. [${f.severity}] ${f.issue}${f.where ? ` @${f.where}` : ''}`);
-        if (f.fix) out(`      建议：${f.fix}`);
-        if (f.evidence) out(`      证据：${f.evidence}`);
+        if (f.fix) out(`      suggestion: ${f.fix}`);
+        if (f.evidence) out(`      evidence: ${f.evidence}`);
       });
     } catch {
       out(`  ${s.adversarial_residual}`);
@@ -412,9 +432,12 @@ async function showCmd(idOrSlug: string): Promise<void> {
 async function main(): Promise<void> {
   const [cmd, ...rest] = process.argv.slice(2);
   const { pos, flags } = parseArgs(rest);
-  // 扩展包先装：help 要列它的命令、doctor 要报它的状态、default 分支要分派到它。
-  // 装载失败**不在这里抛**——那会让 `forge doctor`（唯一能告诉你为什么失败的命令）自己也跑不起来。
-  // 改为记下来：doctor 显示它，其它任何命令都拒绝执行并退非零（存在即必须装成功，绝不静默降级）。
+  // The extension pack loads first: help lists its commands, doctor reports its state, and the default branch
+  // dispatches to it.
+  // A load failure is **not thrown here** — that would stop `forge doctor`, the one command that can tell you
+  // why it failed, from running at all.
+  // Instead it is recorded: doctor shows it, and every other command refuses to run and exits non-zero
+  // (present means it has to load successfully; it never degrades silently).
   let extError: string | null = null;
   try {
     await loadExtensions();
@@ -422,8 +445,8 @@ async function main(): Promise<void> {
     extError = String(e instanceof Error ? e.message : e);
   }
   if (extError && cmd !== 'doctor') {
-    log.err(`扩展包装载失败，已拒绝执行「${cmd ?? '(空)'}」：${extError}`);
-    log.err('跑 `forge doctor` 看详情；确实不想要扩展就清掉 FORGE_EXT_DIR / 移走 $FORGE_HOME/ext。');
+    log.err(`the extension pack failed to load, so "${cmd ?? '(none)'}" was refused: ${extError}`);
+    log.err('Run `forge doctor` for the details; if you really do not want the extension, clear FORGE_EXT_DIR or move $FORGE_HOME/ext away.');
     process.exitCode = 1;
     return;
   }
@@ -433,10 +456,11 @@ async function main(): Promise<void> {
       break;
     case 'add': {
       const raw = str(flags.prd) ?? pos[0] ?? '';
-      // 链接归哪个源，由注册表说了算；谁都不认就**明说**（绝不猜一个源，猜错=登记一条永远读不出正文的需求）。
+      // Which source a link belongs to is the registry's decision; if nobody recognises it, **say so** — never
+      // guess a source, because guessing wrong registers a requirement whose body can never be read.
       const doc = raw ? parseAnyRef(raw) : null;
       if (!doc) {
-        out(raw ? `无法识别的需求文档：${raw}（已注册的文档源：${registeredIds().join('/') || '无'}）` : '缺 --prd <需求文档链接>');
+        out(raw ? `unrecognised requirement document: ${raw} (the registered document sources are: ${registeredIds().join('/') || 'none'})` : 'missing --prd <document link>');
         process.exitCode = 1;
         break;
       }
@@ -444,7 +468,7 @@ async function main(): Promise<void> {
         doc,
         slug: str(flags.slug),
         title: str(flags.title),
-        projectId: str(flags.project), // 显式指定目标项目（缺省按 群→项目映射/默认 解析）
+        projectId: str(flags.project), // name the target project explicitly (by default it resolves through the channel-to-project mapping, then the default)
         branch: str(flags.branch) === 'prod' ? 'prod' : str(flags.branch) === 'dev' ? 'dev' : undefined,
         chatId: str(flags.chat),
       });
@@ -469,19 +493,23 @@ async function main(): Promise<void> {
       break;
     case 'watchdog': {
       const d = await runWatchdog();
-      out(`watchdog: ${d.klass} · action=${d.action.kind}${d.livenessAgeSec != null ? ` · liveness ${d.livenessAgeSec}s 前` : ''}`);
+      out(`watchdog: ${d.klass} · action=${d.action.kind}${d.livenessAgeSec != null ? ` · liveness ${d.livenessAgeSec}s ago` : ''}`);
       break;
     }
     case 'contract-check': {
-      // 主动探测外部 CLI/API 输出契约（codex/claude 各一发付费 trivial；gh/飞书免费只读）→ 落库 + 漂移告警。
+      // Actively probe the external CLI and API output contracts (one paid trivial call each for codex and
+      // claude; gh and the IM API are free and read-only) -> persist and alert on drift.
       const results = await runContractCheckCli(Date.now());
       const drifted = results.filter((r) => r.available && !r.ok);
       process.exitCode = drifted.length ? 1 : 0;
       break;
     }
     case 'eval': {
-      // golden eval：用 fixtures/eval 的 PRD 真跑闸A提示词，对照期望比对产出形状 → 报回归。
-      // ⚠️ 调真实 claude（**花钱**），故不在 npm run ci，只手动跑。--runs N 多样本看抖动；落盘 + 与上次对比趋势。
+      // The golden eval: really run the Gate A prompt over the PRDs in fixtures/eval and compare the output's
+      // shape against the expectations -> report regressions.
+      // ⚠️ It calls claude for real (**and costs money**), so it is not part of npm run ci and is only run by
+      // hand. --runs N takes several samples to see the jitter; the run is persisted and compared against the
+      // previous one.
       const { runEval } = await import('./eval/runEval.ts');
       const { loadFixtures } = await import('./eval/expectations.ts');
       const { formatReport, diffRuns, formatTrend } = await import('./eval/aggregate.ts');
@@ -491,14 +519,14 @@ async function main(): Promise<void> {
       const fxs = loadFixtures(undefined, only);
       const n = fxs.length;
       if (n === 0) {
-        out(only ? `找不到 fixture：${only}` : '没有 fixtures（fixtures/eval/ 为空）');
+        out(only ? `no such fixture: ${only}` : 'there are no fixtures (fixtures/eval/ is empty)');
         process.exitCode = 1;
         break;
       }
-      const judgeN = fxs.filter((f) => f.expect.acceptance_judge).length; // 带 acceptance-judge 的闸B fixture 各多一发 claude
+      const judgeN = fxs.filter((f) => f.expect.acceptance_judge).length; // each Gate B fixture with an acceptance-judge costs one extra claude call
       const calls = (n + judgeN) * runs;
-      out(`⚠️ forge eval 会真实调用 claude（**花钱**）：${n} 个 fixture${judgeN ? `（含 ${judgeN} 个带 acceptance-judge，各多一发）` : ''} × ${runs} 次 = ${calls} 发 claude，逐个真评审…\n`);
-      const prev = loadLatestEvalRun(); // 落盘前先读上一次，作趋势基线
+      out(`⚠️ forge eval calls claude for real (**it costs money**): ${n} fixture(s)${judgeN ? ` (${judgeN} of them with an acceptance-judge, each costing one extra call)` : ''} x ${runs} run(s) = ${calls} claude calls, each a real review...\n`);
+      const prev = loadLatestEvalRun(); // read the previous run before persisting this one, as the trend baseline
       const report = await runEval({ only, runs });
       out(formatReport(report));
       if (!flags['no-save']) {
@@ -508,7 +536,7 @@ async function main(): Promise<void> {
         } catch {
           report.gitSha = null;
         }
-        out(`\n已落盘：${saveEvalRun(report, report.ranAt)}`);
+        out(`\nPersisted to: ${saveEvalRun(report, report.ranAt)}`);
       }
       if (prev) out(`\n${formatTrend(diffRuns(prev, report))}`);
       process.exitCode = report.allPass ? 0 : 1;
@@ -525,9 +553,9 @@ async function main(): Promise<void> {
       const who = str(flags.user) ?? 'PM';
       const r = await submitPmAnswers(pos[0] ?? '', who, str(flags.notes));
       const s = await sessions.resolve(pos[0] ?? '');
-      if (r.ok && s) await postConfirmComment(s, { who, notes: str(flags.notes) }); // PM 答复 → 文档留痕
+      if (r.ok && s) await postConfirmComment(s, { who, notes: str(flags.notes) }); // product's answer leaves a record on the document
       out(r.msg);
-      if (r.ok) out(`下一步：./forge tick  跑本轮复评`);
+      if (r.ok) out(`Next: ./forge tick  to run this round's re-review`);
       process.exitCode = r.ok ? 0 : 1;
       break;
     }
@@ -544,18 +572,20 @@ async function main(): Promise<void> {
       break;
     }
     case 'workload': {
-      // 人均加权负载（私有·管理面）：规模×跨栈×质量。工具+调分留在私有 Forge，工程师看不到。
+      // Weighted load per person (private, management-facing): size x cross-repo x quality. The tool and the
+      // weighting stay in the private Forge, out of sight of engineers.
       const tool = resolve(SVC_DIR, 'tools/weekly-load.sh');
       const r = spawnSync('bash', [tool, ...rest], { stdio: 'inherit' });
       process.exitCode = r.status ?? 0;
       break;
     }
     case 'scores':
-      // PRD 质量评分一览（私有·管理面）：AI 闸A 打分，工程师/对外都看不到。
+      // The PRD quality scores (private, management-facing): scored by the Gate A AI, and visible to neither
+      // engineers nor anyone outside.
       await scoresCmd(flags);
       break;
     case 'cost':
-      // 成本看板（私有·管理面）：claude 改方 $ 聚合，不对外。
+      // The cost board (private, management-facing): the claude dollars aggregated, never shown outside.
       await costCmd(flags);
       break;
     case 'gateb': {
@@ -567,23 +597,24 @@ async function main(): Promise<void> {
     case 'gateb-answer': {
       const r = await submitGateBAnswers(pos[0] ?? '', str(flags.user) ?? 'M', str(flags.notes));
       out(r.msg);
-      if (r.ok) out(`下一步：./forge tick  跑本轮续修`);
+      if (r.ok) out(`Next: ./forge tick  to run this round's revision`);
       process.exitCode = r.ok ? 0 : 1;
       break;
     }
     case 'gateb-go': {
       const r = await forceGateBGo(pos[0] ?? '', userOf(flags));
       out(r.msg);
-      if (r.ok) out(`下一步：./forge go ${pos[0] ?? ''} --user ${userOf(flags)}  建需求`);
+      if (r.ok) out(`Next: ./forge go ${pos[0] ?? ''} --user ${userOf(flags)}  to create the work items`);
       process.exitCode = r.ok ? 0 : 1;
       break;
     }
     case 'assign': {
-      // 指派 DRI：给短码=手动；无短码或 --auto=按 least-loaded+WIP 算法推荐并采纳（打印各人负载理由）。
+      // Assign the DRI: a short code assigns by hand; no code, or --auto, recommends with the least-loaded plus
+      // WIP algorithm and adopts it (printing everyone's load as the reasoning).
       const code = pos[1] && !pos[1].startsWith('--') ? pos[1] : undefined;
       const r = await assign(pos[0] ?? '', userOf(flags), { to: code, auto: !!flags.auto });
       out(r.msg);
-      if (r.ok) out(`下一步：./forge go ${pos[0] ?? ''} --user ${userOf(flags)}  建需求（或卡片一键立项）`);
+      if (r.ok) out(`Next: ./forge go ${pos[0] ?? ''} --user ${userOf(flags)}  to create the work items (or use the card's one-click GO)`);
       process.exitCode = r.ok ? 0 : 1;
       break;
     }
@@ -600,7 +631,7 @@ async function main(): Promise<void> {
       break;
     }
     case 'implement': {
-      // standalone 裸 issue：implement --issue <ref> --title "…" [--body "…"] [--project id] [--repo r] [--branch prod|dev]
+      // Standalone, from a bare issue: implement --issue <ref> --title "..." [--body "..."] [--project id] [--repo r] [--branch prod|dev]
       if (str(flags.issue)) {
         const r = await addImplementTask({
           issueRef: str(flags.issue) ?? '',
@@ -612,41 +643,42 @@ async function main(): Promise<void> {
           by: userOf(flags),
         });
         out(r.msg);
-        if (r.ok && r.created) out('下一步：./forge tick  自动建 worktree + 实现 + 本地 CI');
+        if (r.ok && r.created) out('Next: ./forge tick  to create the worktree, implement, and run local CI automatically');
         process.exitCode = r.ok ? 0 : 1;
         break;
       }
-      // 链式：implement <slug>（从 DONE 触发闸C）
+      // Chained: implement <slug> (triggering Gate C from DONE)
       const r = await requestGateC(pos[0] ?? '', userOf(flags));
       out(r.msg);
-      if (r.ok) out('下一步：./forge tick  自动建 worktree + 实现 + 本地 CI');
+      if (r.ok) out('Next: ./forge tick  to create the worktree, implement, and run local CI automatically');
       process.exitCode = r.ok ? 0 : 1;
       break;
     }
     case 'gatec-answer': {
       const r = await submitGateCAnswers(pos[0] ?? '', str(flags.user) ?? 'M', str(flags.notes));
       out(r.msg);
-      if (r.ok) out('下一步：./forge tick  跑本轮续做');
+      if (r.ok) out('Next: ./forge tick  to carry on with this round');
       process.exitCode = r.ok ? 0 : 1;
       break;
     }
     case 'review-pr': {
-      // 闸C 绿后触发开 PR + 闸D PR 对抗 review：review-pr <slug> [--user M]
+      // Once Gate C is green, trigger opening the PR plus Gate D's adversarial PR review: review-pr <slug> [--user M]
       const r = await requestReviewPr(pos[0] ?? '', userOf(flags));
       out(r.msg);
-      if (r.ok) out('下一步：./forge tick  委托开 PR（不自动 merge）+ codex 审 diff⇄claude 修');
+      if (r.ok) out('Next: ./forge tick  to delegate opening the PR (never merging it automatically), then codex reviews the diff and claude fixes');
       process.exitCode = r.ok ? 0 : 1;
       break;
     }
     case 'gated-answer': {
       const r = await submitGateDAnswers(pos[0] ?? '', str(flags.user) ?? 'M', str(flags.notes));
       out(r.msg);
-      if (r.ok) out('下一步：./forge tick  跑本轮续修');
+      if (r.ok) out("Next: ./forge tick  to run this round's revision");
       process.exitCode = r.ok ? 0 : 1;
       break;
     }
     case 'merged': {
-      // 人工合并 PR 后确认 → SHIPPED（清 worktree + 接漂移闭环）：merged <slug> [--user M]
+      // Acknowledge a human-merged PR -> SHIPPED (clear the worktree and hand off to the drift loop):
+      // merged <slug> [--user M]
       const r = await ackMerged(pos[0] ?? '', userOf(flags), { force: !!flags.force });
       out(r.msg);
       process.exitCode = r.ok ? 0 : 1;
@@ -664,15 +696,17 @@ async function main(): Promise<void> {
     case '--help':
       help();
       break;
-    // 核心命令没有匹配上，才轮到扩展命令——**同名时核心永远优先**。
-    // 这是刻意的单向优先：下游不能靠重名悄悄改掉 `go` / `merged` 这类带权限与红线的核心动作。
+    // An extension command only gets its turn once no core command matched — **on a name collision the core
+    // always wins**.
+    // That one-way precedence is deliberate: downstream cannot quietly replace a core action that carries
+    // permissions and red lines, such as `go` or `merged`, by reusing its name.
     default: {
       const ext = extCommands().find((c) => c.name === cmd);
       if (ext) {
         await ext.run({ argv: rest, pos, flags });
         break;
       }
-      log.err(`未知命令：${cmd}`);
+      log.err(`unknown command: ${cmd}`);
       help();
       process.exitCode = 1;
     }

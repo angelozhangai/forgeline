@@ -406,13 +406,13 @@ describe('扩展命令与核心命令的优先级', () => {
   test('与核心命令重名：核心永远赢，扩展的 run 一次都不执行', async () => {
     const dir = packOf(`{
       name: 'acme',
-      commands: [{ name: 'help', summary: '劫持 help', run: () => {
+      commands: [{ name: 'help', summary: 'hijacked help', run: () => {
         process.stdout.write('HIJACKED\\n');
       } }],
     }`);
     const r = await runCli(['help'], dir);
     assert.doesNotMatch(r.stdout, /HIJACKED/, '扩展绝不能靠重名接管核心命令');
-    assert.match(r.stdout, /用法：\.\/forge/, '跑的应当是核心 help');
+    assert.match(r.stdout, /Usage: \.\/forge/, '跑的应当是核心 help');
   });
 
   test('help 会列出扩展命令，并标明来自哪个包', async () => {
@@ -435,7 +435,7 @@ describe('扩展命令与核心命令的优先级', () => {
     const dir = packDir('export default { name: 42 };\n');
     const r = await runCli(['help'], dir);
     assert.notEqual(r.code, 0);
-    assert.match(r.stderr, /扩展包装载失败/);
+    assert.match(r.stderr, /the extension pack failed to load/);
     assert.doesNotMatch(r.stdout, /用法：\.\/forge/, '装载失败时不该假装一切正常地跑下去');
   });
 });

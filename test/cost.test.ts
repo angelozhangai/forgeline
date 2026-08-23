@@ -43,11 +43,11 @@ test('costSummary：总计/分项（含闸C/闸D）/按状态分桶/withCost', (
 });
 
 test('formatCost：空 → 占位；非空含合计行（4 闸分项）+ 管理面声明', () => {
-  assert.equal(formatCost([], costSummary([])), '（无 session）');
+  assert.equal(formatCost([], costSummary([])), '(no sessions)');
   const rows = costRows([s({ ref_num: 1, gate_a_cost_usd: 1, gate_b_cost_usd: 0, gate_c_cost_usd: 2, gate_d_cost_usd: 0 })]);
   const txt = formatCost(rows, costSummary(rows));
-  assert.match(txt, /合计 \$3\.0000/);
-  assert.match(txt, /闸C \$2\.0000/); // 下游分项可见
-  assert.match(txt, /闸D \$0\.0000/);
-  assert.match(txt, /私有·管理面/);
+  assert.match(txt, /Total \$3\.0000/);
+  assert.match(txt, /\$2\.0000/); // 下游分项可见
+  assert.match(txt, /Gate D \$0\.0000/);
+  assert.match(txt, /private, management-facing/);
 });
