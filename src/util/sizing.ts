@@ -1,11 +1,14 @@
-// 需求复杂度（相对估点）。⚠️ 真源是主仓 docs/workspace/load-eval.md + sync-labels.sh 的 size:* 标签
-// （4 档 S/M/L/XL、分值 S1/M3/L8/XL20、闸B 打标签、weekly-load.sh 按「规模×跨栈×质量」加权）。
-// 本文件只是 Forge 内的镜像，必须与目标项目真源一致——改标准去改项目真源，再同步这里。
+// Requirement complexity (a relative estimate). ⚠️ The source of truth is the main repo's
+// docs/workspace/load-eval.md plus the size:* labels in sync-labels.sh (4 tiers S/M/L/XL, worth
+// S1/M3/L8/XL20, applied as a label by Gate B, and weighted by weekly-load.sh as size x cross-repo breadth
+// x quality). This file is only Forge's mirror of that and must agree with the target project's source of
+// truth — to change the standard, change it there and then sync it here.
 
 export const SIZES = ['S', 'M', 'L', 'XL'] as const;
 export type Size = (typeof SIZES)[number];
 
-// 分值：与主仓 load-eval.md / weekly-load.sh 一致（超线性，难度非线性放大）。
+// The point values, matching the main repo's load-eval.md and weekly-load.sh (superlinear: difficulty is
+// amplified non-linearly).
 export const POINTS: Record<Size, number> = { S: 1, M: 3, L: 8, XL: 20 };
 
 export function isSize(x: unknown): x is Size {
@@ -19,19 +22,20 @@ export function sizePoints(s: Size | null): number {
   return s ? POINTS[s] : 0;
 }
 
-// 点阵：4 格里点亮 tier 格（S→●○○○ … XL→●●●●）。
+// The dot meter: `tier` of the 4 cells lit (S -> ●○○○ … XL -> ●●●●).
 export function sizeMeter(s: Size): string {
   const i = SIZES.indexOf(s) + 1; // 1..4
   return '●'.repeat(i) + '○'.repeat(SIZES.length - i);
 }
 
-// 卡片徽章："复杂度 L · 8pt ●●●○"
+// The card badge: "Complexity L · 8pt ●●●○"
 export function sizeBadge(s: Size | null): string {
-  if (!s) return '复杂度 待定';
-  return `复杂度 ${s} · ${POINTS[s]}pt ${sizeMeter(s)}`;
+  if (!s) return 'Complexity TBD';
+  return `Complexity ${s} · ${POINTS[s]}pt ${sizeMeter(s)}`;
 }
 
-// 锚点定义（人话）：与主仓 sync-labels.sh / load-eval.md 的 size 描述一致。
+// The anchor definitions in plain language, matching the size descriptions in the main repo's
+// sync-labels.sh and load-eval.md.
 export const SIZE_ANCHOR: Record<Size, string> = {
   S: 'small: ≤half a day, single-point change',
   M: 'medium: 1-2 days, one feature in one repo',
@@ -39,7 +43,7 @@ export const SIZE_ANCHOR: Record<Size, string> = {
   XL: 'extra large: a week+, or multi-repo refactor / infrastructure',
 };
 
-// 给闸A/闸B prompt 注入的评分指南。
+// The rubric injected into the Gate A and Gate B prompts.
 export const SIZE_RUBRIC = [
   '## Complexity tiering (size)',
   'Estimate one **relative complexity tier** for the whole requirement (not effort, not lines of code), 4 tiers (aligned with the team load-eval rubric):',

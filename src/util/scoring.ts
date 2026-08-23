@@ -1,10 +1,13 @@
-// PRD 质量评分（闸A·AI 评审时产出）。⚠️ 私有·管理面：只落库 + 内部 `forge show`/`forge scores` 查询，
-// 绝不写进交付文档（req-review.md）、飞书评论或任何工程师/对外可见的面——和 size 私有报表同一纪律（见 index.ts workload）。
-// 与复杂度档（sizing.ts）正交：size 量「这需求多大」，score 量「这份 PRD 写得够不够让团队照着开干」。
+// PRD quality scoring, produced by the Gate A AI review. ⚠️ Private, management-facing: it is persisted and
+// queried through the internal `forge show` / `forge scores` only, and must never be written into a delivery
+// document (req-review.md), a Feishu comment, or any other surface an engineer or an outsider can see — the
+// same discipline as the private size report (see `workload` in index.ts).
+// It is orthogonal to the complexity tier (sizing.ts): size measures "how big is this requirement", score
+// measures "is this PRD written well enough for the team to build from".
 
 export const SCORE_DIMS = ['clarity', 'completeness', 'feasibility', 'testability'] as const;
 export type ScoreDim = (typeof SCORE_DIMS)[number];
-export const DIM_MAX = 25; // 4 维 × 25 = 100 总分
+export const DIM_MAX = 25; // 4 dimensions x 25 = 100 in total
 export const SCORE_MAX = SCORE_DIMS.length * DIM_MAX;
 
 export interface ScoreDims {
@@ -15,13 +18,14 @@ export interface ScoreDims {
 }
 
 export const DIM_LABEL: Record<ScoreDim, string> = {
-  clarity: '清晰度',
-  completeness: '完整度',
-  feasibility: '可行性',
-  testability: '可测性',
+  clarity: 'clarity',
+  completeness: 'completeness',
+  feasibility: 'feasibility',
+  testability: 'testability',
 };
 
-// 各维度锚点（人话）：给 AI 打分的判据，也是报表里「为什么这个分」的口径。
+// The anchor for each dimension, in plain language: the criteria the AI scores against, and the terms the
+// report uses to explain "why this score".
 export const DIM_ANCHOR: Record<ScoreDim, string> = {
   clarity: 'are goals / scope / terminology unambiguous — after reading, do you know exactly what to build',
   completeness: 'are boundaries / errors / permissions / data migration / compatibility covered — any obvious holes',
@@ -35,12 +39,13 @@ const clampInt = (x: unknown, hi: number): number => {
   return Math.min(hi, Math.max(0, n));
 };
 
-// 把模型给的总分收敛到 0–100 整数（模型可能给小数 / 越界，绝不让脏值落库）。
+// Pull the model's total into a 0-100 integer (a model may hand back a fraction or go out of range, and a
+// dirty value must never reach the database).
 export function normScore(x: unknown): number {
   return clampInt(x, SCORE_MAX);
 }
 
-// 把模型给的维度分各自收敛到 0–25 整数，缺维补 0。
+// Pull each of the model's per-dimension scores into a 0-25 integer, filling a missing dimension with 0.
 export function normDims(x: Partial<ScoreDims> | null | undefined): ScoreDims {
   const d = x ?? {};
   return {
@@ -51,24 +56,25 @@ export function normDims(x: Partial<ScoreDims> | null | undefined): ScoreDims {
   };
 }
 
-// 评级带（仅私有报表用，对外永不显示）。
+// The grade band (private reports only — never shown on the outside).
 export function scoreBand(score: number): string {
-  if (score >= 85) return '优';
-  if (score >= 70) return '良';
-  if (score >= 55) return '中';
-  return '差';
+  if (score >= 85) return 'excellent';
+  if (score >= 70) return 'good';
+  if (score >= 55) return 'fair';
+  return 'poor';
 }
 
-// 徽章："PRD 评分 72/100（良）· 清晰度18/完整度15/可行性22/可测性17"
+// The badge: "PRD score 72/100 (good) · clarity 18/completeness 15/feasibility 22/testability 17"
 export function scoreBadge(score: number | null, dims?: ScoreDims | null): string {
-  if (score == null) return 'PRD 评分 待评';
+  if (score == null) return 'PRD score not yet rated';
   const dimStr = dims
-    ? ` · ${SCORE_DIMS.map((d) => `${DIM_LABEL[d]}${dims[d]}`).join('/')}`
+    ? ` · ${SCORE_DIMS.map((d) => `${DIM_LABEL[d]} ${dims[d]}`).join('/')}`
     : '';
-  return `PRD 评分 ${score}/${SCORE_MAX}（${scoreBand(score)}）${dimStr}`;
+  return `PRD score ${score}/${SCORE_MAX} (${scoreBand(score)})${dimStr}`;
 }
 
-// 给闸A prompt 注入的评分指南（与 envelopes.ts GateASchema 的 prd_score* 字段对齐）。
+// The rubric injected into the Gate A prompt (aligned with the prd_score* fields of GateASchema in
+// envelopes.ts).
 export const SCORE_RUBRIC = [
   '## PRD quality scoring (prd_score / prd_score_dims)',
   'Score the **quality of the PRD itself** — note: this is **not** requirement size (that is size), **nor** your analysis confidence (that is confidence).',

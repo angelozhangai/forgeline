@@ -1,81 +1,81 @@
-// 单元：自动指派推荐算法（least-loaded + WIP limit，纯函数）。
+// Unit: the automatic-assignment recommendation (least-loaded plus a WIP limit, a pure function).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { recommend, wipLimitOf, inPool, type LoadRow } from '../src/util/assign.ts';
 
-// 测试用配置：M 上限 2（带队容量小），其余 default 3。
+// The test configuration: M has a limit of 2 (a lead has less capacity), everyone else the default of 3.
 const cfg = { pool: ['M', 'EO', 'CC', 'DE'], wip_limit: { default: 3, M: 2 }, in_progress_statuses: [4, 5, 6] };
 
 const L = (code: string, wip: number, loadPoints: number): LoadRow => ({ code, wip, loadPoints });
 
-test('wipLimitOf：覆盖优先、缺省兜底', () => {
+test('wipLimitOf: an override wins, otherwise the default', () => {
   assert.equal(wipLimitOf(cfg, 'M'), 2);
   assert.equal(wipLimitOf(cfg, 'EO'), 3);
 });
 
-test('inPool：大小写不敏感归一；不在池→null', () => {
+test('inPool: normalised case-insensitively; not in the pool -> null', () => {
   assert.equal(inPool(cfg, 'de'), 'DE');
   assert.equal(inPool(cfg, ' m '), 'M');
   assert.equal(inPool(cfg, 'BD'), null);
 });
 
-test('选投影负载最低者', () => {
+test('it picks whoever has the lowest projected load', () => {
   const r = recommend('M', [L('M', 0, 8), L('EO', 0, 3), L('CC', 0, 0), L('DE', 0, 20)], cfg);
-  assert.equal(r.pick, 'CC'); // 0 + 3 = 3 最低
+  assert.equal(r.pick, 'CC'); // 0 + 3 = 3, the lowest
   assert.equal(r.points, 3);
   assert.equal(r.allOverWip, false);
 });
 
-test('WIP 超上限者被排除，即便其负载最低', () => {
+test('someone over their WIP limit is excluded, even with the lowest load', () => {
   const r = recommend('S', [L('M', 0, 8), L('EO', 0, 3), L('CC', 3, 0), L('DE', 0, 20)], cfg);
-  assert.equal(r.pick, 'EO'); // CC 负载 0 但在研 3≥上限 3 → 出局；EO 3+1=4 次低
+  assert.equal(r.pick, 'EO'); // CC has 0 load but 3 in progress >= the limit of 3 -> out; EO's 3+1=4 is next lowest
   const lx = r.table.find((x) => x.code === 'CC')!;
   assert.equal(lx.eligible, false);
   assert.equal(r.allOverWip, false);
 });
 
-test('全员超 WIP → 回退全池择优并标注', () => {
+test('everyone over their WIP limit -> fall back to the whole pool, pick the best, and flag it', () => {
   const r = recommend('M', [L('M', 2, 5), L('EO', 3, 1), L('CC', 3, 0), L('DE', 3, 10)], cfg);
   assert.equal(r.allOverWip, true);
-  assert.equal(r.pick, 'CC'); // 回退全池后仍取投影最低 0+3
+  assert.equal(r.pick, 'CC'); // after falling back it still takes the lowest projection, 0+3
 });
 
-test('平手：投影相等 → 在研条数少者优先', () => {
-  // M/DE 负载抬高出局候选；EO 与 CC 投影都 8，CC 在研更少。
+test('a tie: equal projections -> whoever has fewer requirements in progress wins', () => {
+  // M and DE are lifted out of contention by their load; EO and CC both project to 8, and CC has fewer in progress.
   const r = recommend('M', [L('M', 0, 100), L('EO', 2, 5), L('CC', 1, 5), L('DE', 0, 100)], cfg);
   assert.equal(r.pick, 'CC');
 });
 
-test('规模点数反映在 points / 投影上', () => {
+test('the size points show up in points and in the projection', () => {
   assert.equal(recommend('XL', [], cfg).points, 20);
   assert.equal(recommend(null, [], cfg).points, 0);
 });
 
-test('探测失败(ok=false)的成员不参与自动选——负载未知绝不当 0 抢指派', () => {
-  // EO 探测失败：即便看起来 0 负载也不能选；应在「已知负载」者里择优。
+test('a member whose probe failed (ok=false) takes no part in the automatic pick — an unknown load is never treated as 0 and handed the work', () => {
+  // EO's probe failed: even though they look like zero load they must not be picked; the best of the known loads wins.
   const r = recommend(
     'M',
     [
       { code: 'M', wip: 0, loadPoints: 8, ok: true },
-      { code: 'EO', wip: 0, loadPoints: 0, ok: false }, // 探测失败 → 排除
+      { code: 'EO', wip: 0, loadPoints: 0, ok: false }, // the probe failed -> excluded
       { code: 'CC', wip: 0, loadPoints: 3, ok: true },
       { code: 'DE', wip: 0, loadPoints: 20, ok: true },
     ],
     cfg,
   );
-  assert.equal(r.pick, 'CC'); // 已知者里投影最低；EO 未知被排除
+  assert.equal(r.pick, 'CC'); // the lowest projection among the known; EO is unknown and excluded
   assert.equal(r.probeIncomplete, true);
 });
 
-test('缺行的池成员视为未知(ok:false)，不被推荐', () => {
-  // 仅 M 有数据；EO/CC/DE 缺行 → 默认 ok:false 未知 → 不参与自动选，只剩 M。
+test('a pool member with no row counts as unknown (ok:false) and is not recommended', () => {
+  // Only M has data; EO/CC/DE have no row -> they default to ok:false and unknown -> out of the automatic pick, leaving M.
   const r = recommend('M', [{ code: 'M', wip: 1, loadPoints: 5, ok: true }], cfg);
   assert.equal(r.pick, 'M');
   assert.equal(r.probeIncomplete, true);
-  assert.equal(r.table.length, 4); // 表仍展开全池（展示用）
+  assert.equal(r.table.length, 4); // the table still lays out the whole pool (for display)
 });
 
-test('全员探测失败/未知 → pick=null（强制人工指派）', () => {
+test('every probe failed or is unknown -> pick=null (a human has to assign it)', () => {
   const r = recommend(
     'M',
     [

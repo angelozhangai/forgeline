@@ -1,45 +1,46 @@
-// 单元：需求宠物·成长进化（彩蛋层）。守两条线：① 纯确定性（同需求每次一致，可断言）；
-// ② 台词绝不泄漏黑话（与 display 同纪律）。
+// Unit: the requirement pet and how it evolves (the easter-egg layer). It guards two lines: (1) it is purely
+// deterministic (the same requirement renders the same way every time, so it can be asserted on); (2) the
+// lines never leak jargon (the same discipline as display).
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { petStage, treeLine, finalForm, feedLine, easterEgg, PET_TREE } from '../src/util/pet.ts';
 import { STATES } from '../src/statemachine/states.ts';
 
-test('petStage：每个状态都有宠物(sprite/tier 1-5/台词)，台词不泄漏黑话', () => {
+test('petStage: every state has a pet (sprite / tier 1-5 / line), and no line leaks jargon', () => {
   for (const s of STATES) {
     const p = petStage(s as never);
-    assert.ok(p.sprite && p.stage && p.voice, `状态 ${s} 缺宠物定义`);
-    assert.ok(p.tier >= 1 && p.tier <= PET_TREE.length, `状态 ${s} tier 越界：${p.tier}`);
-    assert.doesNotMatch(p.voice, /闸A|闸B|GATE_|ADVERSARIAL|AWAITING|CONFIRM/, `状态 ${s} 台词泄漏黑话：${p.voice}`);
+    assert.ok(p.sprite && p.stage && p.voice, `state ${s} has no pet definition`);
+    assert.ok(p.tier >= 1 && p.tier <= PET_TREE.length, `state ${s} has a tier out of range: ${p.tier}`);
+    assert.doesNotMatch(p.voice, /Gate [ABCD]|GATE_|ADVERSARIAL|AWAITING|CONFIRM/, `state ${s} leaks jargon in its line: ${p.voice}`);
   }
 });
 
-test('treeLine：高亮当前阶，含全 5 阶', () => {
+test('treeLine: highlights the current stage and carries all 5', () => {
   const line = treeLine('AWAITING_PM_CONFIRM'); // tier 2
-  assert.match(line, /【🐣】/); // 第 2 阶高亮
-  for (const e of PET_TREE) assert.ok(line.includes(e), `进化树缺 ${e}`);
+  assert.match(line, /\[🐣\]/); // the second stage is highlighted
+  for (const e of PET_TREE) assert.ok(line.includes(e), `the evolution tree is missing ${e}`);
 });
 
-test('finalForm：确定性（同 id 恒定）+ 落在已知形态集', () => {
+test('finalForm: deterministic (constant for the same id) and drawn from the known set', () => {
   const a = finalForm({ id: 'abc', slug: 'x' });
   const b = finalForm({ id: 'abc', slug: 'x' });
-  assert.equal(a, b, '同一需求最终形态必须稳定');
+  assert.equal(a, b, "the same requirement's final form must be stable");
   const known = ['🦄', '🐉', '🦅', '🦚', '🦖', '🦢', '🦩', '✨🦄✨'];
-  assert.ok(known.includes(a), `最终形态 ${a} 不在已知集`);
+  assert.ok(known.includes(a), `the final form ${a} is not in the known set`);
 });
 
-test('feedLine：群卡藏 $（仅口数），私聊带真实 $', () => {
+test('feedLine: the group card hides the dollar figure (bites only), a direct message carries the real one', () => {
   const group = feedLine(0.19, { showDollar: false });
-  assert.doesNotMatch(group, /\$/, '群卡投喂不该露金额');
-  assert.match(group, /投喂.*口/);
+  assert.doesNotMatch(group, /\$/, 'the group card must not reveal the amount');
+  assert.match(group, /Fed .* bites/);
   const dm = feedLine(0.19, { showDollar: true });
-  assert.match(dm, /\$0\.19/, '私聊投喂要带真实 $');
+  assert.match(dm, /\$0\.19/, 'a direct message must carry the real dollar figure');
 });
 
-test('easterEgg：里程碑(第10只)确定触发；普通需求确定性(可空)', () => {
-  assert.match(easterEgg({ id: 'x', ref_num: 10, created_at: 0 }) ?? '', /里程碑/);
-  assert.match(easterEgg({ id: 'x', ref_num: 20, created_at: 0 }) ?? '', /里程碑/);
-  // 同一输入多次调用结果一致（确定性）
+test('easterEgg: the milestone (every tenth) always fires; an ordinary requirement is deterministic (and may be null)', () => {
+  assert.match(easterEgg({ id: 'x', ref_num: 10, created_at: 0 }) ?? '', /Milestone/);
+  assert.match(easterEgg({ id: 'x', ref_num: 20, created_at: 0 }) ?? '', /Milestone/);
+  // Calling it repeatedly with the same input gives the same answer (determinism)
   const once = easterEgg({ id: 'plain-7', ref_num: 7, created_at: 0 });
   const twice = easterEgg({ id: 'plain-7', ref_num: 7, created_at: 0 });
   assert.equal(once, twice);
