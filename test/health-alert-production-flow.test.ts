@@ -1,5 +1,7 @@
-// 单元/边界：健康告警的产品行为。告警是 M 私有运维信息，只能经 MessagingPort 私聊；
-// bot 失败也不能降级到群 webhook，避免把本地错误细节泄到团队群。
+// Unit and boundary: how health alerting behaves as a product. An alert is the maintainer's private
+// operational information and may only go out as a direct message through MessagingPort; even if the bot
+// fails it must not fall back to the channel webhook, which would leak local error detail into the team's
+// channel.
 import { test, mock } from 'node:test';
 import assert from 'node:assert/strict';
 import type { CardModel } from '../src/messaging/model.ts';
@@ -37,15 +39,15 @@ function reset(): void {
   webhookCalls = 0;
 }
 
-test('健康降级告警：经 port 私聊发送，卡片含人能处理的状态、明细和本地入口', async () => {
+test("a degraded health alert: sent as a direct message through the port, with a card carrying a status a human can act on, the detail, and the local entry point", async () => {
   reset();
   const alertAt = Date.UTC(2026, 5, 18, 2, 3, 4);
-  await sendHealthAlert('degraded', '健康端口无响应', ['主循环仍在跑', '建议查 logs/launchd.log'], alertAt);
+  await sendHealthAlert('degraded', 'the health port is not responding', ['the main loop is still running', 'check logs/launchd.log'], alertAt);
 
   assert.equal(dmCards.length, 1);
   const card = dmCards[0];
   assert.equal(card.color, 'orange');
-  assert.equal(card.title, '🟡 健康端口无响应');
+  assert.equal(card.title, '🟡 the health port is not responding');
   const expectedLocalTime = new Intl.DateTimeFormat('sv-SE', {
     year: 'numeric',
     month: '2-digit',
@@ -57,17 +59,17 @@ test('健康降级告警：经 port 私聊发送，卡片含人能处理的状�
   }).format(new Date(alertAt));
   assert.equal(card.subtitle, `Forge · ${expectedLocalTime}`);
   const text = JSON.stringify(card.blocks);
-  assert.match(text, /主循环仍在跑/);
+  assert.match(text, /the main loop is still running/);
   assert.match(text, /logs\/launchd\.log/);
-  assert.match(text, /本地状态页/);
-  assert.equal(webhookCalls, 0, '健康告警不应走群 webhook');
+  assert.match(text, /local status page/);
+  assert.equal(webhookCalls, 0, 'a health alert must not go through the channel webhook');
 });
 
-test('健康告警私聊失败：只记日志语义，不外泄到群 webhook', async () => {
+test('a health alert whose direct message fails: it is only logged, and never leaks to the channel webhook', async () => {
   reset();
   dmResult = false;
-  await sendHealthAlert('down', '服务异常', ['liveness 过期'], Date.UTC(2026, 5, 18, 2, 3, 4));
+  await sendHealthAlert('down', 'the service is disrupted', ['liveness has gone stale'], Date.UTC(2026, 5, 18, 2, 3, 4));
 
-  assert.equal(dmCards.length, 1, '仍然只尝试 bot 私聊');
-  assert.equal(webhookCalls, 0, 'bot 私聊失败也不能群兜底');
+  assert.equal(dmCards.length, 1, "it still only attempts the bot's direct message");
+  assert.equal(webhookCalls, 0, "even when the bot's direct message fails, the channel is not a fallback");
 });

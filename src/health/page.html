@@ -1,9 +1,9 @@
 <!doctype html>
-<html lang="zh-CN">
+<html lang="en">
 <head>
 <meta charset="utf-8" />
 <meta name="viewport" content="width=device-width, initial-scale=1" />
-<title>Forge · 状态</title>
+<title>Forge · status</title>
 <style>
   :root {
     --bg: #0e1116; --panel: #161b22; --panel2: #1c232c; --border: #2b333d;
@@ -62,46 +62,46 @@
 </head>
 <body>
 <div class="wrap">
-  <h1>Forge <span style="color:var(--mut);font-weight:400;font-size:13px">· PRD 评审/技术方案自动化</span></h1>
-  <div class="sub">PRD 评审 → 技术方案 自动化 · 本地状态页 · 每 5s 刷新</div>
+  <h1>Forge <span style="color:var(--mut);font-weight:400;font-size:13px">· automated PRD review and technical planning</span></h1>
+  <div class="sub">PRD review to technical plan, automated · local status page · refreshes every 5s</div>
 
   <div id="banner" class="banner deg">
     <div class="dot"></div>
-    <div><div class="big" id="banner-text">加载中…</div><div class="meta" id="banner-meta"></div></div>
+    <div><div class="big" id="banner-text">loading...</div><div class="meta" id="banner-meta"></div></div>
   </div>
 
-  <div class="sec">组件健康</div>
+  <div class="sec">component health</div>
   <div class="grid" id="checks"></div>
 
-  <div class="sec">近 72 小时在线率 · <span id="uptime" class="muted"></span></div>
+  <div class="sec">uptime over the last 72 hours · <span id="uptime" class="muted"></span></div>
   <div class="bars" id="bars"></div>
-  <div class="hrow"><span>72h 前</span><span id="incidents"></span><span>现在</span></div>
+  <div class="hrow"><span>72h ago</span><span id="incidents"></span><span>now</span></div>
 
-  <div class="sec">PRD 流水线看板</div>
+  <div class="sec">PRD pipeline board</div>
   <div class="chips" id="board" style="margin-bottom:12px"></div>
   <table id="attn-tbl" style="display:none">
-    <thead><tr><th>需求</th><th>状态</th><th>标题</th><th></th></tr></thead>
+    <thead><tr><th>requirement</th><th>state</th><th>title</th><th></th></tr></thead>
     <tbody id="attn"></tbody>
   </table>
-  <div id="attn-empty" class="muted" style="font-size:13px">无停泊/待决项 🎉</div>
+  <div id="attn-empty" class="muted" style="font-size:13px">nothing parked or waiting on a decision 🎉</div>
 
-  <div class="sec">全部需求 · <select id="project-filter"><option value="">全部项目</option></select> · <select id="state-filter"><option value="">全部状态</option></select></div>
+  <div class="sec">all requirements · <select id="project-filter"><option value="">all projects</option></select> · <select id="state-filter"><option value="">all states</option></select></div>
   <table id="sessions-tbl" style="display:none">
-    <thead><tr><th>需求</th><th>状态</th><th>标题</th><th>项目</th><th></th></tr></thead>
+    <thead><tr><th>requirement</th><th>state</th><th>title</th><th>project</th><th></th></tr></thead>
     <tbody id="sessions"></tbody>
   </table>
-  <div id="sessions-empty" class="muted" style="font-size:13px">（无 session）</div>
+  <div id="sessions-empty" class="muted" style="font-size:13px">(no sessions)</div>
   <div id="detail" style="display:none"></div>
 
   <footer>
-    数据源 <a href="/health">/health</a> · <a href="/api/board">/api/board</a> · <a href="/api/sessions">/api/sessions</a> · <a href="/api/history">/api/history</a>
-    　守护 PID <span id="pid">—</span> · 运行 <span id="uptime2">—</span> · 周期 <span id="cycles">—</span> · 活跃 gate <span id="gates">—</span>
+    data from <a href="/health">/health</a> · <a href="/api/board">/api/board</a> · <a href="/api/sessions">/api/sessions</a> · <a href="/api/history">/api/history</a>
+    &nbsp;&nbsp;daemon PID <span id="pid">—</span> · up <span id="uptime2">—</span> · cycles <span id="cycles">—</span> · active gates <span id="gates">—</span>
   </footer>
 </div>
 
 <script>
 const STATE_LABEL = {
-  healthy: '全部正常', degraded: '部分降级', down: '服务异常',
+  healthy: 'all systems normal', degraded: 'partially degraded', down: 'service disrupted',
 };
 const STATE_CLASS = { healthy: 'ok', degraded: 'deg', down: 'dn' };
 
@@ -114,7 +114,7 @@ function fmtDur(sec) {
 }
 function ago(ts) {
   if (!ts) return '—';
-  return fmtDur(Math.round((Date.now() - ts)/1000)) + '前';
+  return fmtDur(Math.round((Date.now() - ts)/1000)) + ' ago';
 }
 function esc(s){ return String(s).replace(/[&<>"]/g, c => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c])); }
 
@@ -126,7 +126,7 @@ async function tick() {
   catch (e) {
     const b = document.getElementById('banner');
     b.className = 'banner dn';
-    document.getElementById('banner-text').textContent = '状态页无法连接守护';
+    document.getElementById('banner-text').textContent = 'the status page cannot reach the daemon';
     document.getElementById('banner-meta').textContent = String(e);
     return;
   }
@@ -134,9 +134,9 @@ async function tick() {
   const b = document.getElementById('banner');
   b.className = 'banner ' + (STATE_CLASS[h.status] || 'deg');
   document.getElementById('banner-text').textContent = STATE_LABEL[h.status] || h.status;
-  const wedged = h.daemon.wedged ? ' · ⚠️ 卡死' : '';
+  const wedged = h.daemon.wedged ? ' · ⚠️ wedged' : '';
   document.getElementById('banner-meta').textContent =
-    `运行 ${fmtDur(h.uptimeSec)} · 上次周期 ${ago(h.daemon.lastCycleAt)} · liveness ${h.daemon.livenessAgeSec ?? '—'}s 前${wedged}`;
+    `up ${fmtDur(h.uptimeSec)} · last cycle ${ago(h.daemon.lastCycleAt)} · liveness ${h.daemon.livenessAgeSec ?? '—'}s ago${wedged}`;
   // footer
   document.getElementById('pid').textContent = h.daemon.pid ?? '—';
   document.getElementById('uptime2').textContent = fmtDur(h.uptimeSec);
@@ -155,10 +155,11 @@ async function tick() {
     renderHistory(hist);
   } catch {}
 
-  // board（跟随项目过滤：选中项目后看板/需关注也只统计该项目，不再混入他项目）
+  // The board (it follows the project filter: with a project selected, the board and the attention list count
+  // that project only and no longer mix in others)
   try { await loadBoard(); } catch {}
 
-  // 全部需求列表
+  // The full requirement list
   try { await loadSessions(); } catch {}
 }
 
@@ -174,20 +175,22 @@ let lastProjectsKey = '';
 async function loadSessions() {
   const qs = [curProject ? 'project=' + encodeURIComponent(curProject) : '', curFilter ? 'state=' + encodeURIComponent(curFilter) : ''].filter(Boolean).join('&');
   const data = await getJSON('/api/sessions' + (qs ? '?' + qs : ''));
-  // 状态集变了才重建过滤下拉（免每 5s 打断选择），重建后恢复当前选择
+  // Only rebuild the filter dropdown when the set of states changes (so a selection is not interrupted every
+  // 5s), and restore the current selection afterwards
   const key = (data.states || []).join(',');
   if (key !== lastStatesKey) {
     lastStatesKey = key;
     const sel = document.getElementById('state-filter');
-    sel.innerHTML = '<option value="">全部状态</option>' + (data.states || []).map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
+    sel.innerHTML = '<option value="">all states</option>' + (data.states || []).map(s => `<option value="${esc(s)}">${esc(s)}</option>`).join('');
     sel.value = curFilter;
   }
-  // 项目集变了才重建项目下拉（始终是全库项目，不随当前过滤收窄）
+  // Only rebuild the project dropdown when the set of projects changes (it always lists every project in the
+  // database and does not narrow with the current filter)
   const pkey = (data.projects || []).join(',');
   if (pkey !== lastProjectsKey) {
     lastProjectsKey = pkey;
     const psel = document.getElementById('project-filter');
-    psel.innerHTML = '<option value="">全部项目</option>' + (data.projects || []).map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join('');
+    psel.innerHTML = '<option value="">all projects</option>' + (data.projects || []).map(p => `<option value="${esc(p)}">${esc(p)}</option>`).join('');
     psel.value = curProject;
   }
   renderSessions(data.sessions || []);
@@ -199,7 +202,7 @@ function renderSessions(rows) {
   document.getElementById('sessions').innerHTML = rows.map(r => `
     <tr class="srow" data-slug="${esc(r.slug)}" style="cursor:pointer">
       <td>${esc(r.ref)}</td>
-      <td>${esc(r.label)}${r.autonomy > 0 ? ` <span class="chip" title="项目自治等级">🤖L${r.autonomy}</span>` : ''}</td>
+      <td>${esc(r.label)}${r.autonomy > 0 ? ` <span class="chip" title="the project's autonomy level">🤖L${r.autonomy}</span>` : ''}</td>
       <td>${esc(r.title)}</td>
       <td class="muted">${esc(r.project)}</td>
       <td class="muted">${ago(r.updatedAt)}</td>
@@ -207,55 +210,55 @@ function renderSessions(rows) {
   document.querySelectorAll('#sessions .srow').forEach(tr => { tr.onclick = () => showDetail(tr.dataset.slug); });
 }
 const ACTION_LABEL = {
-  confirm: '强制通过', gateb: '出技术方案', force_go: '强制立项', go: 'GO 立项', deny: '打回',
-  implement: '起实现', review_pr: '开 PR 复审', merged: '确认已合并', retry: '重试',
+  confirm: 'force through', gateb: 'produce a technical plan', force_go: 'force the work open', go: 'GO', deny: 'send back',
+  implement: 'start the implementation', review_pr: 'open the PR for review', merged: 'confirm it was merged', retry: 'retry',
 };
 async function postAction(action, slug) {
-  if (!confirm(`确认对 ${slug} 执行「${ACTION_LABEL[action] || action}」？`)) return;
+  if (!confirm(`Run "${ACTION_LABEL[action] || action}" on ${slug}?`)) return;
   let j;
   try {
     const r = await fetch('/api/action', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ action, slug }) });
     j = await r.json();
-  } catch (e) { j = { ok: false, msg: '请求失败：' + String(e) }; }
-  await showDetail(slug);          // 刷新详情（状态/可用按钮已变）
+  } catch (e) { j = { ok: false, msg: 'the request failed: ' + String(e) }; }
+  await showDetail(slug);          // refresh the detail (the state and the available buttons have changed)
   const msg = document.getElementById('act-msg');
-  if (msg) { msg.textContent = j.msg || (j.ok ? '已执行' : '失败'); msg.className = j.ok ? 'muted' : 'err'; }
-  loadSessions().catch(() => {});  // 刷新列表
+  if (msg) { msg.textContent = j.msg || (j.ok ? 'done' : 'failed'); msg.className = j.ok ? 'muted' : 'err'; }
+  loadSessions().catch(() => {});  // refresh the list
 }
 async function showDetail(slug) {
   const d = document.getElementById('detail');
   d.style.display = 'block';
-  d.innerHTML = '<div class="muted">加载中…</div>';
+  d.innerHTML = '<div class="muted">loading...</div>';
   try {
     const x = await getJSON('/api/session?id=' + encodeURIComponent(slug) + (curProject ? '&project=' + encodeURIComponent(curProject) : ''));
     d.innerHTML = `
-      <div class="sec" style="margin-top:0">${esc(x.ref)} · ${esc(x.title)} <a href="#" id="detail-close" class="muted" style="float:right;font-size:12px">收起 ✕</a></div>
+      <div class="sec" style="margin-top:0">${esc(x.ref)} · ${esc(x.title)} <a href="#" id="detail-close" class="muted" style="float:right;font-size:12px">close ✕</a></div>
       <div class="chips" style="margin-bottom:10px">
         <span class="chip">${esc(x.label)}</span>
-        <span class="chip">项目 ${esc(x.project)}</span>
-        <span class="chip">分支 ${esc(x.branch)}</span>
+        <span class="chip">project ${esc(x.project)}</span>
+        <span class="chip">branch ${esc(x.branch)}</span>
         ${x.assignee ? `<span class="chip">DRI ${esc(x.assignee)}</span>` : ''}
         ${x.size ? `<span class="chip">${esc(x.size)}</span>` : ''}
-        ${x.autonomy > 0 ? `<span class="chip">自治 L${x.autonomy}</span>` : ''}
+        ${x.autonomy > 0 ? `<span class="chip">autonomy L${x.autonomy}</span>` : ''}
         ${x.prUrl ? `<span class="chip"><a href="${esc(x.prUrl)}" target="_blank" rel="noopener">PR ↗</a></span>` : ''}
-        <span class="chip muted">建 ${ago(x.createdAt)} · 更 ${ago(x.updatedAt)}</span>
+        <span class="chip muted">created ${ago(x.createdAt)} · updated ${ago(x.updatedAt)}</span>
       </div>
       ${(x.actions || []).length ? `<div style="margin:4px 0 8px">${x.actions.map(a => `<button class="btn ${a === 'deny' ? 'danger' : ''}" data-act="${esc(a)}" data-slug="${esc(x.slug)}">${esc(ACTION_LABEL[a] || a)}</button>`).join(' ')}</div>` : ''}
       <div id="act-msg" class="muted" style="font-size:12px;margin-bottom:8px"></div>
       <div class="evtlist">${(x.events || []).slice().reverse().map(e => `
-        <div class="evt"><span class="muted">${ago(e.ts)}</span> · <b>${esc(e.kind)}</b>${e.detail ? ` <span class="muted">${esc(String(e.detail).slice(0, 200))}</span>` : ''}</div>`).join('') || '<div class="muted">无事件</div>'}</div>`;
+        <div class="evt"><span class="muted">${ago(e.ts)}</span> · <b>${esc(e.kind)}</b>${e.detail ? ` <span class="muted">${esc(String(e.detail).slice(0, 200))}</span>` : ''}</div>`).join('') || '<div class="muted">no events</div>'}</div>`;
     document.getElementById('detail-close').onclick = (ev) => { ev.preventDefault(); d.style.display = 'none'; };
     d.querySelectorAll('.btn[data-act]').forEach(b => { b.onclick = () => postAction(b.dataset.act, b.dataset.slug); });
     d.scrollIntoView({ behavior: 'smooth', block: 'nearest' });
   } catch (e) {
-    d.innerHTML = '<div class="err">加载失败：' + esc(String(e)) + '</div>';
+    d.innerHTML = '<div class="err">could not load: ' + esc(String(e)) + '</div>';
   }
 }
 
 function renderHistory(hist) {
   document.getElementById('uptime').textContent =
-    `在线 ${hist.uptimePct}% · 正常 ${hist.healthyPct}% · 降级 ${hist.degradedPct}% · 异常 ${hist.downPct}%（${hist.count} 个采样）`;
-  // 72 个时段（每段 1h），落到对应桶取最坏状态
+    `up ${hist.uptimePct}% · normal ${hist.healthyPct}% · degraded ${hist.degradedPct}% · disrupted ${hist.downPct}% (${hist.count} samples)`;
+  // 72 slots of one hour each; each sample falls into its bucket and the worst status wins
   const buckets = 72, span = 72*3600*1000, start = hist.now - span;
   const slot = new Array(buckets).fill('empty');
   const rank = { healthy:1, degraded:2, down:3, empty:0 };
@@ -267,14 +270,14 @@ function renderHistory(hist) {
   document.getElementById('bars').innerHTML = slot.map(s =>
     `<i class="${s==='empty'?'empty':s}" title="${s}"></i>`).join('');
   const evs = hist.events.slice(-3).map(e => `${e.from}→${e.to}`).join(' · ');
-  document.getElementById('incidents').textContent = hist.events.length ? `${hist.events.length} 次状态翻转` : '无翻转';
+  document.getElementById('incidents').textContent = hist.events.length ? `${hist.events.length} status flips` : 'no flips';
 }
 
 function renderBoard(board) {
   const order = Object.entries(board.byState).sort((a,b)=>b[1]-a[1]);
   document.getElementById('board').innerHTML = order.length
     ? order.map(([st,n]) => `<span class="chip">${esc(st)} <b>${n}</b></span>`).join('')
-    : '<span class="muted">（无 session）</span>';
+    : '<span class="muted">(no sessions)</span>';
   const attn = board.attention || [];
   const tbl = document.getElementById('attn-tbl'), empty = document.getElementById('attn-empty');
   if (!attn.length) { tbl.style.display='none'; empty.style.display='block'; return; }

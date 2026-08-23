@@ -1,5 +1,6 @@
-// 解析后的保活/健康配置：runtime.yaml › health 块叠默认值，端口可被 env FORGE_HEALTH_PORT 覆盖。
-// 全部给了兜底默认，所以旧配置/测试不带 health 块也能跑。
+// The resolved keep-alive and health configuration: runtime.yaml's health block layered over the defaults,
+// with the port overridable by the FORGE_HEALTH_PORT env var.
+// Everything has a fallback default, so an older config or a test with no health block still runs.
 import { loadConfig } from '../config.ts';
 
 export interface HealthCfg {
@@ -37,7 +38,8 @@ export function healthConfig(): HealthCfg {
   const cfg = loadConfig();
   const h = cfg.runtime.health ?? {};
   const d = HEALTH_DEFAULTS;
-  // 端口优先级：env FORGE_HEALTH_PORT（forge 包装器从 forge.env 导出）> runtime.yaml > 默认。
+  // Port precedence: the FORGE_HEALTH_PORT env var (the forge wrapper exports it from forge.env) >
+  // runtime.yaml > the default.
   const envPort = cfg.env.FORGE_HEALTH_PORT;
   return {
     port: num(envPort, num(h.port, d.port)),
@@ -48,7 +50,7 @@ export function healthConfig(): HealthCfg {
     sampleIntervalSec: num(h.sample_interval_sec, d.sampleIntervalSec),
     historyRetainHours: num(h.history_retain_hours, d.historyRetainHours),
     logRotateMb: num(h.log_rotate_mb, d.logRotateMb),
-    contractCheckEnabled: h.contract_check ?? d.contractCheckEnabled, // boolean：?? 兜底（num() 不适用）
+    contractCheckEnabled: h.contract_check ?? d.contractCheckEnabled, // a boolean: ?? for the fallback (num() does not apply)
     contractIntervalHours: num(h.contract_interval_hours, d.contractIntervalHours),
   };
 }
