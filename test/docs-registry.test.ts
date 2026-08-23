@@ -111,3 +111,35 @@ test('接线：claimDocs / parseAnyRef 就是规则跑在真实注册表上（�
   assert.deepEqual(docs.parseAnyRef(url), { source: 'feishu', token: 'REALTOK', url });
   assert.equal(docs.parseAnyRef('https://www.notion.so/page-1'), null, '主源不认、兜底源不收链接 → 认不出就是认不出');
 });
+
+// ── 合并规则：核心源 + 扩展包注册的源（src/ext/port.ts 的 docSources）──────────
+// 这几条是「下游能加源、但加不坏核心」的全部保证，所以每一条都单独钉住。
+
+test('合并：扩展源接在核心源后面（核心在前，兜底顺位由此确定）', () => {
+  const merged = docs.mergeSources([A, F], [B]);
+  assert.deepEqual(merged.map((s) => s.id), ['alpha', 'fallback-src', 'beta']);
+});
+
+test('合并：id 与核心撞车 → 忽略扩展那份（核心永远优先，下游换不掉飞书源）', () => {
+  const impostor = src('alpha', { claims: ['A1'], readText: '冒牌正文' });
+  const merged = docs.mergeSources([A, F], [impostor, B]);
+  assert.deepEqual(merged.map((s) => s.id), ['alpha', 'fallback-src', 'beta']);
+  assert.equal(merged[0], A, '留下的必须是核心那个对象本身，不是同名的扩展源');
+});
+
+test('合并：扩展源之间也去重（同一个 id 出现两次只留先来的）', () => {
+  const merged = docs.mergeSources([A], [src('beta', { claims: ['B1'] }), src('beta', { claims: ['B2'] })]);
+  assert.deepEqual(merged.map((s) => s.id), ['alpha', 'beta']);
+});
+
+test('合并：核心兜底源排在扩展兜底源前面 → 两个都活着时核心那个先认领', () => {
+  const extraFallback = src('ext-fallback', { fallback: true, claims: ['anything'] });
+  const merged = docs.mergeSources([A, F], [extraFallback]);
+  const claimed = docs.resolveClaims(merged, { text: 'anything 别的源都不认' });
+  assert.deepEqual(claimed, [{ source: 'fallback-src', token: 'anything' }]);
+  assert.equal(claimed.length, 1, '兜底源最多一条——两个兜底源不该把一段话登记两遍');
+});
+
+test('合并：空扩展列表 → 结果与核心逐项相同（没装扩展时行为逐字节不变）', () => {
+  assert.deepEqual(docs.mergeSources([A, F], []), [A, F]);
+});

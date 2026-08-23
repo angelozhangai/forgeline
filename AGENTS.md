@@ -57,7 +57,12 @@ Seam invariants, all machine-guarded (see [test/ext-seam.test.ts](test/ext-seam.
 
 - Hooks **notify, never intercept** — no return value is honoured; failures and timeouts are logged and
   stepped over. A vetoing hook would be a way to switch the governance rails off.
-- **Core commands win** on name collision — downstream can't shadow `go`/`merged`.
+- **Core commands win** on name collision — downstream can't shadow `go`/`merged`. The same rule covers
+  document sources: a pack may register its own (`docSources`, for Notion/Confluence/an internal wiki), but
+  an id that collides with a core source is dropped, so nobody can quietly take over Feishu doc parsing.
+  A stored `doc_ref` outlives the pack — removing the pack makes `readDoc` say *unregistered source*, never
+  a silent read failure. This is registrable where `MessagingPort` is not, because the document registry is
+  consulted per message rather than bound at module load.
 - **Present but unloadable → hard error.** Silent fallback is this architecture's #1 failure mode: a hook that
   didn't load has no symptom at all.
 - **State machine / transition table are not extensible** — they carry the red lines (a stalled Gate C can only
