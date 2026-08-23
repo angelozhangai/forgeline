@@ -1,95 +1,100 @@
-// 每需求生命周期状态。erasable TS：用 const 数组 + union 类型，不用 enum。
+// Per-requirement lifecycle states. Erasable TS: a const array plus a union type, not an enum.
 
 export const STATES = [
   'INTAKE',
   'GATE_A_RUNNING',
   'AWAITING_PM_CONFIRM',
-  'GATE_A_REVISION_REQUESTED', // PM 已答复，待同会话复评（闸A 多轮循环）
-  'GATE_A_ADVERSARIAL', // 闸A codex审⇄claude改：claude 复评无开放问题后，再过一道对抗复审才确认（poller 驱动）
+  'GATE_A_REVISION_REQUESTED', // the PM has answered; awaiting re-review in the same session (Gate A's multi-round loop)
+  'GATE_A_ADVERSARIAL', // Gate A codex-reviews / claude-revises: after claude's re-review has no open questions, one adversarial pass is still required before confirming (poller-driven)
   'CONFIRMED',
   'GATE_B_REQUESTED',
   'GATE_B_RUNNING',
-  'ADVERSARIAL_LOOP', // 闸B codex审⇄claude改 多轮循环态（poller 驱动；每-tick 上限到顶自转移续跑）
-  'AWAITING_GATE_B_INPUT', // claude 改方升级 needs_human → 停泊等 M 答复（闸B 人在环）
-  'GATE_B_REVISION_REQUESTED', // M 已答复，待同会话 resume 续修（对称 GATE_A_REVISION_REQUESTED）
+  'ADVERSARIAL_LOOP', // Gate B codex-reviews / claude-revises, multi-round (poller-driven; self-transitions to continue when the per-tick cap is reached)
+  'AWAITING_GATE_B_INPUT', // claude escalated the design as needs_human -> parked awaiting the maintainer (Gate B human-in-the-loop)
+  'GATE_B_REVISION_REQUESTED', // the maintainer has answered; awaiting resume in the same session (symmetric with GATE_A_REVISION_REQUESTED)
   'AWAITING_GO',
   'WRITING',
-  'DONE', // 上游终态：issue 已建（下游可从此触发闸C；漂移闭环亦锚此态）
-  // ── 下游：闸C 实现 + 本地CI ──
-  'GATE_C_REQUESTED', // forge implement / standalone 裸 issue intake 触发
-  'GATE_C_RUNNING', // 建 worktree + 物化/校验验收红 + 起实现
-  'GATE_C_LOOP', // 实现⇄CI 修复有界循环（poller 驱动；每-tick 上限自转移续跑）
-  'AWAITING_GATE_C_INPUT', // claude 实现升级 needs_human → 等 M 答复
-  'GATE_C_REVISION_REQUESTED', // M 答复后 resume 续做
-  // ── 下游：闸D PR 对抗 review + 测试补强 + merge readiness ──
-  'AWAITING_GATE_D', // 闸C 绿 → 等权限人触发开 PR + 闸D（默认人工，后续受自治策略控制）
-  'GATE_D_REQUESTED', // 建 PR 后进对抗
-  'GATE_D_LOOP', // codex 审 diff ⇄ claude 修（CI 夹在 fix 内；poller 驱动）
-  'AWAITING_GATE_D_INPUT', // 改方升级 needs_human → 等 M 答复
-  'GATE_D_REVISION_REQUESTED', // M 答复后 resume 续修
-  'GATE_D_HARDENING', // LGTM 后补内环测试（杜绝镜像测试）+ 再跑 CI（poller 驱动）
-  'AWAITING_HUMAN_MERGE', // 出 merge-readiness 报告，等人工合并（**永不自动 merge**）
-  'SHIPPED', // 人工确认已合并（forge merged）→ 接漂移闭环
-  // 停泊态
+  'DONE', // upstream terminal state: issues created (downstream can trigger Gate C from here; the drift loop also anchors on this state)
+  // -- Downstream: Gate C implementation + local CI --
+  'GATE_C_REQUESTED', // triggered by forge implement, or by standalone bare-issue intake
+  'GATE_C_RUNNING', // create the worktree, materialise/verify acceptance as red, start the implementation
+  'GATE_C_LOOP', // bounded implement/CI-fix loop (poller-driven; self-transitions to continue when the per-tick cap is reached)
+  'AWAITING_GATE_C_INPUT', // claude escalated the implementation as needs_human -> awaiting the maintainer
+  'GATE_C_REVISION_REQUESTED', // resume after the maintainer has answered
+  // -- Downstream: Gate D adversarial PR review + test hardening + merge readiness --
+  'AWAITING_GATE_D', // Gate C is green -> awaiting an authorised person to open the PR and trigger Gate D (manual by default; later governed by the autonomy policy)
+  'GATE_D_REQUESTED', // adversarial review begins once the PR is open
+  'GATE_D_LOOP', // codex reviews the diff / claude fixes (CI runs inside the fix; poller-driven)
+  'AWAITING_GATE_D_INPUT', // the revision escalated as needs_human -> awaiting the maintainer
+  'GATE_D_REVISION_REQUESTED', // resume after the maintainer has answered
+  'GATE_D_HARDENING', // after LGTM, add inner-loop tests (no mirror tests) and run CI again (poller-driven)
+  'AWAITING_HUMAN_MERGE', // merge-readiness report produced, awaiting a human merge (**never merges automatically**)
+  'SHIPPED', // a human confirmed the merge (forge merged) -> hands over to the drift loop
+  // Parked states
   'GATE_A_FAILED',
-  'GATE_A_STALLED', // 闸A 多轮到上限仍未消解 → 停泊交 M 人工裁决
+  'GATE_A_STALLED', // Gate A hit its round cap unresolved -> parked for the maintainer to arbitrate
   'GATE_B_FAILED',
-  'GATE_B_STALLED', // 闸B 对抗到上限仍未消解 → 停泊交 M 裁决（强制立项 / 再修一轮）
+  'GATE_B_STALLED', // Gate B's adversarial loop hit its cap unresolved -> parked for the maintainer (force through / one more revision)
   'GATE_C_FAILED',
-  'GATE_C_STALLED', // 闸C CI/验收到上限仍不绿 → 停泊交 M 裁决
+  'GATE_C_STALLED', // Gate C's CI/acceptance hit its cap still red -> parked for the maintainer
   'GATE_D_FAILED',
-  'GATE_D_STALLED', // 闸D 对抗到上限仍未消解 → 停泊交 M 裁决
+  'GATE_D_STALLED', // Gate D's adversarial loop hit its cap unresolved -> parked for the maintainer
   'GO_DENIED',
   'WRITE_FAILED',
 ] as const;
 
 export type State = (typeof STATES)[number];
 
-// 轮询驱动（无需人）即可自动推进的状态 → 下一步动作由 worker 执行。
-// 注：GATE_B_REQUESTED 的 step 内部一气跑完 闸B + 对抗复审，直到 AWAITING_GO。
+// States that advance automatically under the poller, with no human needed -> the worker performs the
+// next action.
+// Note: the step for GATE_B_REQUESTED runs Gate B and the adversarial review through in one go, all
+// the way to AWAITING_GO.
 export const POLLER_DRIVEN: ReadonlySet<State> = new Set<State>([
-  'INTAKE', // → 闸A → AWAITING_PM_CONFIRM
-  'GATE_A_REVISION_REQUESTED', // → 闸A 复评（resume）→ AWAITING_PM_CONFIRM / GATE_A_ADVERSARIAL / GATE_A_STALLED
-  'GATE_A_ADVERSARIAL', // → 跑 codex审⇄claude改 引擎 → CONFIRMED / GATE_A_STALLED（或 paused 自转移续跑）
-  'GATE_B_REQUESTED', // → 闸B 初稿 → ADVERSARIAL_LOOP
-  'ADVERSARIAL_LOOP', // → 跑 codex审⇄claude改 引擎 → AWAITING_GO / AWAITING_GATE_B_INPUT / GATE_B_STALLED（或 paused 自转移续跑）
-  'GATE_B_REVISION_REQUESTED', // → M 答复后 resume 续修 → ADVERSARIAL_LOOP
-  // 下游闸C
-  'GATE_C_REQUESTED', // → 建 worktree + 起实现 → GATE_C_LOOP
-  'GATE_C_LOOP', // → 实现⇄CI 循环 → AWAITING_GATE_D / AWAITING_GATE_C_INPUT / GATE_C_STALLED（或 paused 自转移续跑）
-  'GATE_C_REVISION_REQUESTED', // → M 答复后 resume 续做 → GATE_C_LOOP
-  // 下游闸D
-  'GATE_D_REQUESTED', // → 建 PR → GATE_D_LOOP
-  'GATE_D_LOOP', // → codex审diff⇄claude改 → GATE_D_HARDENING / AWAITING_GATE_D_INPUT / GATE_D_STALLED（或 paused 自转移续跑）
-  'GATE_D_REVISION_REQUESTED', // → M 答复后 resume 续修 → GATE_D_LOOP
-  'GATE_D_HARDENING', // → 补内环测试 + CI → AWAITING_HUMAN_MERGE
+  'INTAKE', // -> Gate A -> AWAITING_PM_CONFIRM
+  'GATE_A_REVISION_REQUESTED', // -> Gate A re-review (resume) -> AWAITING_PM_CONFIRM / GATE_A_ADVERSARIAL / GATE_A_STALLED
+  'GATE_A_ADVERSARIAL', // -> run the codex-review/claude-revise engine -> CONFIRMED / GATE_A_STALLED (or self-transition to continue when paused)
+  'GATE_B_REQUESTED', // -> Gate B first draft -> ADVERSARIAL_LOOP
+  'ADVERSARIAL_LOOP', // -> run the codex-review/claude-revise engine -> AWAITING_GO / AWAITING_GATE_B_INPUT / GATE_B_STALLED (or self-transition to continue when paused)
+  'GATE_B_REVISION_REQUESTED', // -> resume after the maintainer answered -> ADVERSARIAL_LOOP
+  // Downstream Gate C
+  'GATE_C_REQUESTED', // -> create the worktree, start the implementation -> GATE_C_LOOP
+  'GATE_C_LOOP', // -> implement/CI loop -> AWAITING_GATE_D / AWAITING_GATE_C_INPUT / GATE_C_STALLED (or self-transition to continue when paused)
+  'GATE_C_REVISION_REQUESTED', // -> resume after the maintainer answered -> GATE_C_LOOP
+  // Downstream Gate D
+  'GATE_D_REQUESTED', // -> open the PR -> GATE_D_LOOP
+  'GATE_D_LOOP', // -> codex reviews the diff / claude fixes -> GATE_D_HARDENING / AWAITING_GATE_D_INPUT / GATE_D_STALLED (or self-transition to continue when paused)
+  'GATE_D_REVISION_REQUESTED', // -> resume after the maintainer answered -> GATE_D_LOOP
+  'GATE_D_HARDENING', // -> add inner-loop tests + CI -> AWAITING_HUMAN_MERGE
 ]);
 
-// 等人的停顿点（worker 不碰）
+// Pause points waiting on a human (the worker does not touch these).
 export const HUMAN_GATES: ReadonlySet<State> = new Set<State>([
   'AWAITING_PM_CONFIRM',
-  'GATE_A_STALLED', // 等 M 裁决（强制结束 / 给输入再跑一轮）
-  'CONFIRMED', // 等有权限的人触发闸B
-  'AWAITING_GATE_B_INPUT', // 等 M 答复 claude 改方的升级问题（needs_human）
-  'GATE_B_STALLED', // 等 M 裁决（强制立项 / 再修一轮）
+  'GATE_A_STALLED', // awaiting the maintainer's arbitration (force an end / supply input and run another round)
+  'CONFIRMED', // awaiting an authorised person to trigger Gate B
+  'AWAITING_GATE_B_INPUT', // awaiting the maintainer's answer to claude's escalated design questions (needs_human)
+  'GATE_B_STALLED', // awaiting the maintainer's arbitration (force the requirement through / one more revision)
   'AWAITING_GO',
-  // 下游
-  'AWAITING_GATE_C_INPUT', // 等 M 答复闸C 实现的升级问题
-  'GATE_C_STALLED', // 等 M 裁决（只能给输入再修一轮——CI 没绿不许跳去开 PR，红线#3）
-  'AWAITING_GATE_D', // 等有权限的人触发开 PR + 闸D
-  'AWAITING_GATE_D_INPUT', // 等 M 答复闸D 改方的升级问题
-  'GATE_D_STALLED', // 等 M 裁决（强制前进 / 再修一轮）
-  'AWAITING_HUMAN_MERGE', // 等人工合并 PR（永不自动）
+  // Downstream
+  'AWAITING_GATE_C_INPUT', // awaiting the maintainer's answer to Gate C implementation escalations
+  'GATE_C_STALLED', // awaiting the maintainer's arbitration (input and one more revision only — a red CI may never skip ahead to opening a PR; red line #3)
+  'AWAITING_GATE_D', // awaiting an authorised person to open the PR and trigger Gate D
+  'AWAITING_GATE_D_INPUT', // awaiting the maintainer's answer to Gate D revision escalations
+  'GATE_D_STALLED', // awaiting the maintainer's arbitration (force forward / one more revision)
+  'AWAITING_HUMAN_MERGE', // awaiting a human PR merge (never automatic)
 ]);
 
-// 「正在跑 gate」的活跃态：claude/codex 子进程在飞。看门狗据此「有 gate 在跑则暂缓强杀」，
-// 心跳/状态页据此显示活跃 gate 数。注：子进程是 async spawn，不堵 event loop（见 util/proc.ts:run）。
+// The "a gate is running" active states: a claude/codex subprocess is in flight. The watchdog uses
+// this to hold off a forced kill while a gate is running, and the heartbeat/status page uses it to
+// show the number of active gates.
+// Note: subprocesses are spawned asynchronously and do not block the event loop (see run in
+// util/proc.ts).
 export const ACTIVE_GATE_STATES: ReadonlySet<State> = new Set<State>([
   'GATE_A_RUNNING',
   'GATE_A_ADVERSARIAL',
   'GATE_B_RUNNING',
   'ADVERSARIAL_LOOP',
-  // 下游：子进程（claude/codex/CI）在飞 → 看门狗据此宽限不强杀
+  // Downstream: a subprocess (claude/codex/CI) is in flight -> the watchdog grants grace rather than killing
   'GATE_C_RUNNING',
   'GATE_C_LOOP',
   'GATE_D_LOOP',

@@ -1,87 +1,112 @@
-// 扩展接缝——**ExtensionPack**：Forgeline 与「构建在它之上的下游产品」之间的唯一接口。
+// Extension seam — **ExtensionPack**: the one interface between Forgeline and a downstream product
+// built on top of it.
 //
-// 照本仓既有范式：接口（本文件）+ 单一选择点（ext/index.ts `loadExtensions`/`hooks`/`commands`）+
-// adapter（下游自己的 `$FORGE_HOME/ext/index.ts`）。与 MessagingPort / SessionStore / JobSource 同构。
+// Follows the pattern already used in this repo: the interface (this file) + a single selection point
+// (ext/index.ts `loadExtensions`/`hooks`/`commands`) + the adapter (downstream's own
+// `$FORGE_HOME/ext/index.ts`). Structurally identical to MessagingPort / SessionStore / JobSource.
 //
-// **为什么存在**：核心把「PRD 评审 → 技术方案 → 实现 → PR」这条治理流水线做成通用能力；下游（自建部署、
-// 商业产品、团队定制）需要在不 fork、不改核心文件的前提下往上叠东西——加自己的 CLI 命令、把状态流转同步
-// 到自己的系统、在 tick 前后跑自己的对账。没有这层接缝，这些需求只能靠打补丁改核心文件，两边就会永久分叉
-// （GitLab CE/EE 的旧账）。有了这层，下游是核心的**消费者**而非分支。
+// **Why it exists**: the core turns the governance pipeline (PRD review -> tech design ->
+// implementation -> PR) into a generic capability. Downstream — private deployments, commercial
+// layers, team customisations — needs to add things on top without forking and without editing core
+// files: its own CLI commands, mirroring state transitions into its own systems, running its own
+// reconciliation around each tick. Without this seam those needs can only be met by patching core
+// files, and the two sides fork permanently (the GitLab CE/EE bill). With it, downstream is a
+// **consumer** of the core rather than a branch of it.
 //
-// ── 装载 ──
-// 见 ext/index.ts：`FORGE_EXT_DIR` 显式指定 → 否则 `$FORGE_HOME/ext/index.ts` 自动发现 → 都没有则**空包**
-// （纯 OSS 行为逐字节不变）。扩展包默认导出一个 ExtensionPack。
+// -- Loading --
+// See ext/index.ts: an explicit `FORGE_EXT_DIR` -> otherwise auto-discovery of
+// `$FORGE_HOME/ext/index.ts` -> neither present means an **empty pack** (pure-OSS behaviour, byte for
+// byte unchanged). An extension pack default-exports an ExtensionPack.
 //
-// ── ⛔ 跨边界只传纯数据与函数 ──
-// 扩展包住在**另一个仓库、另一份 node_modules**里（peer checkout）。同一个库（zod / yaml / SDK）两侧各有
-// 一份独立实例，`instanceof`、`Symbol` 私有标记、原型链判定**全部失效**，且失效是静默的——不抛错，只是
-// 分支走错。所以本接口的每个字段都必须是 JSON 可序列化的纯数据或普通函数：
-//   ✅ string / number / boolean / null / 纯对象 / 数组 / 函数
-//   ❌ zod schema、class 实例、Error 子类、Date 以外的库对象、带原型语义的任何东西
-// 传错的代价不是崩溃而是错判，比崩溃更难查。这条是硬约束，不是建议。
+// -- Only plain data and functions cross this boundary --
+// An extension pack lives in **another repository with its own node_modules** (a peer checkout). The
+// same library (zod / yaml / an SDK) exists as two independent instances, one per side, so
+// `instanceof`, private `Symbol` markers and prototype-chain checks **all stop working** — and they
+// stop working silently: nothing throws, the branch is simply taken wrongly. Every field on this
+// interface must therefore be JSON-serialisable plain data or an ordinary function:
+//   OK:  string / number / boolean / null / plain objects / arrays / functions
+//   NOT: zod schemas, class instances, Error subclasses, library objects other than Date, anything
+//        carrying prototype semantics
+// The cost of getting this wrong is a wrong decision rather than a crash, which is harder to find
+// than a crash. This is a hard constraint, not advice.
 //
-// ── 非目标（刻意不做，别加）──
-// · **不提供 MessagingPort 覆盖**：messaging 的选择点在模块加载期同步求值（messaging/index.ts），而扩展包是
-//   异步 `import()` 装入的，时序上根本接不上。要换 IM provider，正确做法是在 messaging/ 下写一个实现
-//   MessagingPort 的 adapter——那本来就一行不用改核心。硬塞一个「有时生效」的覆盖比没有更糟。
-//   （**文档源不在此列**：docs 的注册表是每次调用现查的，不存在这个时序问题 → 见下面的 docSources。）
-// · **不提供状态机改写**：状态与合法转移表（statemachine/）是这套治理流水线的公开契约与安全红线
-//   （例：GATE_C_STALLED 只能回到 GATE_C_REVISION_REQUESTED——CI 没绿绝不放行开 PR）。允许下游改它
-//   等于允许下游拆掉护栏。要新增闸门请到上游提 issue。
+// -- Non-goals (deliberately absent; do not add) --
+// · **No MessagingPort override.** The messaging selection point is evaluated synchronously at module
+//   load (messaging/index.ts), while an extension pack is loaded by an asynchronous `import()`, so
+//   the timing simply does not line up. The right way to swap IM provider is to write an adapter
+//   under messaging/ implementing MessagingPort — which already requires no core change at all.
+//   Forcing in an override that "sometimes applies" would be worse than having none.
+//   (**Document sources are not in this category**: the docs registry is consulted on every call, so
+//   the timing problem does not arise -> see docSources below.)
+// · **No state machine rewriting.** The states and the legal transition table (statemachine/) are
+//   this pipeline's public contract and its safety red lines (for example: GATE_C_STALLED can only go
+//   back to GATE_C_REVISION_REQUESTED — a red CI never gets to open a PR). Letting downstream edit
+//   that is letting downstream remove the guardrails. New gates go through an issue upstream.
 import type { State } from '../statemachine/states.ts';
-// 经 docs/index.ts 取类型（那是文档层的唯一接线处；架构闸不允许核心直连某个具体源）。
+// Types come via docs/index.ts (the single wiring point of the document layer; the architecture gate
+// forbids the core from importing a concrete source directly).
 import type { DocSource } from '../docs/index.ts';
 
-// 扩展命令的执行上下文：核心已解析好的参数，不含任何核心内部对象（见上「只传纯数据」）。
+// Execution context of an extension command: arguments the core has already parsed, carrying no core
+// internals whatsoever (see "only plain data" above).
 export interface ExtCommandContext {
-  argv: string[]; // 命令名之后的原始参数（未解析，扩展想自己解析时用）
-  pos: string[]; // 位置参数
-  flags: Record<string, string | boolean>; // `--k v` → string；`--k` → true
+  argv: string[]; // raw arguments after the command name (unparsed, for packs that parse their own)
+  pos: string[]; // positional arguments
+  flags: Record<string, string | boolean>; // `--k v` -> string; `--k` -> true
 }
 
-// 一条扩展 CLI 命令。名字不得与核心命令冲突（冲突时核心永远优先，见 ext/index.ts 的去重）。
+// One extension CLI command. The name must not collide with a core command (on collision the core
+// always wins — see the de-duplication in ext/index.ts).
 export interface ExtCommand {
   name: string;
-  summary: string; // `forge help` 里显示的一行说明
+  summary: string; // the one-line description shown by `forge help`
   run(ctx: ExtCommandContext): Promise<void> | void;
 }
 
-// 一次状态流转。核心在 **SessionStore.transition() 成功之后**发出（失败的转移不发）。
+// One state transition. The core emits it **after SessionStore.transition() succeeds** (a failed
+// transition emits nothing).
 export interface TransitionEvent {
   id: string; // session id
-  from: State | null; // 转移前的状态；库里查不到旧态时为 null（并发/首次建单）
+  from: State | null; // state before the transition; null when the old state is not in the DB (a race, or a first-time record)
   to: State;
   at: number; // epoch ms
 }
 
 export interface TickEvent {
   at: number; // epoch ms
-  processed?: number; // onTickEnd 才有：本轮实际推进的 session 数
-  ok?: boolean; // onTickEnd 才有：本轮 tick 是否正常结束（抛错时为 false）
+  processed?: number; // onTickEnd only: how many sessions this round actually advanced
+  ok?: boolean; // onTickEnd only: whether the tick ended normally (false when it threw)
 }
 
-// 生命周期钩子。**全部是通知，不是拦截**——返回值被忽略，抛错被吞掉并记 warn，永远不改变核心行为。
-// 这是刻意的：钩子能否决核心动作的那一刻，下游就能把治理护栏关掉，接缝也就失去了意义。
-// 每个钩子有独立超时（见 ext/index.ts HOOK_TIMEOUT_MS），卡住的钩子不会拖住 gate 推进。
+// Lifecycle hooks. **All of them notify; none of them intercept** — return values are ignored, a
+// throw is swallowed and logged as a warning, and core behaviour never changes as a result.
+// That is deliberate: the moment a hook can veto a core action, downstream can switch the governance
+// guardrails off, and the seam has lost its point.
+// Each hook has its own timeout (see HOOK_TIMEOUT_MS in ext/index.ts), so a hung hook cannot hold up
+// gate progress.
 export interface LifecycleHooks {
   onTransition?(e: TransitionEvent): Promise<void> | void;
   onTickStart?(e: TickEvent): Promise<void> | void;
   onTickEnd?(e: TickEvent): Promise<void> | void;
 }
 
-// 下游扩展包的默认导出。
+// The default export of a downstream extension pack.
 export interface ExtensionPack {
-  name: string; // 出现在 `forge doctor` 里，便于确认「到底装上了没有」
+  name: string; // shown by `forge doctor`, so "did it actually load" is answerable
   commands?: ExtCommand[];
   hooks?: LifecycleHooks;
-  // 下游自己的文档源（Notion / Confluence / 内部 wiki / GitHub 上的 md…）。
-  // 核心自带的只有飞书文档与 plaintext 兜底源；不给这个口子，接自家文档系统就只能改
-  // docs/index.ts 那个数组——正是本接缝存在要消灭的那件事。
+  // Downstream's own document sources (Notion / Confluence / an internal wiki / markdown on GitHub…).
+  // The core ships only the Feishu document source and the plaintext fallback; without this opening,
+  // plugging in your own document system means editing that array in docs/index.ts — precisely the
+  // thing this seam exists to eliminate.
   //
-  // 三条规矩（见 docs/index.ts mergeSources，且都有用例守着）：
-  //  · **核心源永远优先**：id 与核心撞车时忽略扩展那份（同「核心命令永远优先」）；
-  //  · 兜底源（`fallback:true`）按注册顺序定先后，核心在前——两个兜底源同时活着会出一条 warn；
-  //  · 落库的 `doc_ref` 是 `<source>:<token>`，**活得比扩展包久**：包被摘掉之后 readDoc 会如实报
-  //    「未注册的文档源」，绝不退化成静默的读失败。所以源 id 一旦上线就别再改。
+  // Three rules (see mergeSources in docs/index.ts; each has a test guarding it):
+  //  · **Core sources always win**: an id colliding with a core one means the extension's copy is
+  //    ignored (the same rule as "core commands always win").
+  //  · Fallback sources (`fallback:true`) are ordered by registration with core first — two live
+  //    fallback sources emit a warning.
+  //  · The persisted `doc_ref` is `<source>:<token>` and **outlives the pack**: once the pack is
+  //    removed, readDoc reports "unregistered document source" faithfully and never degrades into a
+  //    silent read failure. So do not change a source id once it has shipped.
   docSources?: DocSource[];
 }
