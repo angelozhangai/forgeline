@@ -1,8 +1,13 @@
-// 闸C「实现⇄CI」循环：复用 reviewFixLoop 引擎，但 **reviewer = 确定性 CI/验收**（非 codex）：
-//  · review() = 在 worktree 跑委托 CI（forge-ci.sh）。绿→LGTM；红/未实现→CHANGES（findings=失败摘要）。
-//  · fix()    = claude 在 worktree 改文件（cwd=worktree）+ forge 落提交（claude 只写码、forge 拥有 git）。
-//  · 被对抗的产物是 worktree 状态：diff/CI 由 forge 现场重建（git/CI），绝不从模型输出解析代码。
-// 复用引擎 → 自动获得：轮次/每-tick 上限/needs_human 升级/到上限停泊/改方解析自愈/残留落库。
+// The Gate C "implement / CI" loop: it reuses the reviewFixLoop engine, but **the reviewer is deterministic
+// CI and acceptance** rather than codex:
+//  - review() runs the project's delegated CI inside the worktree. Green -> LGTM; red or not-yet-implemented ->
+//    CHANGES_REQUESTED (with the failure summary as the findings).
+//  - fix() has claude edit files inside the worktree (cwd = worktree) and forge makes the commit (claude only
+//    writes code; forge owns git).
+//  - The artifact under adversarial review is the worktree state: the diff and the CI result are rebuilt on the
+//    spot by forge (through git and CI), never parsed as code out of the model's output.
+// Reusing the engine gives all of this for free: round counting, the per-tick cap, needs_human escalation,
+// parking at the cap, self-healing when the revision output does not parse, and persisting the residue.
 import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { writeFileSync } from 'node:fs';
@@ -11,7 +16,7 @@ import { strictParse } from '../llm/structured.ts';
 import { loadConfig } from '../config.ts';
 import { log } from '../util/log.ts';
 import { store } from '../store/index.ts';
-const { patch, get, appendEvent } = store; // 经 SessionStore 接缝取本地实现方法（自由函数无 this，解构安全）
+const { patch, get, appendEvent } = store; // take the local implementation methods through the SessionStore seam (free functions have no `this`, so destructuring is safe)
 import { GateCFixResultSchema, GATE_C_FIX_CONTRACT, parseHumanAsks, findingsToMd } from './envelopes.ts';
 import type { ImplEnvelope } from './envelopes.ts';
 import { persistGateC, readImplEnvelope, gateCContext } from './gateC.ts';
@@ -22,13 +27,17 @@ import { runReviewFixLoop } from '../review/reviewFixLoop.ts';
 import type { ReviewFixConfig, ReviewFixDrivers, ReviewFixOutcome, ReviewVerdict } from '../review/reviewFixLoop.ts';
 import type { Session } from '../types.ts';
 
-// CI affected 的 base：优先 **pin 住的 base_sha**（worktree 即 pin 在此 sha）；base_ref 仅兜底。
-// 绝不默认用移动 ref base_ref=origin/<branch>——并发 refresh() 推进它时 affected 会按未来基线算 → 误测/漏测/假绿（Codex B2）。导出供单测。
+// The base for CI's affected computation: prefer the **pinned base_sha** (the worktree is pinned at exactly
+// that sha); base_ref is only a fallback.
+// It must never default to the moving ref base_ref=origin/<branch> - when a concurrent refresh() advances it,
+// "affected" is computed against a future baseline, which tests the wrong things, skips others, and can go
+// falsely green (Codex B2). Exported for unit tests.
 export function ciBase(env: Pick<ImplEnvelope, 'base_sha' | 'base_ref'>): string | undefined {
   return env.base_sha || env.base_ref || undefined;
 }
 
-// CI 驱动产出的状态文本 → ReviewVerdict（确定性，绝不抛——故不走 schema 自愈）。导出供单测。
+// The status text produced by the CI driver -> a ReviewVerdict (deterministic and never throws, which is why
+// it does not go through the schema self-healing path). Exported for unit tests.
 export function ciTextToVerdict(text: string): ReviewVerdict {
   let o: { state?: string; summary?: string };
   try {
@@ -48,11 +57,11 @@ function gateCConfig(s: Session): ReviewFixConfig<ImplEnvelope> {
   const cfg = loadConfig();
   const max = Math.max(1, cfg.runtime.gate_c?.max_rounds ?? 4);
   const perTick = Math.max(1, Math.min(max, cfg.runtime.gate_c?.max_rounds_per_tick ?? 1));
-  const cur = async (): Promise<Session> => (await get(s.id))!; // 每次现读 DB（get 现 async）
+  const cur = async (): Promise<Session> => (await get(s.id))!; // read the DB fresh each time (get is async now)
   const pid = projectForSession(s).id;
 
   return {
-    label: '闸C 实现',
+    label: 'Gate C implementation',
     maxRounds: max,
     maxRoundsPerTick: perTick,
     maxParseRepairRetries: Math.max(0, cfg.runtime.parse_repair_retries ?? 2),
@@ -62,10 +71,10 @@ function gateCConfig(s: Session): ReviewFixConfig<ImplEnvelope> {
     setRound: async (n) => {
       await patch(s.id, { gate_c_round: n });
     },
-    // CI 是 reviewer——无状态、无会话，两个 reviewer-session 钩子 no-op。
+    // CI is the reviewer - stateless and session-less, so both reviewer-session hooks are no-ops.
     getReviewerSession: async () => null,
     setReviewerSession: async () => {
-      /* CI 无会话 */
+      /* CI has no session */
     },
     getFixerSession: async () => (await cur()).gate_c_fixer_session,
     setFixerSession: async (id) => {
@@ -94,18 +103,19 @@ function gateCConfig(s: Session): ReviewFixConfig<ImplEnvelope> {
       await patch(s.id, { gate_c_pending_input: null, gate_c_human_asks: null });
       await appendEvent(s.id, 'gatec_human_answer_consumed', { round: c.gate_c_round });
     },
-    // CI reviewer 不吃 prompt（driver 忽略）。纯构造器保持同步。
+    // The CI reviewer takes no prompt (the driver ignores it). The pure constructors stay synchronous.
     buildInitialReviewPrompt: () => '',
     buildResumeReviewPrompt: () => '',
     parseVerdict: (text) => ciTextToVerdict(text),
-    // 纯构造器保持同步：用进入循环时的 session 快照 s（context/worktree_path 进 loop 前已定）。
+    // The pure constructors stay synchronous: they use the session snapshot `s` taken when the loop was
+    // entered (context and worktree_path are fixed before the loop).
     buildInitialFixPrompt: (findings, humanAnswer) => {
       const base = render(loadPrompt('gate-c-implement.md', pid), {
         CONTEXT: gateCContext(s),
         FINDINGS: findingsToMd(findings),
         WORKTREE: s.worktree_path ?? '',
       });
-      return humanAnswer ? `${humanAnswer}\n\n---\n\n${base}` : base; // 防御：首轮一般无人工答复
+      return humanAnswer ? `${humanAnswer}\n\n---\n\n${base}` : base; // defensive: the first round normally has no human answer
     },
     buildResumeFixPrompt: (findings, humanAnswer) =>
       render(loadPrompt('gate-c-fix-resume.md', pid), {
@@ -116,8 +126,10 @@ function gateCConfig(s: Session): ReviewFixConfig<ImplEnvelope> {
     parseFixResult: (text) => {
       try {
         const r = strictParse(GateCFixResultSchema, text);
-        // 重建信封：claude 改了 worktree 文件（代码不在 text 里），diff/files 从 git 现场读。
-        // 同步解析钩子：用 session 快照 s 读信封（draft_path 进 loop 前已定，循环内不变）。
+        // Rebuild the envelope: claude edited files in the worktree (the code is not in `text`), so the diff
+        // and the file list are read live from git.
+        // This parse hook is synchronous: it reads the envelope through the session snapshot `s` (draft_path is
+        // fixed before the loop and does not change inside it).
         const env = readImplEnvelope(s);
         const wt = env.worktree_path;
         const merged: ImplEnvelope = {
@@ -129,8 +141,8 @@ function gateCConfig(s: Session): ReviewFixConfig<ImplEnvelope> {
         };
         return { artifact: merged, needsHuman: r.needs_human };
       } catch (e) {
-        log.warn(`闸C 改方输出解析失败 → 交引擎自愈/停泊：${String(e).slice(0, 160)}`);
-        return null; // 引擎据此先 resume 回喂重出，耗尽才停泊（绝不静默放行）
+        log.warn(`Gate C revision output failed to parse -> handing it to the engine to self-heal or park: ${String(e).slice(0, 160)}`);
+        return null; // the engine self-heals first (resume and feed back for a re-emit) and only parks once exhausted (never let it through silently)
       }
     },
     persistResidual: async (round, used, findings) => {
@@ -147,75 +159,86 @@ function gateCDrivers(s: Session): ReviewFixDrivers {
     try {
       writeFileSync(resolve(sessionLogDir(s.id), name), raw);
     } catch {
-      /* 落盘失败不阻断 */
+      /* a failed dump must not block the flow */
     }
   };
   return {
     review: async () => {
       const env = readImplEnvelope(await cur());
       const wt = env.worktree_path;
-      // base 后无提交 = 尚未实现 → 不跑 CI，直接判「未实现」逼 claude 动工。
+      // No commits after base means nothing has been implemented yet -> skip CI and return "unimplemented"
+      // outright, which forces claude to start working.
       if (!hasCommitsSince(wt, env.base_sha)) {
         return { ok: true, text: JSON.stringify({ state: 'unimplemented' }), sessionId: null, available: true, used: 'ci' };
       }
       const ciScript = proj.scripts.ci ? resolve(wt, proj.scripts.ci) : undefined;
       const ci = await runCi(wt, ciScript, {
-        base: ciBase(env), // pin sha 优先，绝不用移动 ref（Codex B2，见 ciBase）
+        base: ciBase(env), // the pinned sha wins; never a moving ref (Codex B2, see ciBase)
         timeoutMs: (loadConfig().runtime.gate_c?.ci_timeout_sec ?? 1800) * 1000,
       });
       dump('gatec-ci.raw.txt', ci.summary);
-      // 信封 CI 字段刷新（展示，best-effort）。
+      // Refresh the envelope's CI fields (for display, best-effort).
       try {
         await persistGateC(await cur(), { ...env, ci_ok: ci.ok, ci_summary: ci.summary.slice(0, 2000), implemented: true, diff_stat: diffStatSince(wt, env.base_sha) });
       } catch {
-        /* 展示刷新失败不阻断 */
+        /* a failed display refresh must not block the flow */
       }
-      // CI 跑不起来（脚本缺失/spawn 失败/超时）= 基础设施错 → ok:false 上抛停泊（绝不当成红让 claude 白改）。
+      // CI failing to run at all (a missing script, a spawn failure, a timeout) is an infrastructure error ->
+      // return ok:false so it propagates up and parks (never treat it as a red result and send claude off to
+      // fix nothing).
       if (!ci.ran) {
         return { ok: false, text: '', sessionId: null, available: true, used: 'ci', error: ci.summary };
       }
-      // CI 绿但 worktree 被 CI 自身改脏（codegen/format 改了 tracked 文件）→ CI 验的是 HEAD+脏、而产物/PR 是 HEAD，
-      // 「CI 绿」对 HEAD 是假阳性 → 当基础设施/契约错停泊（CI 不应改 tracked 文件，同闸D Blocker）。
+      // CI went green but CI itself dirtied the worktree (codegen or formatting touched tracked files) -> what
+      // CI verified was HEAD-plus-dirt, while the artifact and the PR are HEAD, so "CI green" is a false
+      // positive for HEAD. Park it as an infrastructure/contract error (CI must not modify tracked files - the
+      // same blocker Gate D enforces).
       if (ci.ok && !worktreeClean(wt)) {
-        // 展示纠偏：上面按 ci.ok 把信封刷成了 ci_ok:true，但对 HEAD 是假阳性 → 改回 false 并标注，免停泊后排障误导（Codex SF）。
+        // Correct the display: the refresh above set ci_ok:true from ci.ok, but that is a false positive for
+        // HEAD -> set it back to false and say why, so the parked session does not mislead whoever debugs it
+        // (Codex SF).
         try {
-          await persistGateC(await cur(), { ...env, ci_ok: false, ci_summary: `green-but-dirty rejected（CI 绿但改脏了 worktree，CI 不应改 tracked 文件）：${ci.summary.slice(0, 1800)}`, implemented: true });
+          await persistGateC(await cur(), { ...env, ci_ok: false, ci_summary: `green-but-dirty rejected (CI went green but dirtied the worktree; CI must not modify tracked files): ${ci.summary.slice(0, 1800)}`, implemented: true });
         } catch {
-          /* 展示刷新失败不阻断 */
+          /* a failed display refresh must not block the flow */
         }
-        return { ok: false, text: '', sessionId: null, available: true, used: 'ci', error: `CI 绿但改脏了 worktree（CI 不应改 tracked 文件）：${ci.summary.slice(0, 200)}` };
+        return { ok: false, text: '', sessionId: null, available: true, used: 'ci', error: `CI went green but dirtied the worktree (CI must not modify tracked files): ${ci.summary.slice(0, 200)}` };
       }
       return { ok: true, text: JSON.stringify({ state: ci.ok ? 'green' : 'ci_red', summary: ci.summary }), sessionId: null, available: true, used: 'ci' };
     },
     fix: async (prompt, opts) => {
       const wt = (await cur()).worktree_path ?? proj.root;
-      // 下游整写代码远重于上游审文档 → 单调用超时用 gate_c.claude_timeout_sec（缺省回退全局）。
+      // Writing code downstream is far heavier than reviewing a document upstream, so the per-call timeout
+      // comes from gate_c.claude_timeout_sec (falling back to the global value when unset).
       const timeoutSec = loadConfig().runtime.gate_c?.claude_timeout_sec;
       let sid = opts.sessionId;
       let res: Awaited<ReturnType<typeof runClaude>>;
       if (sid) {
-        res = await runClaude(prompt, { label: '闸C·实现', resume: sid, cwd: wt, timeoutSec });
+        res = await runClaude(prompt, { label: 'Gate C · implement', resume: sid, cwd: wt, timeoutSec });
       } else {
-        sid = randomUUID(); // pin 新会话，便于续做 resume
-        res = await runClaude(prompt, { label: '闸C·实现', sessionId: sid, cwd: wt, timeoutSec });
+        sid = randomUUID(); // pin a new session so the work can be resumed
+        res = await runClaude(prompt, { label: 'Gate C · implement', sessionId: sid, cwd: wt, timeoutSec });
       }
       dump('gatec-fix.raw.txt', res.raw ?? '');
       if (res.ok) {
-        // claude 只写码 → forge 落一个 WIP 提交（拥有 git）。--no-verify 跳目标项目 husky（真闸是 forge-ci.sh）。
+        // claude only writes code, so forge makes a WIP commit (forge owns git). --no-verify skips the target
+        // project's own pre-commit hooks - the real gate is the project's CI script.
         const round = ((await cur()).gate_c_round ?? 0) + 1;
-        const cm = commitWorktree(wt, `forge(闸C ${s.slug}): round ${round}`);
+        const cm = commitWorktree(wt, `forge(gate C ${s.slug}): round ${round}`);
         await appendEvent(s.id, 'gatec_commit', { ok: cm.ok, committed: cm.committed, output: cm.output.slice(0, 160) });
         if (res.costUsd != null) await patch(s.id, { gate_c_cost_usd: ((await cur()).gate_c_cost_usd ?? 0) + res.costUsd });
-        // 提交失败/worktree 脏 → 抛停泊：否则 reviewer 的 CI 验的是脏 working tree、而非 HEAD（同闸D Blocker）。
-        if (!cm.ok) throw new Error(`闸C 落提交失败 → 停泊（worktree 可能脏）：${cm.output.slice(0, 200)}`);
-        if (!worktreeClean(wt)) throw new Error('闸C 提交后 worktree 仍非 clean → 停泊（CI 须验 HEAD，不验脏树）');
+        // A failed commit or a dirty worktree throws and parks: otherwise the reviewer's CI would verify a
+        // dirty working tree rather than HEAD (the same blocker Gate D enforces).
+        if (!cm.ok) throw new Error(`Gate C failed to make the commit -> parking (the worktree may be dirty): ${cm.output.slice(0, 200)}`);
+        if (!worktreeClean(wt)) throw new Error('the Gate C worktree is still not clean after the commit -> parking (CI must verify HEAD, not a dirty tree)');
       }
       return { ok: res.ok, text: res.result, sessionId: res.ok ? sid : null, costUsd: res.costUsd, error: res.error };
     },
   };
 }
 
-// 跑一段闸C 实现⇄CI 循环（worker 在 GATE_C_LOOP / GATE_C_REVISION_REQUESTED 调），返回结论交 worker 转移。
+// Run a stretch of the Gate C implement/CI loop (the worker calls this in GATE_C_LOOP /
+// GATE_C_REVISION_REQUESTED) and return the conclusion for the worker to transition on.
 export function runGateCLoop(s: Session): Promise<ReviewFixOutcome> {
   return runReviewFixLoop(gateCConfig(s), gateCDrivers(s));
 }

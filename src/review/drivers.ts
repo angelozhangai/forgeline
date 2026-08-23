@@ -10,29 +10,34 @@ import { projectForSession } from '../projects.ts';
 import type { ReviewFixDrivers } from './reviewFixLoop.ts';
 import type { Session } from '../types.ts';
 
-// codex审⇄claude改 真实驱动的参数化：闸A/闸B 仅这些点不同（label / 落盘名 / on_missing=skip 日志 /
-// 成本累加列 / codex-token 列）。列特定的写库用回调注入——保持「列知识」在各 gate 模块、避开 computed-key
-// 的 TS 摩擦，工厂体本身完全 product-agnostic。
+// Parameterisation of the real codex-reviews / claude-revises drivers: Gate A and Gate B differ only in these
+// points (the label, the dump filename, the on_missing=skip log line, which cost column accrues, and which
+// codex-token column is written).
+// The column-specific database writes are injected as callbacks, which keeps that "column knowledge" in each
+// gate's own module, avoids TypeScript friction with computed keys, and leaves the factory body entirely
+// product-agnostic.
 export interface ReviewFixDriverOpts {
-  reviewLabel: string; // codex 复审标签（'闸A·对抗'）
-  reviewClaudeLabel: string; // claude 降级自审标签（'闸A·对抗·claude'）
-  fixLabel: string; // claude 改方标签（'闸A·改评审'）
-  reviewDumpName: string; // 复审原文落盘名（'gate-a-review.raw.txt'）
-  fixDumpName: string; // 改方原文落盘名（'gate-a-fix.raw.txt'）
-  skipLog: string; // on_missing=skip 时的日志（'…→ 跳过闸A 对抗复审'）
-  accrueFixCost: (costUsd: number) => void; // 累加 claude 改方成本到本 gate 的成本列
-  persistReviewerTokens?: (tokensJson: string) => void; // codex token 用量落列（仅闸B；codex 无美元口径）
+  reviewLabel: string; // the codex review label ('Gate A · adversarial')
+  reviewClaudeLabel: string; // the label for the degraded claude self-review ('Gate A · adversarial · claude')
+  fixLabel: string; // the claude revision label ('Gate A · revise the review')
+  reviewDumpName: string; // the filename the raw review output is dumped to ('gate-a-review.raw.txt')
+  fixDumpName: string; // the filename the raw revision output is dumped to ('gate-a-fix.raw.txt')
+  skipLog: string; // the log line for on_missing=skip ('… -> skipping the Gate A adversarial review')
+  accrueFixCost: (costUsd: number) => void; // accrue the claude revision cost into this gate's cost column
+  persistReviewerTokens?: (tokensJson: string) => void; // persist codex's token usage into its column (Gate B only; codex has no dollar figure)
 }
 
-// 真实驱动工厂：reviewer=codex（thread_id resume；on_missing 降级 claude 自审 / skip / error），
-// fixer=claude（pin session 续修）。抽这一处后，gateALoop/gateBLoop 不再各拷一份近 50 行近同的驱动。
+// The real driver factory: the reviewer is codex (resuming by thread_id; on_missing degrades to a claude
+// self-review, or skips, or errors) and the fixer is claude (with a pinned session for resumed revisions).
+// With this extracted, gateALoop and gateBLoop no longer each carry their own near-identical 50 lines of
+// driver code.
 export function makeReviewFixDrivers(s: Session, o: ReviewFixDriverOpts): ReviewFixDrivers {
-  const proj = projectForSession(s); // 目标项目根：codex/claude 都以它为 cwd（读代码真源 + PRD）
+  const proj = projectForSession(s); // the target project root: both codex and claude use it as cwd (to read the source of truth in the code, and the PRD)
   const dumpRaw = (name: string, raw: string): void => {
     try {
-      writeFileSync(resolve(sessionLogDir(s.id), name), raw); // 失败/解析失败时人核对的原文
+      writeFileSync(resolve(sessionLogDir(s.id), name), raw); // the raw output a human checks when something fails or does not parse
     } catch {
-      /* 落盘失败不阻断流程 */
+      /* a failed dump must not block the flow */
     }
   };
   return {
@@ -50,21 +55,26 @@ export function makeReviewFixDrivers(s: Session, o: ReviewFixDriverOpts): Review
             log.warn(o.skipLog);
             return { ok: false, text: '', sessionId: null, available: false, used: 'codex' };
           }
-          if (cfg.runtime.adversarial.on_missing === 'error') throw new Error('codex 不可用且 on_missing=error');
-          log.warn('codex 未安装，降级用 claude 自审（独立性弱，装上 codex 自动切回）');
+          if (cfg.runtime.adversarial.on_missing === 'error') throw new Error('codex is unavailable and on_missing=error');
+          log.warn('codex is not installed; degrading to a claude self-review (weaker independence — install codex and it switches back automatically)');
         } else {
-          log.warn(`codex 复审失败（${c.error}），降级用 claude`);
+          log.warn(`The codex review failed (${c.error}); degrading to claude`);
         }
       }
-      // claude 自审降级（无会话续接，每轮重发——独立性弱，仅 codex 缺失时兜底）。失败**不再按通过**：available=true+ok=false 上抛停泊。
-      // 【为何不 resume 省 token】引擎只有一个 reviewer-session 槽，codex 路径把它当 codex thread_id 续接。
-      // 若让 claude 兜底也 pin/resume 自己的 session 存进该槽，下一轮 codex 路径会拿 claude session 当 thread_id 误用
-      // （codex 偶发失败回到这里时尤甚）。安全的续接要么加第二个 claude-reviewer 槽、要么持久化「reviewer 模式」——
-      // 对一个 README 已建议「装上 codex 即自动切回」的降级路径而言，这点 token 省不值得给核心引擎加状态。故保持每轮重发。
+      // The degraded claude self-review (no session continuation, so every round resends — weaker
+      // independence, used only as a fallback when codex is missing). A failure is **no longer treated as
+      // approved**: available=true with ok=false propagates up and parks.
+      // [Why it does not resume to save tokens] The engine has a single reviewer-session slot, and the codex
+      // path uses it as a codex thread_id. If the claude fallback also pinned and resumed its own session in
+      // that slot, the next round's codex path would misuse a claude session as a thread_id — especially
+      // likely when codex fails intermittently and control returns here. Safe continuation would need either a
+      // second claude-reviewer slot or a persisted "reviewer mode", and for a degraded path whose README
+      // already says "install codex and it switches back automatically", that token saving is not worth adding
+      // state to the core engine. So it resends every round.
       const r = await runClaude(prompt, { label: o.reviewClaudeLabel, cwd: proj.root });
       dumpRaw(o.reviewDumpName, r.raw ?? '');
       if (!r.ok) {
-        log.warn(`claude 复审失败（${r.error}）→ 上抛停泊，绝不静默放行`);
+        log.warn(`The claude review failed (${r.error}) -> propagating up to park; never let it through silently`);
         return { ok: false, text: '', sessionId: null, available: true, used: 'claude', error: r.error };
       }
       return { ok: true, text: r.result, sessionId: null, available: true, used: 'claude' };
@@ -75,11 +85,11 @@ export function makeReviewFixDrivers(s: Session, o: ReviewFixDriverOpts): Review
       if (sid) {
         res = await runClaude(prompt, { label: o.fixLabel, resume: sid, cwd: proj.root });
       } else {
-        sid = randomUUID(); // pin 新会话，便于后续续修 resume
+        sid = randomUUID(); // pin a new session so later revisions can resume it
         res = await runClaude(prompt, { label: o.fixLabel, sessionId: sid, cwd: proj.root });
       }
       dumpRaw(o.fixDumpName, res.raw ?? '');
-      if (res.ok && res.costUsd != null) o.accrueFixCost(res.costUsd); // 累加，不覆盖初稿/评审成本
+      if (res.ok && res.costUsd != null) o.accrueFixCost(res.costUsd); // accrue rather than overwrite the first-draft and review costs
       return { ok: res.ok, text: res.result, sessionId: res.ok ? sid : null, costUsd: res.costUsd, error: res.error };
     },
   };

@@ -1,14 +1,22 @@
-// 闸D 测试补强（GATE_D_HARDENING）：codex LGTM 后的最后一道——claude 补**内环**测试（失败/权限/并发路径，
-// 杜绝镜像测试）+ 本地 CI 必须再次全绿 → 生成 merge-readiness 报告 → 推分支 → worker 置 AWAITING_HUMAN_MERGE。
+// Gate D test hardening (GATE_D_HARDENING): the last step after codex says LGTM - claude adds **inner-loop**
+// tests (failure, permission and concurrency paths, with no mirror tests) and the local CI must go fully green
+// again -> generate the merge-readiness report -> push the branch -> the worker moves to AWAITING_HUMAN_MERGE.
 //
-// 不变量（沿用闸D fix 那套，且更省一层）：
-// - 被补强的产物是 worktree 状态；diff/CI 由 forge 现场重建，绝不解析模型输出的代码。
-// - **CI 验的对象 == 被 push 的对象**：commit-before-CI、CI 前后皆 clean、红则有限轮自修。
-// - **绿态基线 = 闸D LGTM 时 pin 的不可变 sha**（worker.afterGateD 落 gate_d_green_sha）：补强前 `reset --hard <green-sha>`
-//   丢弃上轮中途死/失败残留的补强改动——故重入幂等。**绝不用移动 ref origin/<branch>**（陈旧/缺失/被 force-push 会让
-//   harden/CI/push 的对象 ≠ 被 codex 审过的对象，Codex M4 Blocker）。
-// - **CI 绿前任何失败一律回滚到绿态基线再停泊**；CI 绿确认后 pin 下 gate_d_harden_verified_sha 锁定该提交，此后写报告
-//   （forge 本地决策文档，非 PR 产物）+ 推**代码**提交，失败不回滚（绝不丢已验证工作）。幂等收尾只在「HEAD 仍 == verified_sha 且干净」时补推（绝不盲推未验证对象，Codex M4 SF）。
+// Invariants (the same set Gate D's fix uses, with one fewer layer):
+// - The artifact being hardened is the worktree state; the diff and the CI result are rebuilt on the spot by
+//   forge, never parsed as code out of the model's output.
+// - **What CI verified == what gets pushed**: commit before CI, clean both before and after CI, and a bounded
+//   number of self-fix rounds when it is red.
+// - **The green baseline is the immutable sha pinned at Gate D's LGTM** (worker.afterGateD writes
+//   gate_d_green_sha): hardening starts with `reset --hard <green-sha>`, discarding any hardening edits left
+//   behind by a previous round that died or failed midway - which is what makes re-entry idempotent. It must
+//   **never use the moving ref origin/<branch>** (stale, missing or force-pushed, that would make what gets
+//   hardened, CI-verified and pushed differ from what codex reviewed - Codex blocker).
+// - **Any failure before CI goes green rolls back to the green baseline and then parks**; once CI green is
+//   confirmed, gate_d_harden_verified_sha pins that commit, and from then on writing the report (a forge-local
+//   decision document, not a PR artifact) and pushing the **code** commit do not roll back on failure (verified
+//   work is never thrown away). The idempotent finish only re-pushes while "HEAD is still == verified_sha and
+//   the tree is clean" - it never blindly pushes an unverified object (Codex SF).
 import { resolve } from 'node:path';
 import { randomUUID } from 'node:crypto';
 import { writeFileSync, mkdirSync } from 'node:fs';
@@ -19,7 +27,7 @@ import type { ImplEnvelope } from './envelopes.ts';
 import { loadConfig } from '../config.ts';
 import { log } from '../util/log.ts';
 import { store } from '../store/index.ts';
-const { patch, get, appendEvent } = store; // 经 SessionStore 接缝取本地实现方法（自由函数无 this，解构安全）
+const { patch, get, appendEvent } = store; // take the local implementation methods through the SessionStore seam (free functions have no `this`, so destructuring is safe)
 import { persistGateC, readImplEnvelope, gateCContext } from './gateC.ts';
 import { getLegs } from './legs.ts';
 import { runCi, hasCommitsSince, diffStatSince, changedFilesSince, commitWorktree, pushWorktree, worktreeClean, resetWorktree } from './ci.ts';
@@ -28,10 +36,12 @@ import { projectForSession } from '../projects.ts';
 import { runClaude } from '../llm/runClaude.ts';
 import type { Session } from '../types.ts';
 
-// 补强后「CI 红→自修」的有限轮数：超过仍红即停泊交人（绝不带红进合并就绪）。
+// How many bounded "CI is red -> fix it" rounds happen after hardening: once those are exhausted and it is
+// still red it parks for a human (a red state never reaches merge-ready).
 const MAX_HARDEN_CI_FIX_ATTEMPTS = 2;
 
-// 据 runtime.gate_d.harden 配置拼补强硬规则（喂进 gate-d-harden-tests.md 的 {{HARDEN_RULES}}）。
+// Assemble the hard hardening rules from the runtime.gate_d.harden configuration (fed into
+// gate-d-harden-tests.md as {{HARDEN_RULES}}).
 function hardenRules(): string {
   const h = loadConfig().runtime.gate_d?.harden;
   const rules: string[] = [];
@@ -42,65 +52,69 @@ function hardenRules(): string {
   return rules.join('\n');
 }
 
-// 残留未决意见（正常 LGTM 解析后 gate_d_residual 已清为 null → 「无」）。坏 JSON 容错为「无」。
+// Any residual unresolved findings (after a normal LGTM, gate_d_residual has been cleared to null -> "none").
+// Broken JSON is tolerated and also reads as "none".
 function residualNote(s: Session): string {
-  if (!s.gate_d_residual) return '- 无未决意见（codex 对抗复审零 Blocker）。';
+  const NONE = '- No unresolved findings (the codex adversarial review raised zero blockers).';
+  if (!s.gate_d_residual) return NONE;
   try {
     const r = JSON.parse(s.gate_d_residual) as { findings?: { severity?: string; issue?: string; where?: string }[] };
     const fs = r.findings ?? [];
-    if (fs.length === 0) return '- 无未决意见（codex 对抗复审零 Blocker）。';
-    return fs.slice(0, 12).map((f) => `- [${f.severity ?? '?'}] ${f.issue ?? ''}${f.where ? `（${f.where}）` : ''}`).join('\n');
+    if (fs.length === 0) return NONE;
+    return fs.slice(0, 12).map((f) => `- [${f.severity ?? '?'}] ${f.issue ?? ''}${f.where ? ` (${f.where})` : ''}`).join('\n');
   } catch {
-    return '- 无未决意见（codex 对抗复审零 Blocker）。';
+    return NONE;
   }
 }
 
-// 合并就绪报告 markdown（纯函数，便于单测）：事实性内容确定性拼装——绝不再过一遍 LLM（避免在「过了所有闸、只差出文档」处引入新失败点）。
+// The merge-readiness report markdown (a pure function, so it is easy to unit test): the factual content is
+// assembled deterministically and never passed through an LLM again - which avoids introducing a new failure
+// point at the very last step, where every gate has already passed and only the document is left.
 export function buildMergeReadiness(
   s: Session,
   env: ImplEnvelope,
   opts: { context: string; codexRound: number; hardenSummary: string },
 ): string {
   const files = env.files_changed ?? [];
-  return `# 合并就绪报告 · ${s.title || s.slug}
+  return `# Merge-readiness report · ${s.title || s.slug}
 
-> 本报告由 forge 闸D 生成。**严禁自动合并**——合并永远由人完成。请人工 review 关键 diff 后再合。
+> Generated by forge Gate D. **Automatic merging is forbidden** - merging is always done by a human. Please review the important parts of the diff yourself before merging.
 
-- PR：${s.pr_url ?? '（未记录）'}
-- 分支：${env.impl_branch} → ${s.branch}
-- 基线：${(env.base_sha ?? '').slice(0, 12) || '?'}（${env.base_ref ?? ''}）
+- PR: ${s.pr_url ?? '(not recorded)'}
+- Branch: ${env.impl_branch} -> ${s.branch}
+- Baseline: ${(env.base_sha ?? '').slice(0, 12) || '?'} (${env.base_ref ?? ''})
 
-## 需求 / 技术方案
+## Requirement / tech design
 
-${opts.context.slice(0, 4000) || '（无上下文）'}
+${opts.context.slice(0, 4000) || '(no context)'}
 
-## 改动概览
+## Change overview
 
 \`\`\`
-${env.diff_stat || '（无 diff stat）'}
+${env.diff_stat || '(no diff stat)'}
 \`\`\`
-${files.length ? `\n改动文件（${files.length}）：\n${files.map((f) => `- ${f}`).join('\n')}\n` : ''}
-## 对抗复审（codex 审 diff ⇄ claude 改）
+${files.length ? `\nFiles changed (${files.length}):\n${files.map((f) => `- ${f}`).join('\n')}\n` : ''}
+## Adversarial review (codex reviews the diff / claude revises)
 
-- 结论：通过（第 ${opts.codexRound} 轮 codex LGTM，本地 CI 全绿才推）。
+- Verdict: passed (codex said LGTM in round ${opts.codexRound}, and nothing is pushed until the local CI is fully green).
 
-## 测试补强（内环）
+## Test hardening (inner loop)
 
-- ${opts.hardenSummary || '已补内环测试（失败/权限/并发等关键路径），杜绝镜像测试。'}
-- 本地 CI：补强后全绿。
+- ${opts.hardenSummary || 'Inner-loop tests were added (failure, permission and concurrency paths among them), with no mirror tests.'}
+- Local CI: fully green after hardening.
 
-## 剩余风险 / Accepted Risk
+## Remaining risk / accepted risk
 
 ${residualNote(s)}
 
-## 回滚方案
+## Rollback plan
 
-- 合并后如需回滚：在 PR 合并页点 Revert，或 \`git revert -m 1 <merge-commit-sha>\` 另开 PR 回退。
+- To roll back after merging: click Revert on the merged PR page, or open a follow-up PR with \`git revert -m 1 <merge-commit-sha>\`.
 
-## 合并前/后必跑
+## Must run before and after merging
 
-- 目标项目 CI（forge-ci.sh affected，与 forge 本地所跑同一套）。
-- 合并到主干后建议跑一次受影响 e2e（按项目约定）。
+- The target project's CI (the same affected-scoped script forge ran locally).
+- After merging to the trunk, running the affected e2e suite once is recommended (per the project's own convention).
 `;
 }
 
@@ -123,7 +137,7 @@ function reportFileName(repo: string | null): string {
   return `merge-readiness.${safe}.md`;
 }
 
-// 落盘合并就绪报告，返回路径。
+// Write the merge-readiness report to disk and return its path.
 function writeMergeReadiness(s: Session, env: ImplEnvelope, opts: { codexRound: number; hardenSummary: string }): string {
   const proj = projectForSession(s);
   const dir = resolve(proj.deliveryDir, s.slug);
@@ -133,8 +147,10 @@ function writeMergeReadiness(s: Session, env: ImplEnvelope, opts: { codexRound: 
   return path;
 }
 
-// 跑测试补强（worker 在 GATE_D_HARDENING 调）。成功 → 落 merge_readiness_path + 推分支并返回（worker 据此置 AWAITING_HUMAN_MERGE）；
-// 任何失败抛 → worker 停泊 GATE_D_FAILED（planRetry 据 gate_d_harden_round>0 回 HARDENING 续补，重入幂等）。
+// Run the test hardening (the worker calls this in GATE_D_HARDENING). On success it writes
+// merge_readiness_path, pushes the branch and returns (the worker then moves to AWAITING_HUMAN_MERGE).
+// Any failure throws -> the worker parks at GATE_D_FAILED (planRetry sees gate_d_harden_round > 0 and returns
+// to HARDENING to continue, which is idempotent on re-entry).
 export async function runGateDHarden(s: Session): Promise<void> {
   const proj = projectForSession(s);
   const cur = async (): Promise<Session> => (await get(s.id))!;
@@ -147,101 +163,112 @@ export async function runGateDHarden(s: Session): Promise<void> {
     try {
       writeFileSync(resolve(sessionLogDir(s.id), name), raw);
     } catch {
-      /* 落盘失败不阻断 */
+      /* a failed dump must not block the flow */
     }
   };
 
-  // 绿态基线 = 闸D LGTM 时 pin 的不可变 sha（绝不用移动 ref）。缺失 → 拒绝在未知基线上补强。
+  // The green baseline is the immutable sha pinned at Gate D's LGTM (never a moving ref). If it is missing,
+  // refuse to harden on an unknown baseline.
   const greenSha = ((await cur()).gate_d_green_sha ?? '').trim();
-  if (!greenSha) throw new Error('闸D 补强：缺 pin 的绿态 sha（gate_d_green_sha）——拒绝在未知/移动基线上补强 → 停泊');
+  if (!greenSha) throw new Error('Gate D hardening: the pinned green sha (gate_d_green_sha) is missing - refusing to harden on an unknown or moving baseline -> parking');
 
-  // 幂等收尾 fast-path：补强已 CI 绿（verified_sha 在）且 HEAD 仍是那个被验证的提交且干净 → 只补推（绝不盲推未验证对象）。
-  // HEAD != verified（隔离树被改/残留/dead-tick）或脏 → 不走 fast-path，落到全量补强重来（reset 回 pin 绿态）。
+  // The idempotent-finish fast path: hardening already went CI-green (verified_sha is set), HEAD is still that
+  // verified commit, and the tree is clean -> just re-push (never blindly push an unverified object).
+  // If HEAD != verified (the isolated tree was modified, residue was left behind, or a tick died) or the tree is
+  // dirty, skip the fast path and fall through to a full re-hardening (resetting back to the pinned green sha).
   const verified = ((await cur()).gate_d_harden_verified_sha ?? '').trim();
   if ((await cur()).merge_readiness_path && verified && worktreeHeadSha(wt) === verified && worktreeClean(wt)) {
     const pushed = pushWorktree(wt);
     await appendEvent(s.id, 'gate_d_harden_pushed', { reused: true, ok: pushed.ok, head: verified.slice(0, 12) });
-    if (!pushed.ok) throw new Error(`闸D 补强：补推已验证提交失败：${pushed.output.slice(0, 200)}`);
+    if (!pushed.ok) throw new Error(`Gate D hardening: re-pushing the verified commit failed: ${pushed.output.slice(0, 200)}`);
     return;
   }
 
   const round = ((await cur()).gate_d_harden_round ?? 0) + 1;
-  // 进全量补强：先置位 harden_round（任何后续失败都让 planRetry 回 HARDENING）；清陈旧报告/已验证 sha（下面重新生成，绝不让旧 verified 触发 fast-path 误推）。
+  // Entering a full hardening pass: set harden_round first (so any later failure makes planRetry come back to
+  // HARDENING), and clear the stale report and verified sha (both are regenerated below - an old verified sha
+  // must never trigger the fast path and push the wrong thing).
   await patch(s.id, { gate_d_harden_round: round, merge_readiness_path: null, gate_d_harden_verified_sha: null });
 
-  // 规范化到 pin 的绿态 sha：丢弃上轮中途死/失败残留的补强改动（干净首入即 no-op）。
+  // Normalise to the pinned green sha: discard hardening edits left behind by a previous round that died or
+  // failed midway (on a clean first entry this is a no-op).
   const norm = resetWorktree(wt, greenSha);
   await appendEvent(s.id, 'gate_d_harden_reset', { to: greenSha.slice(0, 12), ok: norm.ok, output: norm.output.slice(0, 120) });
-  if (!norm.ok) throw new Error(`闸D 补强：规范化到绿态 ${greenSha.slice(0, 12)} 失败 → 停泊（绝不在残留树上补强）：${norm.output.slice(0, 160)}`);
+  if (!norm.ok) throw new Error(`Gate D hardening: normalising to the green sha ${greenSha.slice(0, 12)} failed -> parking (never harden on a tree with residue): ${norm.output.slice(0, 160)}`);
   const head = worktreeHeadSha(wt);
-  if (head !== greenSha) throw new Error(`闸D 补强：reset 后 HEAD(${head?.slice(0, 12) ?? '?'}) ≠ pin 绿态(${greenSha.slice(0, 12)}) → 停泊`);
-  const preHead = greenSha; // 回滚锚点 = pin 的绿态（不可变）
+  if (head !== greenSha) throw new Error(`Gate D hardening: after the reset, HEAD (${head?.slice(0, 12) ?? '?'}) is not the pinned green sha (${greenSha.slice(0, 12)}) -> parking`);
+  const preHead = greenSha; // the rollback anchor is the pinned green sha (immutable)
 
-  // CI 绿前任何失败 → 回滚到 pin 绿态再停泊（回滚失败也抛，下轮重入会再 reset 兜底）。
+  // Any failure before CI goes green -> roll back to the pinned green sha and park (a failed rollback throws
+  // too; the next re-entry resets again as a backstop).
   const rollback = async (): Promise<void> => {
     const r = resetWorktree(wt, preHead);
     await appendEvent(s.id, 'gate_d_harden_rollback', { to: preHead.slice(0, 12), ok: r.ok });
-    if (!r.ok) throw new Error(`闸D 补强回滚到 ${preHead.slice(0, 12)} 失败 → 停泊：${r.output.slice(0, 160)}`);
+    if (!r.ok) throw new Error(`Gate D hardening failed to roll back to ${preHead.slice(0, 12)} -> parking: ${r.output.slice(0, 160)}`);
   };
   const bail = async (msg: string): Promise<never> => {
     await rollback();
     throw new Error(msg);
   };
 
-  // claude 续接闸D 改方会话（同 worktree 上下文）补内环测试。补强同属下游重调用 → 用 gate_d.claude_timeout_sec（缺省回退全局）。
+  // claude resumes the Gate D revision session (same worktree context) to add the inner-loop tests. Hardening
+  // is another heavy downstream call, so it uses gate_d.claude_timeout_sec (falling back to the global value).
   const claudeTimeout = loadConfig().runtime.gate_d?.claude_timeout_sec;
   let sid = (await cur()).gate_d_fixer_session;
   const runStep = async (p: string): Promise<Awaited<ReturnType<typeof runClaude>>> => {
-    if (sid) return runClaude(p, { label: '闸D·补强', resume: sid, cwd: wt, timeoutSec: claudeTimeout });
+    if (sid) return runClaude(p, { label: 'Gate D · harden', resume: sid, cwd: wt, timeoutSec: claudeTimeout });
     sid = randomUUID();
     await patch(s.id, { gate_d_fixer_session: sid });
-    return runClaude(p, { label: '闸D·补强', sessionId: sid, cwd: wt, timeoutSec: claudeTimeout });
+    return runClaude(p, { label: 'Gate D · harden', sessionId: sid, cwd: wt, timeoutSec: claudeTimeout });
   };
 
   let res = await runStep(
     render(loadPrompt('gate-d-harden-tests.md', pid), {
       WORKTREE: wt,
-      DIFF_STAT: env.diff_stat || '（无 diff stat）',
+      DIFF_STAT: env.diff_stat || '(no diff stat)',
       CONTEXT: gateCContext(await cur()).slice(0, 4000),
       HARDEN_RULES: hardenRules(),
     }),
   );
   dump('gated-harden.raw.txt', res.raw ?? '');
-  if (!res.ok) await bail(`闸D 补强 claude 失败：${res.error}`);
+  if (!res.ok) await bail(`Gate D hardening claude failed: ${res.error}`);
   if (res.costUsd != null) await patch(s.id, { gate_d_cost_usd: ((await cur()).gate_d_cost_usd ?? 0) + res.costUsd });
   let hardenSummary = '';
   try {
     hardenSummary = strictParse(GateCFixResultSchema, res.result).summary;
   } catch {
-    hardenSummary = ''; // 补强真闸是 CI 绿，不是 JSON——解析失败不阻断，摘要留空
+    hardenSummary = ''; // the real gate for hardening is a green CI, not the JSON - a parse failure does not block anything, the summary is just left empty
   }
 
-  // 落提交 + CI 绿（有限轮自修）；同闸D fix 不变量：commit→clean→CI→（绿且 clean 才过）。
+  // Commit and drive CI to green (with a bounded number of self-fix rounds); the same invariant as Gate D's
+  // fix: commit -> clean -> CI -> pass only when green and still clean.
   let lastCi = '';
   for (let attempt = 0; ; attempt++) {
-    const cm = commitWorktree(wt, `forge(闸D 补强 ${s.slug}): round ${round}${attempt ? ` CI 修${attempt}` : ''}`);
+    const cm = commitWorktree(wt, `forge(gate D harden ${s.slug}): round ${round}${attempt ? ` ci-fix ${attempt}` : ''}`);
     await appendEvent(s.id, 'gate_d_harden_commit', { ok: cm.ok, committed: cm.committed, attempt });
-    if (!cm.ok) await bail(`闸D 补强落提交失败 → 停泊（worktree 可能脏）：${cm.output.slice(0, 200)}`);
-    if (!worktreeClean(wt)) await bail('闸D 补强提交后 worktree 非 clean → 停泊（CI 须验 HEAD）');
+    if (!cm.ok) await bail(`Gate D hardening failed to make the commit -> parking (the worktree may be dirty): ${cm.output.slice(0, 200)}`);
+    if (!worktreeClean(wt)) await bail('the Gate D hardening worktree is not clean after the commit -> parking (CI must verify HEAD)');
     const ci = await runCi(wt, ciScript, { base: env.base_sha || env.base_ref || undefined, timeoutMs: ciTimeout });
     dump('gated-harden-ci.raw.txt', ci.summary);
     lastCi = ci.summary;
-    if (!ci.ran) await bail(`闸D 补强 CI 跑不起来（基础设施）：${ci.summary.slice(0, 200)}`);
+    if (!ci.ran) await bail(`the Gate D hardening CI could not be run (infrastructure): ${ci.summary.slice(0, 200)}`);
     if (ci.ok) {
-      if (!worktreeClean(wt)) await bail('闸D 补强 CI 后 worktree 被改脏 → 停泊（CI 验的对象 ≠ 被 push 的 HEAD）');
-      break; // 绿 + 前后皆 clean → HEAD 即被验证的提交
+      if (!worktreeClean(wt)) await bail('the Gate D hardening worktree was dirtied after CI -> parking (what CI verified is not the HEAD being pushed)');
+      break; // green and clean on both sides -> HEAD is exactly the verified commit
     }
-    if (attempt >= MAX_HARDEN_CI_FIX_ATTEMPTS) await bail(`闸D 补强 + ${attempt} 轮自修后本地 CI 仍红 → 停泊交人工（绝不带红进合并就绪）：${ci.summary.slice(0, 200)}`);
+    if (attempt >= MAX_HARDEN_CI_FIX_ATTEMPTS) await bail(`the local CI is still red after Gate D hardening plus ${attempt} self-fix round(s) -> parking for a human (a red state never reaches merge-ready): ${ci.summary.slice(0, 200)}`);
     res = await runStep(render(loadPrompt('gate-d-ci-fix.md', pid), { CI: ci.summary.slice(0, 3000), WORKTREE: wt }));
     dump('gated-harden.raw.txt', res.raw ?? '');
-    if (!res.ok) await bail(`闸D 补强自修 claude 失败：${res.error}`);
+    if (!res.ok) await bail(`the Gate D hardening self-fix claude call failed: ${res.error}`);
     if (res.costUsd != null) await patch(s.id, { gate_d_cost_usd: ((await cur()).gate_d_cost_usd ?? 0) + res.costUsd });
   }
 
-  // CI 绿 + 前后皆 clean：补强工作已锁定（committed、被验证）。**pin 下被验证的 HEAD sha**作幂等收尾守门——
-  // 此后写报告 + 推，失败不回滚（绝不丢已验证工作）；下轮重入只在 HEAD 仍 == 此 sha 时补推（绝不盲推）。
+  // CI is green and the tree was clean on both sides: the hardening work is locked in (committed and
+  // verified). **Pin the verified HEAD sha** as the guard for the idempotent finish - from here on, writing the
+  // report and pushing do not roll back on failure (verified work is never thrown away), and a later re-entry
+  // only re-pushes while HEAD is still exactly this sha (it never pushes blindly).
   const verifiedSha = worktreeHeadSha(wt);
-  if (!verifiedSha) throw new Error('闸D 补强：CI 绿后取不到 HEAD sha → 停泊（无法锚定幂等收尾）');
+  if (!verifiedSha) throw new Error('Gate D hardening: the HEAD sha could not be read after CI went green -> parking (the idempotent finish has nothing to anchor to)');
   await patch(s.id, { gate_d_harden_verified_sha: verifiedSha });
 
   const finalEnv: ImplEnvelope = {
@@ -254,14 +281,16 @@ export async function runGateDHarden(s: Session): Promise<void> {
     last_summary: hardenSummary,
   };
   await persistGateC(await cur(), finalEnv);
-  // merge-readiness 是 **forge 本地决策文档**（落 docs/delivery/<slug>/，非 PR 产物，不随分支推送）。
+  // merge-readiness is a **forge-local decision document** (written under the delivery directory; it is not a
+  // PR artifact and is not pushed along with the branch).
   const mdPath = writeMergeReadiness(await cur(), finalEnv, { codexRound: (await cur()).gate_d_round ?? 1, hardenSummary });
   await patch(s.id, { merge_readiness_path: mdPath });
   await appendEvent(s.id, 'gate_d_merge_readiness', { path: mdPath });
 
-  // 推**代码**提交更新 PR 分支（报告不在内）。失败不回滚——verified_sha 已 pin，下轮幂等收尾会补推这个被验证的提交。
+  // Push the **code** commit to update the PR branch (the report is not part of it). A failure does not roll
+  // back - verified_sha is pinned, so the next round's idempotent finish re-pushes that verified commit.
   const pushed = pushWorktree(wt);
-  if (!pushed.ok) throw new Error(`闸D 补强推分支失败（已验证提交 ${verifiedSha.slice(0, 12)} 留存，下轮幂等补推）：${pushed.output.slice(0, 200)}`);
+  if (!pushed.ok) throw new Error(`Gate D hardening failed to push the branch (the verified commit ${verifiedSha.slice(0, 12)} is kept, and the next round re-pushes it idempotently): ${pushed.output.slice(0, 200)}`);
   await appendEvent(s.id, 'gate_d_harden_pushed', { round, head: verifiedSha.slice(0, 12) });
-  log.ok(`${s.slug}: 闸D 测试补强完成（第${round}轮）+ 本地 CI 全绿 + 已推 → 合并就绪`);
+  log.ok(`${s.slug}: Gate D test hardening finished (round ${round}) + the local CI is fully green + pushed -> merge-ready`);
 }

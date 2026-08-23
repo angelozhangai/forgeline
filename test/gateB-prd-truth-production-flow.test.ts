@@ -1,5 +1,6 @@
-// 集成：闸B 的 PRD 真源生产链路。
-// 只 mock LLM / git fetch / 目标项目脚本边界；真实覆盖 runGateB/loadPrdTruth/session/worker 的上线行为。
+// Integration: the production path from the PRD source of truth into Gate B.
+// Only the LLM, git fetch and target-project script boundaries are mocked; the real behaviour of runGateB,
+// loadPrdTruth, the session store and the worker is exercised end to end.
 process.env.FORGE_DB = ':memory:';
 
 import { test, mock, beforeEach } from 'node:test';
@@ -17,14 +18,14 @@ let scaffoldCalls = 0;
 const notifications: { kind: string; state: string; error?: string | null }[] = [];
 
 const gateBResult = JSON.stringify({
-  summary: '按冻结 PRD 真源出方案',
+  summary: 'design produced from the frozen PRD source of truth',
   key_decisions: { source: 'prd-truth' },
-  tech_design_markdown: '实现只应基于冻结真源与代码真源。',
+  tech_design_markdown: 'The implementation must rest only on the frozen source of truth and the source of truth in the code.',
   acceptance: {
     contracts: [{ repo: 'C', surface: 'POST /refund {order_id} -> 200 {refund_id}' }],
-    scenarios: [{ id: 'AC1', repo: 'C', gherkin: 'Given 已支付订单\nWhen 发起退款\nThen 返回退款单号' }],
+    scenarios: [{ id: 'AC1', repo: 'C', gherkin: 'Given a paid order\nWhen a refund is requested\nThen a refund id is returned' }],
   },
-  issue_specs: [{ repo: 'C', title: 'feat(refund): 支持退款', type: 'feat', prio: 'P1' }],
+  issue_specs: [{ repo: 'C', title: 'feat(refund): support refunds', type: 'feat', prio: 'P1' }],
   confidence: 0.91,
 });
 
@@ -39,7 +40,8 @@ mock.module('../src/gates/repoFreshness.ts', {
     assertFresh: () => {},
   },
 });
-// checkout 锚定校验隔离成「已对齐」——本测不验证 git，只走 runGateB 上线行为。
+// The checkout anchor check is stubbed to "already aligned" - this test does not verify git, only runGateB's
+// production behaviour.
 mock.module('../src/gates/repoAnchor.ts', {
   namedExports: { anchorCheck: () => ({ off: [], disclosure: '' }), reposOffRef: () => [] },
 });
@@ -82,7 +84,8 @@ mock.module('../src/notify.ts', {
   },
 });
 
-// worker 导入 autoAssignOnGo；避免成功路径意外触真实负载探针。失败停泊用例不会走到这里。
+// The worker imports autoAssignOnGo; this keeps the success path from accidentally hitting the real load
+// probe. The parking test never reaches it.
 mock.module('../src/util/load.ts', {
   namedExports: { probeLoad: async () => [] },
 });
@@ -96,7 +99,7 @@ function deliveryDir(slug: string): string {
 }
 
 async function createSession(id: string): ReturnType<typeof sessions.get> {
-  await sessions.create({ id, slug: id, title: '退款需求', branch: 'dev', prd_url: 'https://feishu/prd' });
+  await sessions.create({ id, slug: id, title: 'refund requirement', branch: 'dev', prd_url: 'https://feishu/prd' });
   return sessions.get(id);
 }
 
@@ -113,50 +116,50 @@ beforeEach(() => {
   notifications.length = 0;
 });
 
-test('生产链路：封口 prd-truth 已存在时，闸B 只读冻结单源；后续 gate-a.json 损坏也不污染 prompt', async () => {
+test('production path: when the sealed prd-truth exists, Gate B reads only that frozen single source, and a gate-a.json that goes bad afterwards cannot pollute the prompt', async () => {
   const id = 'prdtruth-frozen-source';
   await createSession(id);
   mkdirSync(deliveryDir(id), { recursive: true });
   writeFileSync(
     resolve(deliveryDir(id), 'prd-truth.md'),
     [
-      '# PRD 真源（已多轮评审）',
-      '冻结事实：本期只做余额退款。',
-      'PM 最终裁决：不做原路退款。',
+      '# PRD source of truth (reviewed over several rounds)',
+      'Frozen fact: this cycle ships store-credit refunds only.',
+      'Final PM ruling: refunds to the original payment route are out of scope.',
     ].join('\n'),
   );
   const badGateA = resolve(mkdtempSync(resolve(tmpdir(), 'forge-bad-gatea-')), 'gate-a.json');
-  writeFileSync(badGateA, '{"summary": "旧的三源不该再被读", "repos_');
+  writeFileSync(badGateA, '{"summary": "the old three sources must not be read again", "repos_');
   await sessions.patch(id, {
     gate_a_output_path: badGateA,
-    confirmed_notes: '旧 confirmed_notes 不该作为独立输入拼进闸B',
+    confirmed_notes: 'the old confirmed_notes must not be spliced into Gate B as an independent input',
   });
 
   await runGateB((await sessions.get(id))!);
 
   assert.equal(claudeCalls, 1);
   assert.equal(scaffoldCalls, 1);
-  assert.match(lastPrompt, /冻结事实：本期只做余额退款/);
-  assert.match(lastPrompt, /PM 最终裁决：不做原路退款/);
-  assert.doesNotMatch(lastPrompt, /旧的三源不该再被读/);
-  assert.doesNotMatch(lastPrompt, /旧 confirmed_notes 不该作为独立输入拼进闸B/);
+  assert.match(lastPrompt, /Frozen fact: this cycle ships store-credit refunds only/);
+  assert.match(lastPrompt, /Final PM ruling: refunds to the original payment route are out of scope/);
+  assert.doesNotMatch(lastPrompt, /the old three sources must not be read again/);
+  assert.doesNotMatch(lastPrompt, /the old confirmed_notes must not be spliced into Gate B/);
   assert.doesNotMatch(lastPrompt, /\{\{PRD_TEXT\}\}|\{\{GATE_A_OUTPUT\}\}|\{\{CONFIRMED_NOTES\}\}/);
-  assert.ok(readFileSync(resolve('logs', id, 'gate-b.prompt.txt'), 'utf8').includes('冻结事实：本期只做余额退款'));
+  assert.ok(readFileSync(resolve('logs', id, 'gate-b.prompt.txt'), 'utf8').includes('Frozen fact: this cycle ships store-credit refunds only'));
 });
 
-test('生产链路：封口文档缺且 gate-a.json 损坏时，worker 停泊 GATE_B_FAILED，不调用 Claude 生成空壳方案', async () => {
+test('production path: when the sealed document is missing and gate-a.json is broken, the worker parks at GATE_B_FAILED and never calls claude to produce an empty-shell design', async () => {
   const id = 'prdtruth-bad-gatea-parks';
   await createSession(id);
   await moveToGateBRequested(id);
   const badGateA = resolve(mkdtempSync(resolve(tmpdir(), 'forge-bad-gatea-')), 'gate-a.json');
-  writeFileSync(badGateA, '{"summary": "截断的评审稿"');
-  await sessions.patch(id, { gate_a_output_path: badGateA, confirmed_notes: 'PM：已确认' });
+  writeFileSync(badGateA, '{"summary": "a truncated review draft"');
+  await sessions.patch(id, { gate_a_output_path: badGateA, confirmed_notes: 'PM: confirmed' });
 
   await worker.step((await sessions.get(id))!);
 
   const parked = (await sessions.get(id))!;
   assert.equal(parked.state, 'GATE_B_FAILED');
-  assert.match(parked.error ?? '', /PRD 真源：闸A 信封 JSON 解析失败/);
+  assert.match(parked.error ?? '', /PRD source of truth: the Gate A envelope failed to parse as JSON/);
   assert.equal(claudeCalls, 0);
   assert.equal(scaffoldCalls, 0);
   assert.ok(notifications.some((n) => n.kind === 'failed' && n.state === 'GATE_B_FAILED'));
