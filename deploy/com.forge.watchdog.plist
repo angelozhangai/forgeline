@@ -1,8 +1,12 @@
 <?xml version="1.0" encoding="UTF-8"?>
-<!-- Forge 看门狗。模板：__SVC__ 由 deploy/install.sh 替换。每 60s 探活 + 自愈 + 飞书告警（独立进程，监控主守护）。
-     StartInterval 是「一次性周期运行」（非常驻）：每 60s 起一次 forge-watchdog 跑完即退。
-     为何独立于主守护：卡死/已死的进程无法自我监控，监控者必须在被监控者之外。
-     ProgramArguments 直接指向 forge-watchdog → BTM 显示 forge-watchdog 而非 zsh。 -->
+<!-- The Forge watchdog. This is a template: deploy/install.sh replaces __SVC__. Every 60s it probes
+     liveness, self-heals and alerts over IM, as a separate process watching the main daemon.
+     StartInterval means run periodically rather than stay resident: every 60s it starts forge-watchdog,
+     which runs once and exits.
+     Why it is separate from the main daemon: a wedged or dead process cannot monitor itself, so the monitor
+     has to live outside what it monitors.
+     ProgramArguments points straight at forge-watchdog, so background activity shows forge-watchdog rather
+     than zsh. -->
 <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
 <plist version="1.0">
 <dict>

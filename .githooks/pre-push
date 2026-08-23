@@ -1,65 +1,70 @@
 #!/usr/bin/env bash
-# 拒绝从本地直接推 main，以及对 main 的非快进（force）推送。
+# Refuse a direct push to main from a local checkout, and refuse any non-fast-forward (force) push to it.
 #
-# 为什么本地还要拦一道：GitHub 上 main 已经有 ruleset（禁删/禁 force/必须走 PR/CI 必须绿），
-# 但 bypass 名单里有 Repository admin —— 也就是**仓主直接 `git push origin main` 会静默成功**。
-# 服务端那条 bypass 是留给「CI 挂死了、必须先修」这类紧急情况的，不是给肌肉记忆用的。
-# 对单人仓来说，最该拦的恰恰就是自己那一下手快，所以拦在本地：
-# 服务端留出口，本地防手滑，两边职责不同，缺一边都不对。
+# Why block it locally when the server already does: main on GitHub carries a ruleset (no deletion, no force,
+# a PR required, CI required), but Repository admin is on its bypass list -- so **the repo owner running
+# `git push origin main` succeeds silently**.
+# That server-side bypass exists for emergencies like "CI is wedged and has to be fixed first", not for
+# muscle memory.
+# In a one-person repo the thing most worth catching is your own reflex, so it is caught locally:
+# the server keeps the escape hatch, the local hook catches the slip. The two have different jobs, and
+# neither is redundant.
 #
-# 真要绕过（且你确实想清楚了）：FORGELINE_ALLOW_MAIN=1 git push origin main
-# 强推另有开关，且没有合并写法 —— 必须两个都显式设，逼你多想一秒。
+# To bypass it deliberately, having thought it through: FORGELINE_ALLOW_MAIN=1 git push origin main
+# A force push needs its own switch on top, and there is no combined form -- both have to be set explicitly,
+# which buys you one more second of thought.
 #
-# stdin 每行：<local ref> <local sha> <remote ref> <remote sha>
+# Each line on stdin: <local ref> <local sha> <remote ref> <remote sha>
 set -euo pipefail
 
 ZERO='0000000000000000000000000000000000000000'
 blocked=0
 
-# shellcheck disable=SC2034  # local_ref 是 git 传进来的固定四列之一，用不到但必须占位
+# shellcheck disable=SC2034  # local_ref is one of the four columns git always passes; unused, but it has to hold the position
 while read -r local_ref local_sha remote_ref remote_sha; do
   [ -n "${remote_ref:-}" ] || continue
   [ "$remote_ref" = "refs/heads/main" ] || continue
 
-  # 删远端 main
+  # Deleting the remote main
   if [ "$local_sha" = "$ZERO" ]; then
-    printf '\n  ✗ 拒绝删除远端 main。\n\n' >&2
+    printf '\n  ✗ refusing to delete the remote main.\n\n' >&2
     blocked=1
     continue
   fi
 
-  # 非快进：远端有你本地没有的提交，强推会让它们消失。
+  # Non-fast-forward: the remote holds commits you do not, and a force push would make them disappear.
   if [ "$remote_sha" != "$ZERO" ] && ! git merge-base --is-ancestor "$remote_sha" "$local_sha"; then
     if [ "${FORGELINE_ALLOW_FORCE_MAIN:-}" != "1" ]; then
       cat >&2 <<'EOF'
 
-  ✗ 拒绝对 main 的非快进推送（force push）。
+  ✗ refusing a non-fast-forward (force) push to main.
 
-    远端 main 上有你本地没有的提交。这是一个公开仓，main 的历史是对外的：
-    强推会改写已经被别人 clone、被 issue/PR 引用过的提交。
+    The remote main holds commits yours does not. This is a public repository, and main's history is public
+    with it: a force push rewrites commits other people have already cloned and that issues and PRs refer to.
 
-    正确做法：git fetch origin && git pull --ff-only
+    The right move: git fetch origin && git pull --ff-only
 
 EOF
       blocked=1
       continue
     fi
-    printf '\n  ! FORGELINE_ALLOW_FORCE_MAIN=1：放行对 main 的强推。\n\n' >&2
+    printf '\n  ! FORGELINE_ALLOW_FORCE_MAIN=1: allowing a force push to main.\n\n' >&2
   fi
 
   if [ "${FORGELINE_ALLOW_MAIN:-}" != "1" ]; then
     cat >&2 <<'EOF'
 
-  ✗ 不要从本地直接推 main。
+  ✗ do not push straight to main from a local checkout.
 
-    main 只通过合并 PR 前进 —— 那是 CI（lint + typecheck + test，含覆盖率下限与
-    用例数地板）真正成为硬门的唯一时刻。直接推等于绕过自己设的闸。
+    main moves only by merging a PR -- that is the one moment CI (lint + typecheck + test, coverage floors
+    and the test-count floor included) actually becomes a hard gate. Pushing straight past it is bypassing
+    the gate you set yourself.
 
-    开新工作：
-      git switch -c <类型>/<简短描述> origin/main
+    To start something new:
+      git switch -c <type>/<short-description> origin/main
 
-    推分支开 PR：
-      git push -u origin <分支名> && gh pr create
+    To push the branch and open a PR:
+      git push -u origin <branch-name> && gh pr create
 
 EOF
     blocked=1

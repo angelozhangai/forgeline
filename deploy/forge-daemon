@@ -1,14 +1,19 @@
 #!/bin/zsh
-# Forge — 守护启动器（launchd KeepAlive 调它）：常驻 forge listen（飞书长连接 + 周期 tick + 本地状态页）。
-# plist 直接指向本脚本（非 /bin/zsh），故 macOS「登录项与扩展」后台活动里显示 forge-daemon 而非 zsh。
-# 自定位仓根；补 PATH（launchd 环境极简，缺 node/claude/codex/gh 路径）。
+# Forge -- the daemon launcher, called by launchd's KeepAlive: it stays resident running forge listen (the IM
+# long connection, the periodic tick, and the local status page).
+# The plist points straight at this script rather than /bin/zsh, so macOS's Login Items and Extensions pane
+# shows forge-daemon rather than zsh.
+# It locates the repo root itself and extends PATH -- launchd's environment is minimal and carries no path to
+# node, claude, codex or gh.
 set -e
-DIR="${0:A:h}"          # 本脚本所在目录 = <repo>/deploy
-SVC="${DIR:h}"          # 仓根 = forge
+DIR="${0:A:h}"          # the directory this script lives in = <repo>/deploy
+SVC="${DIR:h}"          # the repo root
 export PATH="/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin:$HOME/.bun/bin:$HOME/.local/bin:$PATH"
 cd "$SVC" || exit 1
 mkdir -p logs
-echo "──── Forge listen 启动 @ $(date '+%Y-%m-%d %H:%M:%S') ────" >> logs/launchd.log
-# caffeinate -is：daemon 运行期间阻止「系统休眠 + 空闲休眠」→ Mac 醒着就一直响应。
-# 注：合盖入包仍会睡（系统级）；醒来后 backfill 把离线期间的群消息补回，不漏需求。
+echo "---- Forge listen starting @ $(date '+%Y-%m-%d %H:%M:%S') ----" >> logs/launchd.log
+# caffeinate -is stops the system sleeping, idle sleep included, while the daemon runs, so the Mac keeps
+# responding for as long as it is awake.
+# Note that closing the lid still sleeps it, at the system level; on waking, backfill collects the channel
+# messages from the offline window so no requirement is lost.
 exec caffeinate -is ./forge listen >> logs/launchd.log 2>&1

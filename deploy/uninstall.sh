@@ -1,6 +1,7 @@
 #!/bin/zsh
-# Forge — 停并卸载守护 + 看门狗 LaunchAgent。数据(state/)、日志(logs/)保留。
-# 一并清理旧名 com.demo.review-svc*（更名前的遗留）。
+# Forge -- stop and uninstall the daemon and watchdog LaunchAgents. The data in state/ and the logs in logs/
+# are left alone.
+# It also clears out the old com.demo.review-svc* names left over from before the rename.
 set -uo pipefail
 LA="$HOME/Library/LaunchAgents"
 U="$(id -u)"
@@ -8,4 +9,4 @@ for label in com.forge.watchdog com.forge.daemon com.demo.review-svc.watchdog co
   launchctl bootout "gui/$U/$label" 2>/dev/null || true
   rm -f "$LA/$label.plist"
 done
-echo "✓ 已停并卸载 Forge 守护 + 看门狗（state/ 数据与 logs/ 日志保留）"
+echo "✓ the Forge daemon and watchdog are stopped and uninstalled (state/ and logs/ are kept)"

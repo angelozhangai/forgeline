@@ -1,32 +1,45 @@
 #!/usr/bin/env bash
-# weekly-load.sh — 按【需求】算每人本周加权负载（不是工时、不是 PR 数、不是行数）
+# weekly-load.sh -- each person's weighted load for the week, counted in **requirements**: not hours, not
+# PR counts, and not lines of code.
 #
-# 为什么：工时表量的是「填报习惯」，不是工作量（见 docs/workspace/load-eval.md）。
-# 本工具从需求看板取每人本周真实推进的【需求】，按统一口径加权：
+# Why: a timesheet measures how diligently someone fills in a timesheet, not how much work they did (see
+# docs/workspace/load-eval.md).
+# This tool takes the requirements each person actually moved forward this week off the board, and weights
+# them all the same way:
 #
-#     得分 = Σ_需求 ( 规模 × 跨栈 × 质量 )
+#     score = sum over requirements of ( size x span x quality )
 #
-#   · 原子单位 = 需求（= 看板一行）：Epic(P#) 把跨仓子 issue 收成 1 个需求；单仓 issue 各算 1 个。
-#     —— 跨仓子 issue 按 epic:<slug> 合并，绝不重复计数（一个 Google 登录不会被算成 C+U 两份）。
-#   · 规模  size:S/M/L/XL → 1 / 3 / 8 / 20（斐波那契，难度超线性）。闸B 评审时打 size:* 标签；
-#            没打则默认 M(标 * 提示你去细化) 或用 config/weekly-overrides.tsv 覆盖。
-#   · 跨栈  需求的子 issue 横跨几个代码仓：单仓×1.0 / 两仓×1.3 / 三仓×1.5（协调/契约成本是真的）。
-#   · 质量  从 rollup 状态推：7-已上线×1.0 / 6-测试中×0.85 / 5-review×0.75 / 4-开发中×0.7 / 其它×0.4。
-#            可在 config/weekly-overrides.tsv 手调（引发事故→0.6；干净沉淀公共件→1.2；review 多轮打回→0.8）。
+#   * The unit is one requirement, which is one row on the board: an Epic (P#) collapses its cross-repo
+#     children into a single requirement, while a single-repo issue counts as one on its own.
+#     Cross-repo children are merged by epic:<slug> and never double-counted, so one sign-in feature is not
+#     counted once for C and again for U.
+#   * Size: size:S/M/L/XL map to 1 / 3 / 8 / 20 -- Fibonacci, because difficulty grows faster than linearly.
+#     The size:* label is applied during the gate B review;
+#     unlabelled, it defaults to M and is marked with a * to prompt you to refine it, or you can override it
+#     in config/weekly-overrides.tsv.
+#   * Span: how many code repos a requirement's children reach across -- one repo x1.0, two x1.3, three x1.5.
+#     The coordination and contract cost is real.
+#   * Quality: inferred from the rollup status -- 7 shipped x1.0, 6 in testing x0.85, 5 in review x0.75,
+#     4 in development x0.7, anything else x0.4.
+#     It can be adjusted by hand in config/weekly-overrides.tsv (caused an incident -> 0.6; left behind a
+#     clean shared component -> 1.2; sent back repeatedly in review -> 0.8).
 #
-# 用法（从 umbrella 根跑）：
-#   ./scripts/weekly-load.sh                         # 默认团队 EO CC DE，最近 7 天
+# Usage, run from the umbrella root:
+#   ./scripts/weekly-load.sh                         # the default team EO CC DE, over the last 7 days
 #   ./scripts/weekly-load.sh --since 2026-06-08 --until 2026-06-12
-#   ./scripts/weekly-load.sh EO CC DE M              # 指定人（简称或 login）
+#   ./scripts/weekly-load.sh EO CC DE M              # specific people, by short code or by login
 #   ./scripts/weekly-load.sh --since 2026-06-08 --until 2026-06-12 CC
 #
-# 覆盖文件（可选，调 size/质量，不动 GitHub 标签）：config/weekly-overrides.tsv
-#   每行：  <需求key> <TAB> <size或-> <TAB> <质量乘数或-> <TAB> 备注
-#   需求key：Epic 用 "epic:<slug>"；单仓用 "C#164"/"A#98"/"U#545"。字段填 "-" = 不覆盖。
-#   例：  epic:admin-dashboard	XL	0.7	测试中的大包
-#         A#98	L	-	精选弹窗其实是 L
+# The override file (optional -- it adjusts size and quality without touching the GitHub labels):
+# config/weekly-overrides.tsv
+#   Each line: <requirement key> <TAB> <size or -> <TAB> <quality multiplier or -> <TAB> a note
+#   The requirement key is "epic:<slug>" for an Epic, or "C#164" / "A#98" / "U#545" for a single repo.
+#   A field of "-" means no override.
+#   For example:  epic:admin-dashboard	XL	0.7	a big one still in testing
+#                 A#98	L	-	the featured dialog is really an L
 #
-# 前置：gh 已登录有 your-org 权限的账号（alice-lead，见 README）。看板真源同 board.sh。
+# Prerequisite: gh is logged in as an account with access to your-org (alice-lead -- see the README). The
+# board is the same source of truth board.sh reads.
 set -uo pipefail
 cd "$(dirname "$0")"
 ROOT="$(cd .. && pwd)"
@@ -43,7 +56,7 @@ resolve_assignee() {
     M) echo alice-lead;; BD) echo bob-dev;; CC) echo carol-codes;; DE) echo dave-eng;; EO) echo erin-ops;; *) echo "$1";;
   esac
 }
-# 反查 login → 简称（展示用）
+# Map a login back to a short code, for display
 shorthand_of() {
   case "$1" in
     alice-lead) echo M;; bob-dev) echo BD;; carol-codes) echo CC;; dave-eng) echo DE;; erin-ops) echo EO;; *) echo "$1";;
@@ -51,14 +64,14 @@ shorthand_of() {
 }
 days_ago() { if date -v-1d >/dev/null 2>&1; then date -v-"$1"d +%F; else date -d "$1 days ago" +%F; fi; }
 
-# ── 解析参数 ──
+# -- Parse the arguments --
 SINCE=""; UNTIL=""; PEOPLE=()
 while [ $# -gt 0 ]; do
   case "$1" in
     --since) SINCE="${2:-}"; shift 2;;
     --until) UNTIL="${2:-}"; shift 2;;
     -h|--help) sed -n '2,33p' "$0"; exit 0;;
-    -*) die "未知参数：$1";;
+    -*) die "unknown argument: $1";;
     *) PEOPLE+=("$1"); shift;;
   esac
 done
@@ -66,7 +79,8 @@ done
 [ -n "$SINCE" ] || SINCE="$(days_ago 7)"
 [ "${#PEOPLE[@]}" -gt 0 ] || PEOPLE=(EO CC DE)
 
-# 每仓每人抽 TSV：前缀 \t 号 \t status序 \t status \t epicSlug \t sizeLabel \t type \t state \t 标题
+# Pull a TSV per repo per person: prefix \t number \t status order \t status \t epicSlug \t sizeLabel \t
+# type \t state \t title
 ROW_JQ='
 .[] |
   ([.labels[].name|select(startswith("status:"))]|(.[0]//"")) as $st |
@@ -77,7 +91,8 @@ ROW_JQ='
   "\($pre)\t\(.number)\t\($ord)\t\(if $st=="" then "-" else $st end)\t\($ep)\t\($sz)\t\(if $ty=="" then "-" else $ty end)\t\(.state)\t\(.title)"
 '
 
-# 评分 awk（读一个人的 TSV，按 key 分组算分；机器汇总行写 SCORE_OUT）
+# The scoring awk: it reads one person's TSV, groups by key and scores each group, writing the
+# machine-readable summary lines to SCORE_OUT.
 SCORE_AWK='
 function sizepts(s){ if(s=="S")return 1; if(s=="M")return 3; if(s=="L")return 8; if(s=="XL")return 20; return 3 }
 function qual(o){ if(o==7)return 1.0; if(o==6)return 0.85; if(o==5)return 0.75; if(o==4)return 0.7; if(o==0)return 0.5; return 0.4 }
@@ -101,7 +116,7 @@ END{
     key=order[i]
     span=0; repcol=""
     for(j in CODE){ if((key SUBSEP CODE[j]) in repos){ span++; repcol=repcol (repcol==""?"":"+") CODE[j] } }
-    if(span==0){ span=1; repcol="P" }   # 只挂在 Epic(P) 上、暂无代码子仓
+    if(span==0){ span=1; repcol="P" }   # it hangs off the Epic (P) alone, with no code repo child yet
     cs = (span>=3?1.5:(span==2?1.3:1.0))
     o = (key in minord)?minord[key]:0
     s = (key in size)?size[key]:"M"; src=(key in sized)?"":"*"
@@ -113,17 +128,17 @@ END{
     printf "  %-6s %-3s %-4s %-4s %7.1f   %s\n", repcol, s src, cs, q, pts, gtitle[key]
   }
   print  "  ----------------------------------------------------------------"
-  printf "  合计加权 ≈ %.1f      需求数 %d（跨栈 %d）\n", total, ng, ncross
+  printf "  weighted total ~ %.1f      requirements %d (spanning repos %d)\n", total, ng, ncross
   if(SCORE_OUT!="") printf "%s\t%.1f\t%d\t%d\n", WHO, total, ng, ncross >> SCORE_OUT
 }'
 
-# 代理小贴士：gh 在本机走 fake-IP 代理时认小写 https_proxy（见 memory）。若 gh 报 EOF：
+# A proxy note: behind a local fake-IP proxy, gh honours the lowercase https_proxy. If gh reports EOF:
 #   https_proxy=http://127.0.0.1:7897 ./scripts/weekly-load.sh ...
-gh api user -q .login >/dev/null 2>&1 || die "gh 未登录或网络不通（如走代理：前缀 https_proxy=http://127.0.0.1:7897）。见 README。"
+gh api user -q .login >/dev/null 2>&1 || die "gh is not logged in, or the network is unreachable (behind a proxy, prefix the command with https_proxy=http://127.0.0.1:7897). See the README."
 
-echo "═══ 每人本周需求负载  ${SINCE} … ${UNTIL}  ═══"
-echo "  口径：需求 × 规模(S1/M3/L8/XL20) × 跨栈(1/1.3/1.5) × 质量(状态推) —— 详见 docs/workspace/load-eval.md"
-[ -f "$OVR_FILE" ] && echo "  覆盖文件：config/weekly-overrides.tsv（已加载）" || echo "  覆盖文件：config/weekly-overrides.tsv（无，size 缺省 M 标 *）"
+echo "=== requirement load per person  ${SINCE} ... ${UNTIL}  ==="
+echo "  how it is counted: requirement x size (S1/M3/L8/XL20) x span (1/1.3/1.5) x quality (inferred from status) -- see docs/workspace/load-eval.md"
+[ -f "$OVR_FILE" ] && echo "  overrides: config/weekly-overrides.tsv (loaded)" || echo "  overrides: config/weekly-overrides.tsv (absent, so size defaults to M and is marked *)"
 echo
 
 SCORE_OUT="$(mktemp)"; trap 'rm -f "$SCORE_OUT"' EXIT
@@ -141,16 +156,16 @@ for who in "${PEOPLE[@]}"; do
   buf="$(printf '%s' "$buf" | sed '/^$/d')"
   echo "─── ${sh} (${login}) ───"
   if [ -z "$buf" ]; then
-    echo "  （本周无指派给该人、且本窗口有更新的 issue）"; echo
+    echo "  (no issue assigned to them was updated inside this window)"; echo
     printf '%s\t0.0\t0\t0\n' "$sh" >> "$SCORE_OUT"; continue
   fi
-  printf "  %-6s %-4s %-4s %-4s %7s   %s\n" "仓" "规模" "跨栈" "质量" "得分" "需求"
+  printf "  %-6s %-4s %-4s %-4s %7s   %s\n" "repo" "size" "span" "qual" "score" "requirement"
   printf '%s\n' "$buf" | awk -F'\t' -v OVR="$OVR_FILE" -v WHO="$sh" -v SCORE_OUT="$SCORE_OUT" "$SCORE_AWK"
   echo
 done
 
-echo "═══ 加权负载排行（${SINCE} … ${UNTIL}）═══"
-sort -t$'\t' -k2 -nr "$SCORE_OUT" | awk -F'\t' '{ printf "  %-4s %6.1f   （需求 %d，跨栈 %d）\n", $1, $2, $3, $4 }'
+echo "=== weighted load, ranked (${SINCE} ... ${UNTIL}) ==="
+sort -t$'\t' -k2 -nr "$SCORE_OUT" | awk -F'\t' '{ printf "  %-4s %6.1f   (requirements %d, spanning repos %d)\n", $1, $2, $3, $4 }'
 echo
-echo "  * = 该需求 size 未打标签，按缺省 M 估；闸B 评审时打 size:S/M/L/XL，或填 config/weekly-overrides.tsv 细化。"
-echo "  说明：本表替代/补充工时表用于「按需求+质量」评估，口径与边界见 docs/workspace/load-eval.md。"
+echo "  * = that requirement carries no size label and was estimated as M. Apply size:S/M/L/XL during the gate B review, or refine it in config/weekly-overrides.tsv."
+echo "  Note: this table replaces or supplements a timesheet, for assessing by requirement and quality. What it counts and where it stops are in docs/workspace/load-eval.md."

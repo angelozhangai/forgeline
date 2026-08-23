@@ -1,12 +1,15 @@
-# 闸A 路由：每个需求由谁评审（M vs 该需求 DRI 自评）。
-# 注意：路由只决定「@谁来确认」，不决定是否停——AWAITING_PM_CONFIRM 必停等人。
-# route_to_M 若任一：repos_touched>1（跨仓） / 命中 sensitive_areas / confidence<min_confidence / envelope.needs_lead
-# 否则 route_to_engineer（DRI 自评）。envelope 缺失/乱码 → 当低置信 → fail-safe 给 M。
+# Gate A routing: who reviews each requirement -- the maintainer, or the requirement's own DRI.
+# Note that routing only decides who gets @-mentioned to confirm, never whether it stops:
+# AWAITING_PM_CONFIRM always waits for a person.
+# It routes to the maintainer if any of these hold: repos_touched > 1 (it spans repos), it hits
+# sensitive_areas, confidence < min_confidence, or the envelope sets needs_lead.
+# Otherwise it routes to the engineer, who reviews their own. A missing or unparseable envelope counts as low
+# confidence and fails safe to the maintainer.
 
 min_confidence: 0.7
-sensitive_areas: [auth, pay, payment, membership, credit, 风控, risk, risk-control, db-migration, migration]
+sensitive_areas: [auth, pay, payment, membership, credit, risk, risk-control, db-migration, migration]
 
-# 短码 → GitHub login（与主仓脚本 resolve_assignee 一致）
+# Short code -> GitHub login (the same mapping the main repo's resolve_assignee script uses)
 reviewers:
   M: alice-lead
   BD: bob-dev
@@ -14,4 +17,4 @@ reviewers:
   DE: dave-eng
   EO: "erin-ops"
 
-lead: M   # 升级目标（route_to_M 时 @ 谁）
+lead: M   # who an escalation goes to, and who gets @-mentioned when it routes to the maintainer

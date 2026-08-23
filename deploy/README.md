@@ -1,185 +1,177 @@
-# deploy — Forge 常驻守护 (launchd) + 看门狗 + IM 长连接(飞书 / Slack) + 本地状态页
+# deploy — the resident Forge daemon (launchd), the watchdog, the IM long connection (Feishu / Slack), and the local status page
 
-> **Forge** = 本服务的品牌/代号：把 PRD 锻造成技术方案/issue。launchd 标签 `com.forge.daemon` / `com.forge.watchdog`，启动器 `deploy/forge-daemon` / `deploy/forge-watchdog`。
+> **Forge** is this service's name: it forges a PRD into a technical plan and issues. The launchd labels are `com.forge.daemon` and `com.forge.watchdog`, and the launchers are `deploy/forge-daemon` and `deploy/forge-watchdog`.
 >
-> macOS「系统设置 → 登录项与扩展 → App 后台活动」里会出现 **forge-daemon / forge-watchdog · 身份不明的开发者**（脚本未做 Developer ID 签名，属正常）——**保持开关常开**即可（关掉 = 禁止 launchd 拉起，服务不再自启/常驻）。**不要**往「登录时打开」手动加东西：LaunchAgent 靠 `RunAtLoad` 在登录时自启，不走那个列表。
+> Under macOS's System Settings → Login Items & Extensions → Background App Activity you will see **forge-daemon / forge-watchdog · unidentified developer** (the scripts carry no Developer ID signature, which is expected) — **leave the toggle on**. Turning it off stops launchd from starting them, so the service no longer runs at login or stays resident. Do **not** add anything to "Open at Login" by hand: a LaunchAgent starts itself through `RunAtLoad` and does not use that list.
 
-服务从「手动 `forge tick`」升级为「**常驻 daemon**:飞书长连接收卡片按钮/群消息 + 内置周期 tick + 出事/要你时主动私聊」。
+The service has grown from a manual `forge tick` into a **resident daemon**: an IM long connection receiving card buttons and channel messages, a built-in periodic tick, and a direct message to you whenever something breaks or needs you.
 
-## 一、daemon:`forge listen`
+## 1. The daemon: `forge listen`
 
-一个常驻进程,干三件事:
-1. **飞书长连接**:收**卡片按钮回调**(确认/出方案/GO/打回/重跑)+ **群消息事件**(含 PRD 链接 → 自动 `addPrd`)。
-2. **内置周期 tick**(每 `runtime.yaml: poll_interval_sec` 秒):推进闸A/闸B、孤儿态自愈。即便长连接没起也照跑。
-3. **主动通知**:待确认/待GO/失败/完成/自愈 → 飞书私聊交互卡。
+One resident process doing three things:
 
-> 未配 `FEISHU_BOT_APP_*` 时自动降级:只跑周期 tick,无长连接(按钮/群入口不可用),通知走桌面+日志。
+1. **The IM long connection**: it receives **card button callbacks** (confirm, produce the plan, go, deny, retry) and **channel message events**, including a PRD link, which it turns into an `addPrd` automatically.
+2. **The built-in periodic tick**, every `runtime.yaml: poll_interval_sec` seconds: it advances gates A and B and heals orphaned sessions. It runs even when the long connection never came up.
+3. **Notifications it starts itself**: awaiting confirmation, awaiting go, a failure, a completion or a recovery all become an interactive card in your direct messages.
 
-## 二、一键安装(守护 + 看门狗 + 状态页)
+> With `FEISHU_BOT_APP_*` unset it degrades automatically: the periodic tick still runs, there is no long connection (so the buttons and the channel entry point are unavailable), and notifications go to the desktop and the log.
 
-用 **LaunchAgent**(非 Daemon):登录态运行,有 login keychain → claude/codex/gh 凭据可用;注销/关机不跑。
-两个任务:**守护**(`KeepAlive` 常驻 `forge listen`)+ **看门狗**(`StartInterval` 每 60s `forge watchdog`,救卡死)。
+## 2. Installing it in one step (the daemon, the watchdog and the status page)
 
-> **🧭 安装真源 = `/deploy-forge` skill（全新 Mac 从零部署）**:让 Claude Code / Codex 跑 **`/deploy-forge`** —— 它是逐步**阻断式**安装真源:每个前置(node≥24 / 主仓 / `forge.env` 密钥 / `claude`·`codex`·`gh` 登录 / 飞书后台见第三节)**卡一道闸**,带你填/装完、验证通过再放行,最后装 launchd 守护并收尾验证。**绝不替你输密钥**。
+It runs as a **LaunchAgent**, not a daemon: at the user level, so the login keychain is present and the claude, codex and gh credentials work. It does not run while logged out or shut down.
+
+Two jobs: the **daemon** (`KeepAlive`, keeping `forge listen` resident) and the **watchdog** (`StartInterval`, running `forge watchdog` every 60s to rescue a wedged process).
+
+> **🧭 The source of truth for installing is the `/deploy-forge` skill** (deploying to a brand-new Mac from scratch). Have Claude Code or Codex run **`/deploy-forge`**: it is a step-by-step **blocking** install guide. Every prerequisite — node ≥ 24, the main repo, the secrets in `forge.env`, being logged in to `claude`, `codex` and `gh`, and the IM developer console covered in section 3 — **stops at its own gate**, walks you through filling it in, verifies it, and only then lets you through, before finally installing the launchd jobs and verifying the result. It **never enters a secret for you**.
 >
-> **换电脑 / 旧宿主退役**：先停旧机 daemon/watchdog、在 Git 之外安全迁移密钥与 `state/` SQLite（如需),再从 Gate 0 严格安装——禁止两份独立 SQLite 同时消费同一生产入口。
+> **Moving to another machine, or retiring the old host**: stop the old machine's daemon and watchdog first, move the secrets and the `state/` SQLite database across outside Git if you need them, and then install strictly from Gate 0. Never let two independent SQLite databases consume the same production entry point at once.
 >
-> 机械部分由 **`./deploy/bootstrap.sh`** 自动做掉(node 检查 / 主仓检查 / `npm install` / 配置脚手架 / git hooks / `forge doctor` 预检);想手动跑就 `./deploy/bootstrap.sh`(准备+预检,不花钱),预检全绿后 `--install` 一键装。已部署过的机器直接用下面的 `install.sh`。
+> The mechanical part is handled by **`./deploy/bootstrap.sh`** (checking node, checking the main repo, `npm install`, scaffolding the config, the git hooks, and the `forge doctor` preflight). To run it yourself, `./deploy/bootstrap.sh` prepares and preflights without spending anything; once the preflight is green, `--install` installs in one step. On a machine already deployed to, go straight to `install.sh` below.
 
 ```bash
-./deploy/bootstrap.sh      # 全新机器:准备 + 预检（不花钱）；--install 则预检全绿后顺手装
-./deploy/install.sh        # 幂等:渲染 plist(替换路径占位) → bootstrap → enable;可重复跑
+./deploy/bootstrap.sh      # a new machine: prepare and preflight (spends nothing); --install installs once the preflight is green
+./deploy/install.sh        # idempotent: render the plists (substituting the path placeholder) -> bootstrap -> enable; safe to run again
 launchctl list | grep forge
-tail -f logs/launchd.log   # 守护日志
-tail -f logs/watchdog.log  # 看门狗日志
-open http://127.0.0.1:4319/   # 本地状态页
+tail -f logs/launchd.log   # the daemon's log
+tail -f logs/watchdog.log  # the watchdog's log
+open http://127.0.0.1:4319/   # the local status page
 ```
 
-停用 / 卸载:
+Stopping and uninstalling:
+
 ```bash
-./deploy/uninstall.sh      # 停并卸载两个任务;state/ 数据与 logs/ 保留
+./deploy/uninstall.sh      # stop and uninstall both jobs; state/ and logs/ are kept
 ```
 
-> plist 是**模板**(含 `__SVC__` 占位),由 `install.sh` 按当前仓根替换后安装——换机/换路径只要重跑 `install.sh`,不再手改硬编码路径。别直接 `cp` 模板。
-> ⚠️ **自动 = 自动花钱**:群里发个 PRD 链接 → 下一拍自动跑闸A(~$1-2)。贵的闸B 仍要你点「出技术方案」按钮才跑,不会失控。
+> The plists are **templates** carrying a `__SVC__` placeholder that `install.sh` replaces with the current repo root before installing. A new machine or a moved directory just means running `install.sh` again -- there is no hardcoded path to edit. Do not `cp` a template yourself.
+>
+> ⚠️ **Automatic means spending money automatically**: post a PRD link in a channel and the next tick runs gate A (about $1-2). The expensive gate B still waits for you to press "produce the technical plan", so it cannot run away with itself.
 
-### 保活的两层:KeepAlive 救「死」,看门狗救「卡」
+### Two layers of keeping it alive: KeepAlive rescues a dead process, the watchdog rescues a wedged one
 
-- **守护 plist**:`KeepAlive=true` 进程退出自动拉起;`ThrottleInterval=30` 防崩溃重启风暴。
-- **但 `KeepAlive` 救不了「进程还活着但卡死」**——飞书长连接断、event loop 堵死、tick 锁僵死时进程都在,launchd 不会动。
-- **看门狗**(独立进程,每 60s):探 `/healthz` + 读心跳 `liveness` + `launchctl` 状态 → 判定:
-  - 进程没在跑 → `launchctl kickstart` 拉起 + 飞书告警。
-  - 进程在跑但**卡死**(liveness 过期 + 探针连续失败到阈值):
-    - **有 gate 在跑** → 先告警「暂缓强杀」,过宽限窗(`wedged_grace_sec`=300s)仍卡死才 `kickstart -k`——**避免打断 claude/codex 白烧 token**。重启后 orphan 自动回收。
-    - 无 gate 在跑 → 立即 `kickstart -k` + 告警。
-  - 恢复 → 「已恢复」告警。**去抖**:只在状态翻转时发,不每分钟刷屏。
-  - 顺手轮转 `logs/launchd.log`(超 `health.log_rotate_mb`=20MB)。
+- **The daemon plist**: `KeepAlive=true` restarts the process whenever it exits, and `ThrottleInterval=30` keeps a crash loop from becoming a restart storm.
+- **But `KeepAlive` cannot rescue a process that is alive and wedged** — when the long connection has dropped, the event loop is blocked, or the tick lock is stuck, the process is still there and launchd does nothing.
+- **The watchdog** (a separate process, every 60s) probes `/healthz`, reads the `liveness` heartbeat and checks `launchctl` status, then decides:
+  - The process is not running → `launchctl kickstart` to start it, plus an alert.
+  - The process is running but **wedged** (liveness has expired and the probe has failed the threshold number of times in a row):
+    - **with a gate still running** → alert that the kill is being held off, and only `kickstart -k` if it is still wedged after the grace window (`wedged_grace_sec`, 300s). This is what **stops an in-flight claude or codex call being interrupted and its tokens wasted**. Orphans are reclaimed automatically after the restart.
+    - with no gate running → `kickstart -k` immediately, plus an alert.
+  - Recovered → a "recovered" alert. It is **debounced**: alerts fire when the state flips, not every minute.
+  - It also rotates `logs/launchd.log` in passing, once it exceeds `health.log_rotate_mb` (20MB).
 
-参数都在 `config/runtime.yaml › health`,端口可被 `FORGE_HEALTH_PORT` 覆盖。手动活检:`./forge health`(加 `--json` 出结构化)。
+Every parameter lives in `config/runtime.yaml › health`, and the port can be overridden by `FORGE_HEALTH_PORT`. To check by hand: `./forge health`, or `--json` for structured output.
 
-## 二·五、换成 Slack(可选)
+## 2.5 Switching to Slack (optional)
 
-传输层是一条缝(`MessagingPort`),飞书和 Slack 是它的两个实现,**核心一行不用动**。
-在 `config/forge.env` 里设 `FORGE_MESSAGING_PROVIDER=slack`,再填那几个 `SLACK_*`
-(键与含义见 `config/forge.env.example` 的内联注释)。零新依赖:Web API 走原生 `fetch`,
-Socket Mode 走 Node 内置 `WebSocket`。
+The transport is a seam (`MessagingPort`) with Feishu and Slack as two implementations of it, and **not one line of the core changes**. Set `FORGE_MESSAGING_PROVIDER=slack` in `config/forge.env` and fill in the handful of `SLACK_*` values (each key and what it means is documented inline in `config/forge.env.example`). No new dependencies: the Web API goes through the native `fetch`, and Socket Mode through Node's built-in `WebSocket`.
 
-> ⚠️ **写错 provider 名服务会直接起不来**,这是有意的。静默回退到飞书意味着:你以为接了 Slack,
-> 实际所有审批卡照发飞书,而 Slack 那边一片空白——**没有任何症状**。宁可起不来。
+> ⚠️ **A misspelled provider name stops the service from starting**, deliberately. Falling back to Feishu silently would mean you believe you are on Slack while every approval card still goes to Feishu and Slack stays empty — **with no symptom at all**. Better that it refuses to start.
 
-Slack 后台(api.slack.com/apps → 建 App)要开的东西:
+What to switch on in the Slack console (api.slack.com/apps → create an App):
 
-1. **OAuth & Permissions → Bot Token Scopes**:`chat:write`、`channels:history`、`groups:history`、
-   `im:write`、`users:read`。装进工作区后拿到 `xoxb-…` → `SLACK_BOT_TOKEN`。
-2. **Socket Mode → 打开**;在 **Basic Information → App-Level Tokens** 建一枚带 `connections:write`
-   的 token(`xapp-…`)→ `SLACK_APP_TOKEN`。
-3. **Event Subscriptions → 订阅** `message.channels` / `message.groups` / `message.im`。
-4. **Interactivity & Shortcuts → 打开**。这条**必开**:Slack 的输入框在消息里不合法,评审表单只能走
-   modal,不开的话按钮点了没反应。
-5. 把 bot `/invite` 进要观察的频道,频道 id 填 `SLACK_WATCH_CHANNELS`;bot 自身 user id 填
-   `SLACK_BOT_USER_ID`(**不填等于哑火**:判不出群消息有没有 @ 到它 → 一律保守忽略)。
+1. **OAuth & Permissions → Bot Token Scopes**: `chat:write`, `channels:history`, `groups:history`, `im:write`, `users:read`. Install it into the workspace and you get an `xoxb-…` token → `SLACK_BOT_TOKEN`.
+2. **Socket Mode → on**; under **Basic Information → App-Level Tokens** create a token with `connections:write` (an `xapp-…`) → `SLACK_APP_TOKEN`.
+3. **Event Subscriptions → subscribe** to `message.channels` / `message.groups` / `message.im`.
+4. **Interactivity & Shortcuts → on**. This one is **required**: Slack's input elements are not valid inside a message, so a review form can only be a modal, and without it pressing the button does nothing.
+5. `/invite` the bot into the channels you want watched and put their ids in `SLACK_WATCH_CHANNELS`; put the bot's own user id in `SLACK_BOT_USER_ID` (**leaving it empty is as good as switching the bot off**: it cannot tell whether a channel message mentioned it, so it conservatively ignores every one).
 
-跑 `FORGE_MESSAGING_PROVIDER=slack ./forge doctor` 会逐项体检上面这些。
+Running `FORGE_MESSAGING_PROVIDER=slack ./forge doctor` checks each of those in turn.
 
-**与飞书唯一的体验差异**:评审/立项表单是「卡片上一个按钮 → 弹出 modal 填 → 一次提交」,
-而不是飞书那样直接在卡片里填。原因见上一条第 4 点,这是 Slack 平台的限制,不是实现取巧。
+**The one difference in feel from Feishu**: the review and filing forms are "a button on the card → a modal opens → submit once", rather than filling the form in on the card itself. The reason is point 4 above — a platform limitation, not a shortcut in the implementation.
 
-### 需求文档从哪来
+### Where the requirement document comes from
 
-读需求文档也是一条独立的缝(`DocSourcePort`,注册表而非选择点——一条消息里可能同时贴好几个源的链接)。
-默认注册两个:
+Reading the requirement document is a separate seam of its own (`DocSourcePort`) — a registry rather than a selection point, because one message may carry links from several sources at once. Two are registered by default:
 
-- **飞书文档**——认 `wiki/docx/docs` 链接,能回写机审批注;
-- **plaintext(兜底,默认关)**——把「@机器人 + 一段话」本身当成需求正文,不需要任何文档服务。
-  在 `config/runtime.yaml` 里 `doc_sources.plaintext.enabled: true` 打开。
-  ⚠️ 开了之后这类消息会**真的建需求、跑闸A = 自动花钱**;今天它们只会被忽略。归一后不足 20 字的
-  (「收到,谢谢」这类)不会被当成需求。
+- **Feishu documents** — it recognises `wiki`, `docx` and `docs` links, and can write the review comments back;
+- **plaintext (the fallback, off by default)** — it treats "@bot plus a paragraph" as the requirement body itself, needing no document service. Switch it on with `doc_sources.plaintext.enabled: true` in `config/runtime.yaml`.
+  ⚠️ Once it is on, a message like that **really does file a requirement and run gate A, which spends money automatically**; today such messages are simply ignored. Anything below the substance threshold once normalised (a "thanks, got it") is not treated as a requirement.
 
-接 Slack 而手上没有文档服务时,把 plaintext 打开就能跑通全链路。
+If you are on Slack with no document service to hand, switching plaintext on is enough to run the whole chain.
 
 ---
 
-## 三、⚠️ 飞书开发者后台需开(只有你能做,长连接收事件的前提)
+## 3. ⚠️ What to switch on in the Feishu developer console (only you can do this, and the long connection depends on it)
 
-> 用 Slack 的话跳过本节,看上面的「二·五」。
+> On Slack, skip this section and read 2.5 above.
 
-在飞书开发者后台建一个企业自建应用(把 App ID/Secret 填进 `config/forge.env`),开这些后**发布新版**(企业自建需管理员审核生效):
+Create an internal app in the Feishu developer console (and put its App ID and secret into `config/forge.env`), switch the following on, and then **publish a new version** — an internal app needs an administrator to approve it before it takes effect:
 
-1. **事件与回调 → 订阅方式 → 选「使用长连接接收事件/回调」**(不是 webhook URL)。
-2. **订阅事件**:
-   - `im.message.receive_v1`(接收消息 → 群消息入口)
-   - 卡片回调(`card.action.trigger`,交互卡按钮)—— 开发者后台「卡片回传交互」/事件里勾选。
-3. **权限**(权限管理 → 开通 → 发版):
-   - 基础(收 @机器人 消息 + 发卡):`im:message.group_at_msg:readonly` + 已有 `im:message:send`。此档下 **PM 必须 @机器人** 才触发。
-   - **PM 免 @ 入口**(直接贴链接即评审,体感更好):额外开 `im:message.group_msg`(收**非 @** 的群消息内容)。
-     代码侧已就绪——adapter 设了 `policy.requireMention:false`(`src/messaging/feishu.ts`),`handleMessage` 只看有无飞书 doc 链接、不要求 @;**唯一前提就是这条 scope**(服务端不开则飞书根本不推非 @ 消息)。
-   - **离线补拉**额外需 `im:message.history:readonly`(读群历史,断连/休眠期间漏的消息开机补回)。
-   - 补拉还会用 `im:chat:readonly` 问一次「这个会话是群还是私聊」(只在历史条目自身不带 `chat_type` 时才问,
-     且按会话记忆,一个进程一次)。**不给也能跑**,但判不出来时一律当群处理——于是**离线期间私聊过来的需求
-     会被「群里没 @ 我」的入口闸丢掉**。只用群入口就无所谓;允许私聊贴需求就该给。
-   - 群消息入口还需把 **bot 拉进那个群**。
-4. **私聊推送目标**已通(`union_id`,见 `config/forge.env`);观察群 `FEISHU_WATCH_CHATS`。
+1. **Events & callbacks → subscription method → choose "receive events and callbacks over a long connection"** (not a webhook URL).
+2. **Subscribe to the events**:
+   - `im.message.receive_v1` (receiving messages, which is the channel entry point)
+   - the card callback (`card.action.trigger`, for interactive card buttons) — tick it under the console's card-callback section.
+3. **Permissions** (permission management → grant → publish):
+   - The basics, receiving messages that @-mention the bot and posting cards: `im:message.group_at_msg:readonly` plus the `im:message:send` you already have. At this level **product has to @-mention the bot** for anything to happen.
+   - **Letting product skip the mention** (pasting a link is enough, which feels better): additionally grant `im:message.group_msg`, which receives channel messages that do **not** mention the bot.
+     The code is already ready for it — the adapter sets `policy.requireMention:false` (`src/messaging/feishu.ts`), and `handleMessage` only looks for a document link rather than requiring a mention. **This scope is the only prerequisite**: without it the server never pushes an un-mentioned message at all.
+   - **Offline backfill** additionally needs `im:message.history:readonly`, to read channel history and recover messages missed while disconnected or asleep.
+   - Backfill also uses `im:chat:readonly` to ask once whether a chat is a group or a direct message. It only asks when a history entry does not carry `chat_type` itself, and it remembers the answer per chat, so one process asks once. **It runs without this permission**, but when it cannot tell it treats every chat as a group — so **a requirement sent by direct message while offline is dropped by the "nobody mentioned me in the channel" intake gate**. If you only ever use the channel entry point this does not matter; if people may send requirements by direct message, grant it.
+   - The channel entry point also needs the **bot added to that channel**.
+4. **The direct-message target** is already wired up (`union_id`, see `config/forge.env`), and the watched chats go in `FEISHU_WATCH_CHATS`.
 
-没开第 1/2 步:`forge listen` 仍跑(周期 tick + 私聊通知),但**按钮点了无反应、群消息收不到**。开了即生效(daemon 会自动收到回调)。
+Without steps 1 and 2, `forge listen` still runs (the periodic tick and direct-message notifications), but **pressing a button does nothing and channel messages never arrive**. Switching them on takes effect immediately — the daemon starts receiving the callbacks on its own.
 
-## 四、通知渠道与配置
+## 4. Notification channels and configuration
 
-`src/notify.ts` 统一出口:**bot 私聊卡片(2.0,带按钮) → webhook 兜底**;**桌面 + 日志永远兜底**。
-- bot:`config/forge.env` 的 `FEISHU_BOT_APP_ID/SECRET` + `FEISHU_DM_UNION_ID`(已配)。
-- 关桌面通知:`NOTIFY_DESKTOP=0`。
+`src/notify.ts` is the single outbound point: **a bot direct-message card (schema 2.0, with buttons), falling back to the webhook**; **the desktop and the log are always the final fallback**.
 
-## 五、卡片驱动的全流程(按钮接通后)
+- The bot: `FEISHU_BOT_APP_ID` / `SECRET` plus `FEISHU_DM_UNION_ID` in `config/forge.env` (already configured).
+- To turn desktop notifications off: `NOTIFY_DESKTOP=0`.
+
+## 5. The whole flow, driven from cards (once the buttons are wired up)
 
 ```
-群里发 PRD 链接 → 自动 addPrd → 闸A → 私聊「🔴 待确认」卡
-  └ 选结论+批注+提交 → confirm → 「✅ 已确认」卡(带「🛠 出技术方案」按钮)
-      └ 点「出技术方案」 → 闸B+对抗 → 「🟡 待 GO」卡(带「✅放行/❌驳回」)
-          └ 点「放行」 → 建 issue → 「✅ 已建需求」卡(带链接)
-失败任何一步 → 「❌ 失败」卡(带「🔁 重跑」)
+a PRD link posted in a channel -> addPrd automatically -> gate A -> a "🔴 awaiting confirmation" direct message
+  └ choose a verdict, add notes, submit -> confirm -> a "✅ confirmed" card, carrying a "🛠 produce the technical plan" button
+      └ press it -> gate B plus the adversarial review -> a "🟡 awaiting the go-ahead" card, with "✅ go / ❌ deny"
+          └ press go -> the issues are created -> a "✅ filed" card, with the links
+any step failing -> a "❌ failed" card, carrying "🔁 retry"
 ```
-全程在飞书私聊点按钮,不碰终端。
 
-> 卡片对外用**人话**:每张卡头部 = **需求编号 `REQ-n` · 标题**,状态用「需求评审中 / 待产品确认 / 待出技术方案 / 待拍板立项」等(闸A/闸B 黑话只留代码内)。编号收到即分配、全程流转,并写进建出的 GitHub issue 正文。
+The whole thing happens by pressing buttons in a direct message, without touching a terminal.
 
-## 六、可靠性:防休眠 · 自动备份 · 离线补拉
+> Cards speak **plain language**: each card's header is the **requirement number `REQ-n` and its title**, and the state reads as "reviewing the requirement", "waiting on product to confirm", "waiting for the technical plan", "waiting on the go-ahead" and so on. The gate A / gate B jargon stays inside the code. The number is assigned the moment a requirement arrives, follows it all the way through, and is written into the body of the GitHub issues it creates.
 
-让"跑在随身笔记本上"也敢被人依赖,三道保障(均已内置,无需额外操作):
+## 6. Reliability: staying awake, automatic backups, and offline backfill
 
-1. **防休眠**:`forge-daemon` 用 `caffeinate -is` 包住 daemon → Mac 醒着(在公司/家开着)就不空闲/系统休眠,长连接不断。
-   > 合盖入包仍会睡(系统级,非 sudo 改不了);但醒来后**离线补拉**会补回那段时间的群消息,不漏需求。
-2. **自动备份**:daemon 每小时把 `state/service.db` 在线备份(`node:sqlite` 原生 backup,持连接安全)到 `state/backups/`,留最近 14 份。启动也立刻备一份。
-   - **恢复**(数据损坏/误删时):
+Three safeguards make "running on the laptop I carry around" something people can actually rely on. All three are built in and need nothing from you:
+
+1. **Staying awake**: `forge-daemon` wraps the daemon in `caffeinate -is`, so while the Mac is awake — at the office, or at home with the lid open — it neither idles nor system-sleeps, and the long connection holds.
+   > Closing the lid and putting it in a bag still sleeps it; that is a system-level behaviour and cannot be changed without sudo. On waking, **offline backfill** recovers the channel messages from that window, so no requirement is lost.
+2. **Automatic backups**: every hour the daemon takes an online backup of `state/service.db` into `state/backups/` (using `node:sqlite`'s native backup, which is safe with the connection open), keeping the most recent 14. It also takes one immediately at startup.
+   - **To restore** (after corruption, or an accidental delete):
      ```bash
-     launchctl bootout gui/$(id -u)/com.forge.daemon        # 先停 daemon
-     cp state/backups/service-<最近时间戳>.db state/service.db    # 用最近备份覆盖
+     launchctl bootout gui/$(id -u)/com.forge.daemon        # stop the daemon first
+     cp state/backups/service-<most recent timestamp>.db state/service.db    # overwrite with the most recent backup
      launchctl bootstrap gui/$(id -u) ~/Library/LaunchAgents/com.forge.daemon.plist
      ```
-3. **离线补拉**:关机/休眠期间飞书长连接不补推事件 → 开机/断线重连/每周期,daemon 用 `im.v1.message.list` 拉群历史,按 `chat_cursor` 水位把漏掉的 PRD 补登记。游标只前进 + 按 URL 去重 → 不漏不重。需 `im:message.group_msg` 权限(见三)。
+3. **Offline backfill**: while the machine is shut down or asleep, the long connection does not redeliver the events it missed. So at startup, on every reconnect, and on every cycle, the daemon pulls channel history through `im.v1.message.list` and registers the PRDs it missed, using the `chat_cursor` watermark. The cursor only moves forward and entries are deduplicated by URL, so nothing is missed and nothing is registered twice. It needs the `im:message.group_msg` permission (see section 3).
 
-## 七、本地状态页(类 status.claude.ai)
+## 7. The local status page (in the spirit of status.claude.ai)
 
-守护进程内嵌一个**仅绑 `127.0.0.1`** 的健康服务(零外部依赖,gate 跑期间也响应——claude/codex 是 async spawn 不堵 event loop)。
+The daemon embeds a health service bound to **`127.0.0.1` only** (with no external dependencies, and it answers even while a gate is running — claude and codex are spawned asynchronously and never block the event loop).
 
-| 路由 | 用途 |
+| Route | What it is for |
 | --- | --- |
-| `GET /` | 状态页 HTML:总状态横幅 + 组件健康灯 + 近 72h 在线率横条 + PRD 流水线看板(高亮卡住的 `AWAITING_*` / `*_FAILED`) |
-| `GET /healthz` | 极简 `200 ok`(看门狗廉价探针) |
-| `GET /health` | 实时健康 JSON(守护/长连接/DB/备份/依赖/磁盘/业务停泊) |
-| `GET /api/board` | 看板数据(按状态分组 + 需关注 session) |
-| `GET /api/history` | 滚动历史(在线率 + 宕机/恢复时间线;`?hours=72`) |
+| `GET /` | The status page HTML: an overall banner, a health light per component, a bar of uptime over the last 72h, and the PRD pipeline board, highlighting anything stuck in `AWAITING_*` or `*_FAILED` |
+| `GET /healthz` | A minimal `200 ok` (the watchdog's cheap probe) |
+| `GET /health` | Live health as JSON (the daemon, the long connection, the database, backups, dependencies, disk, and parked work) |
+| `GET /api/board` | The board's data (grouped by state, plus the sessions needing attention) |
+| `GET /api/history` | The rolling history (uptime plus a timeline of outages and recoveries; `?hours=72`) |
 
-健康分级:`healthy`(全绿) / `degraded`(长连接断、依赖缺、备份停滞、磁盘紧、有 `*_FAILED`) / `down`(心跳缺失/卡死、DB 打不开、磁盘见底)。守护每 60s 落一行 `health_sample`(SQLite,按 `history_retain_hours` 剪枝),状态页据此画在线率;**总状态翻转**时守护自己发飞书(进程级宕机/卡死则由看门狗发,因为那时守护已发不出)。
+The health grades are `healthy` (everything green), `degraded` (the long connection is down, a dependency is missing, backups have stalled, disk is tight, or something is `*_FAILED`), and `down` (the heartbeat is missing or the process is wedged, the database will not open, or the disk is full). Every 60s the daemon writes one `health_sample` row to SQLite, pruned according to `history_retain_hours`, and the status page draws its uptime from those. When the **overall state flips**, the daemon sends the alert itself — except for a process-level outage or a wedge, where the watchdog sends it, because by then the daemon cannot.
 
-打开:`open http://127.0.0.1:4319/`。
+Open it with `open http://127.0.0.1:4319/`.
 
-## 八、Mac mini 无人值守部署
+## 8. Deploying to an unattended Mac mini
 
-1. **自动登录**:系统设置 → 用户与群组 → 自动以你的账户登录(LaunchAgent 需登录态 keychain 才有 claude/codex/gh 凭据;别用 LaunchDaemon)。
-2. **防睡**:`forge-daemon` 已用 `caffeinate -is`;系统级再加 `sudo pmset -a sleep 0 disablesleep 1`(Mac mini 常插电,可一直醒)。
-3. **装服务**:`./deploy/install.sh`(守护 + 看门狗 + git hook 一把装好)。
-4. **远程看状态页**:不对外开端口——走 SSH 隧道在你本机看:
+1. **Log in automatically**: System Settings → Users & Groups → log in automatically as your account. A LaunchAgent needs a logged-in session's keychain for the claude, codex and gh credentials, so do not use a LaunchDaemon.
+2. **Stop it sleeping**: `forge-daemon` already uses `caffeinate -is`; add `sudo pmset -a sleep 0 disablesleep 1` at the system level too (a Mac mini is usually on mains power and can stay awake indefinitely).
+3. **Install the service**: `./deploy/install.sh` installs the daemon, the watchdog and the git hook in one go.
+4. **Reading the status page remotely**: do not expose the port. Use an SSH tunnel and read it locally:
    ```bash
-   ssh -L 4319:127.0.0.1:4319 mini   # 然后本机浏览器开 http://127.0.0.1:4319/
+   ssh -L 4319:127.0.0.1:4319 mini   # then open http://127.0.0.1:4319/ in your own browser
    ```
-5. **告警通路**:确认 `config/forge.env` 的 `FEISHU_BOT_APP_*` + `FEISHU_DM_*` 已配——挂了/卡了/恢复都私聊推你。
-6. **日志**:看门狗按大小轮转 `launchd.log`;想交系统统一管理见 `deploy/newsyslog/`(可选,需 sudo)。
+5. **The alerting path**: check that `FEISHU_BOT_APP_*` and `FEISHU_DM_*` are set in `config/forge.env` — an outage, a wedge and a recovery are all pushed to your direct messages.
+6. **Logs**: the watchdog rotates `launchd.log` by size. To hand the job to the system instead, see `deploy/newsyslog/` (optional, and it needs sudo).

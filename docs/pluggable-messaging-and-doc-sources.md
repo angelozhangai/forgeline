@@ -164,7 +164,7 @@ unit-testable with no network. The adapter keeps only the API call.
 
 - **Zero Feishu markup leaks into the core.** A sweep for `<font>` / `<at>` / `lark_md` outside the
   adapter returns nothing. The core's prose blocks carry portable markdown only (`**bold**`). The
-  worry recorded in [messaging/feishu.ts](../src/messaging/feishu.ts)'s header — "唯一受控残留" — turns
+  worry recorded in [messaging/feishu.ts](../src/messaging/feishu.ts)'s header — "the one controlled leftover" — turns
   out not to exist. Slack needs a plain markdown → mrkdwn conversion, not a Feishu-dialect parser.
 - **`status_msg_id` / `intake_msg_id` are fully opaque to the core** — only stored and handed back to
   `port.*`. Slack's `chat.update` needs *both* channel and `ts`, which the `editGroupCard(messageId, …)`
@@ -363,7 +363,7 @@ does nothing when clicked, it opens a degraded free-text modal that still carrie
 | | Task | Files |
 | --- | --- | --- |
 | 4.1 | `ProbeDep` `'feishu'` → `'im'` + `UPDATE contract_probe SET dep='im' WHERE dep='feishu'` | `llm/probes.ts`, `health/contract.ts`, `store/db.ts` |
-| 4.2 | Health label from `port.id` instead of the literal "飞书长连接"; doctor split per provider | `health/check.ts`, `index.ts` |
+| 4.2 | Health label from `port.id` instead of a hardcoded "Feishu long connection"; doctor split per provider | `health/check.ts`, `index.ts` |
 | 4.3 | README / AGENTS.md / deploy docs: Slack setup + how to register a document source | `README.md`, `AGENTS.md`, `deploy/` |
 
 **DoD**: `grep -ri feishu src/` matches only `src/feishu/`, `src/messaging/feishu.ts`, `src/docs/feishu.ts`.
@@ -379,7 +379,7 @@ the name:
    could not name the old thing could not migrate it.
 
 Everything else went: `ProbeDep` `'feishu'` → `'im'` (with migration v2 rewriting stored rows), the health
-label now reads `${port.id} 长连接`, and the daemon's user-facing log lines name the live provider instead
+label now reads `${port.id} long connection`, and the daemon's user-facing log lines name the live provider instead
 of assuming one.
 
 Two changes worth calling out because they are behavioural, not cosmetic:
