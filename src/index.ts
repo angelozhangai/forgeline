@@ -5,6 +5,7 @@ import { SVC_DIR, SCRIPTS_DIR, ENV_FILE, EXT_DIR } from './root.ts';
 import { loadConfig } from './config.ts';
 import { project, defaultProjectId } from './projects.ts';
 import { layoutCheck } from './project.ts';
+import { rehearse } from './rehearse.ts';
 import { parseHumanAsks } from './gates/envelopes.ts';
 import { commandExists, runSync } from './util/proc.ts';
 import { out, log } from './util/log.ts';
@@ -68,6 +69,8 @@ Usage: ./forge <command> [arguments]
   status-page                         preview the status page on its own (health service only: no tick, no IM, no cost; Ctrl-C to exit)
   watchdog                            one watchdog pass: probe, self-heal, alert (launchd's StartInterval calls it; rarely typed by hand)
   contract-check                      actively probe the external CLI/API output contracts (one paid trivial call each for codex and claude, free for gh and IM) -> persist and alert on drift
+  rehearse [--only dm|channel]        send every card Forge can produce to your real chat and print what the buttons send back · **no model call, no database write, no issue, no cost**
+           [--listen] [--pause ms]    --listen also keeps the connection open to catch the callbacks (ctrl-c to stop)
   add --prd <document link> [--slug s] register a PRD (read the document and create a session; which source a link belongs to is decided by the registry)
       [--title t] [--branch prod|dev] [--chat <chatId>] [--project <id>]
   tick                                advance every ready session (Gate A / Gate B plus the adversarial review)
@@ -496,6 +499,23 @@ async function main(): Promise<void> {
     case 'watchdog': {
       const d = await runWatchdog();
       out(`watchdog: ${d.klass} · action=${d.action.kind}${d.livenessAgeSec != null ? ` · liveness ${d.livenessAgeSec}s ago` : ''}`);
+      break;
+    }
+    case 'rehearse': {
+      // The free rehearsal: prove the provider accepts every card and really returns a form submission,
+      // without a gate run standing between you and the answer. It writes nothing anywhere.
+      const only = str(flags.only);
+      if (only && only !== 'dm' && only !== 'channel') {
+        out(`unknown --only ${only} (expected dm or channel)`);
+        process.exitCode = 1;
+        break;
+      }
+      const pause = Number(str(flags.pause) ?? '');
+      await rehearse({
+        only: (only as 'dm' | 'channel' | undefined) ?? 'all',
+        listen: flags.listen === true,
+        pauseMs: Number.isFinite(pause) && pause >= 0 ? pause : undefined,
+      });
       break;
     }
     case 'contract-check': {
