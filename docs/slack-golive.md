@@ -20,7 +20,8 @@ answers them:**
 3. the planned `disconnect` (`refresh_requested`) really arrives about every half hour;
 4. an ack really lands inside Slack's 3-second window under real latency.
 
-This runbook clears all four in one sitting. Steps 1–4 answer questions 1, 2 and 4; step 6 answers question 3.
+This runbook clears all four in one sitting: steps 1–4 get you to a live card, **step 5 answers questions 1,
+2 and 4**, and **step 7 answers question 3** (it is the one that just needs an hour of wall clock).
 
 ## Before you start
 
@@ -46,8 +47,10 @@ answers show up in the log rather than in Slack.
 2. **`./forge contract-check`** → the `conversations.history` envelope probe passes. This is the first call
    that proves the token and the scopes are real. The Slack probe itself is free and read-only; the same
    command also probes claude and codex with one trivial **paid** call each.
-3. **Start the daemon** (`./forge listen`, or `./deploy/install.sh` for the resident pair) and confirm the log
-   says the Socket Mode connection is open.
+3. **Start the daemon** (`./forge listen`, or `./deploy/install.sh` for the resident pair). Confirm the Socket
+   Mode connection is actually up with `./forge health --json` → `ws.connected: true` (the status page shows
+   the same thing). Do not take "no error in the log" for a connection: with the bot credentials missing the
+   daemon degrades on purpose to the periodic tick with no connection at all, and says so once.
 4. **@-mention the bot in a watched channel** with a requirement (a paragraph, if `plaintext` is on; a
    recognised document link otherwise) → a session is created and a status card appears in the channel.
    *If nothing happens*, the log distinguishes the two causes: `no document source claimed this message`
