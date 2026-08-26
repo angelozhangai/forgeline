@@ -15,6 +15,7 @@
 //
 // Safety: the only outward effect is messages in the chat you configured. The fake session never reaches
 // the store, so no button click can advance anything; a click is caught here, printed, and dropped.
+import { createHash } from 'node:crypto';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -205,17 +206,27 @@ export async function sendCorpus(o: RehearseOpts = {}, p: SendPort = port): Prom
 
 // What one incoming callback means. Pure, and the whole point of the listening half — so it is decided here
 // and merely printed below.
-//   duplicate: the provider redelivered a callback it had already sent, which is what a missed ack looks
+//   duplicate: the provider **redelivered** a callback it had already sent, which is what a missed ack looks
 //              like from this side (there is no other way to observe the ack window from outside);
 //   foreign:   the slug is not the rehearsal one, so this click came from a real card and must not be read
 //              as a rehearsal result.
+//
+// The key is a fingerprint of the **raw payload**, not of the parsed action, and the difference is the whole
+// point. A redelivery is the same payload sent again, byte for byte. A person pressing the same button twice
+// produces two payloads that differ — every provider stamps each interaction with something unique (Slack
+// puts a fresh trigger_id and action_ts on each one). Keyed on {action, slug, formValues}, those two cases
+// are indistinguishable, and this reported "the ack missed its window" for what was really an impatient
+// double click. It said so with total confidence, which is the worst way for a diagnostic to be wrong.
+//
+// The residual risk is stated rather than hidden: a provider that sent byte-identical payloads for two
+// distinct clicks would be misread here — but nothing observing from outside could tell those apart at all.
 export interface Observation {
-  count: number; // how many times this exact callback has now arrived (1 = first time)
+  count: number; // how many times this exact payload has now arrived (1 = first time)
   duplicate: boolean;
   foreign: boolean;
 }
-export function observeCallback(seen: Map<string, number>, a: Pick<InboundCardAction, 'action' | 'slug' | 'formValues'>): Observation {
-  const key = `${a.action}|${a.slug}|${JSON.stringify(a.formValues)}`;
+export function observeCallback(seen: Map<string, number>, a: Pick<InboundCardAction, 'slug'>, raw: unknown): Observation {
+  const key = createHash('sha1').update(JSON.stringify(raw) ?? '').digest('hex');
   const count = (seen.get(key) ?? 0) + 1;
   seen.set(key, count);
   return { count, duplicate: count > 1, foreign: a.slug !== REHEARSAL_SLUG };
@@ -253,7 +264,7 @@ export function listenForCallbacks(): { close: () => void } {
         log.warn(`     ${JSON.stringify(raw).slice(0, 400)}`);
         return;
       }
-      const o = observeCallback(seen, a);
+      const o = observeCallback(seen, a, raw);
       const at = `${((Date.now() - started) / 1000).toFixed(1)}s`;
       log.ok(`  <- ${at}  action=${a.action}  slug=${a.slug}  by=${a.operatorId ?? '?'}`);
       log.info(`     value      ${JSON.stringify(a.value)}`);
