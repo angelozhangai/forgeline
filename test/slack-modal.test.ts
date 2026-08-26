@@ -7,9 +7,9 @@
 // Warning: what is pinned here is our handling, not Slack's actual behaviour — an integration pass
 // against a real workspace remains on the unverified list in the PR.
 process.env.FORGE_DB = ':memory:';
-import { test } from 'node:test';
+import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { buildDecisionModal, buildGoModal, flattenStateValues, parseViewSubmission, type ModalContext } from '../src/slack/modal.ts';
+import { buildDecisionModal, buildGoModal, flattenStateValues, freezeFormBlocks, parseViewSubmission, SUBMIT_ACTION_PREFIX, type ModalContext } from '../src/slack/modal.ts';
 import type { DecisionItem } from '../src/gates/envelopes.ts';
 
 const ITEMS: DecisionItem[] = [
@@ -157,4 +157,81 @@ test('dropdown option text/value cap at 75; the value gets no ellipsis (it is fe
   const opt = (v.blocks as { element: { options: { text: unknown; value: string }[] } }[])[0].element.options[0];
   assert.ok(lenOf(textOf(opt.text)) <= 75);
   assert.equal(opt.value, 'x'.repeat(75));
+});
+
+// -- Freezing a submitted form ------------------------------------------------
+// A modal used to give feedback for free: it closed. An inline form gives none — the card sits there with
+// its options still editable and its button still pressable, so "did that work?" has no answer and pressing
+// again is the obvious next move. The card is therefore rewritten on submission, out of the callback's own
+// contents (Slack sends the original message back with it), so nothing has to be remembered between the two.
+describe('freezeFormBlocks', () => {
+  const card = (): Record<string, unknown>[] => [
+    { type: 'header', text: { type: 'plain_text', text: 'Requirement review' } },
+    { type: 'section', text: { type: 'mrkdwn', text: 'the summary' } },
+    { type: 'input', block_id: 'ask_H1', label: { type: 'plain_text', text: '1. Calendar months or fiscal months?' }, element: { type: 'radio_buttons', action_id: 'ask_H1' } },
+    { type: 'input', block_id: 'ask_H2', label: { type: 'plain_text', text: '2. How far back?' }, element: { type: 'radio_buttons', action_id: 'ask_H2' } },
+    { type: 'input', block_id: 'notes', label: { type: 'plain_text', text: 'Notes' }, element: { type: 'plain_text_input', action_id: 'notes' } },
+    { type: 'actions', elements: [{ type: 'button', action_id: `${SUBMIT_ACTION_PREFIX}confirm_submit`, text: { type: 'plain_text', text: 'Submit' } }] },
+  ];
+  const state = {
+    values: {
+      ask_H1: { ask_H1: { type: 'radio_buttons', selected_option: { value: 'fiscal months' } } },
+      ask_H2: { ask_H2: { type: 'radio_buttons', selected_option: null } },
+      notes: { notes: { type: 'plain_text_input', value: 'check the second one' } },
+    },
+  };
+
+  test('the inputs and the submit button are gone — pressing it twice stops being possible', () => {
+    const { blocks } = freezeFormBlocks(card(), state, 'U1', 1_700_000_000);
+    assert.equal(blocks.filter((b) => b.type === 'input').length, 0);
+    assert.equal(blocks.filter((b) => b.type === 'actions').length, 0);
+    assert.equal(blocks[0].type, 'header', 'everything that was not the form is kept as it was');
+  });
+
+  test('the answers are shown against the questions as the person read them, and an unanswered one says so rather than vanishing', () => {
+    const { blocks, answered } = freezeFormBlocks(card(), state, 'U1', 1_700_000_000);
+    const summary = JSON.stringify(blocks);
+    assert.match(summary, /Calendar months or fiscal months\?.*fiscal months/);
+    assert.match(summary, /How far back\?.*not answered/);
+    assert.match(summary, /check the second one/);
+    assert.equal(answered, 2, 'two of the three fields were filled in');
+  });
+
+  test("the summary names the option the person read, not its internal value — '__other__' means nothing to them", () => {
+    const withLabels = {
+      values: {
+        ask_H1: { ask_H1: { type: 'radio_buttons', selected_option: { value: '__other__', text: { type: 'plain_text', text: 'Other (write it in the notes below)' } } } },
+        ask_H2: { ask_H2: { type: 'radio_buttons', selected_option: { value: '24 months', text: { type: 'plain_text', text: '24 months' } } } },
+        notes: { notes: { type: 'plain_text_input', value: 'fiscal, actually' } },
+      },
+    };
+    const { blocks } = freezeFormBlocks(card(), withLabels, 'U1', 1_700_000_000);
+    const summary = JSON.stringify(blocks);
+    assert.match(summary, /Other \(write it in the notes below\)/);
+    assert.doesNotMatch(summary, /__other__/, 'the sentinel is for the core, never for the reader');
+    assert.match(summary, /fiscal, actually/, 'a free-text field has no label, so its own value is what is shown');
+  });
+
+  test('it says who submitted and when — the acknowledgement is the whole point', () => {
+    const { blocks } = freezeFormBlocks(card(), state, 'U1', 1_700_000_000);
+    const last = JSON.stringify(blocks[blocks.length - 1]);
+    assert.match(last, /Submitted by <@U1>/);
+    assert.match(last, /1700000000/, 'the timestamp goes back as an epoch so each reader sees their own timezone');
+  });
+
+  test('an ordinary action button on the same card survives — only the form is closed', () => {
+    const withOther = [...card(), { type: 'actions', elements: [{ type: 'button', action_id: 'forge_retry_slug', text: { type: 'plain_text', text: 'Retry' } }] }];
+    const { blocks } = freezeFormBlocks(withOther, state, 'U1', 1_700_000_000);
+    const actions = blocks.filter((b) => b.type === 'actions') as { elements: { action_id: string }[] }[];
+    assert.equal(actions.length, 1);
+    assert.equal(actions[0].elements[0].action_id, 'forge_retry_slug');
+  });
+
+  test('a card with no form at all is left alone apart from the acknowledgement', () => {
+    const plain = [{ type: 'section', text: { type: 'mrkdwn', text: 'nothing to fill in' } }];
+    const { blocks, answered } = freezeFormBlocks(plain, { values: {} }, 'U1', 1_700_000_000);
+    assert.equal(answered, 0);
+    assert.equal(blocks[0].type, 'section');
+    assert.equal(blocks.length, 2, 'the original block plus the acknowledgement line');
+  });
 });

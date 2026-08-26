@@ -98,26 +98,33 @@ describe('forge rehearse — the sending half', () => {
 
 describe('forge rehearse — reading one callback', () => {
   const action = { action: 'confirm_submit', slug: REHEARSAL_SLUG, formValues: { ask_0: 'Option A' } };
+  // Two payloads for the same button: providers stamp each interaction with something unique (Slack puts a
+  // fresh trigger_id and action_ts on every one), so these are what a person pressing twice really sends.
+  const press = (trigger: string) => ({ type: 'block_actions', trigger_id: trigger, actions: [{ type: 'button', action_id: 'forge_submit_confirm_submit' }] });
 
-  test('the first arrival is ordinary; the same callback again is a redelivery, which is what a missed ack looks like', () => {
+  test('the identical payload arriving again is a redelivery — which is what a missed ack looks like from outside', () => {
     const seen = new Map<string, number>();
-    const first = observeCallback(seen, action);
+    const raw = press('trg-1');
+    const first = observeCallback(seen, action, raw);
     assert.deepEqual({ count: first.count, duplicate: first.duplicate }, { count: 1, duplicate: false });
-    const again = observeCallback(seen, action);
+    const again = observeCallback(seen, action, raw);
     assert.deepEqual({ count: again.count, duplicate: again.duplicate }, { count: 2, duplicate: true });
   });
 
-  test('a different answer to the same button is a distinct callback, not a duplicate', () => {
+  // The bug this replaced: keyed on {action, slug, formValues}, an impatient double click was reported as
+  // "the ack missed its window" — with total confidence, which is the worst way for a diagnostic to be wrong.
+  test('the same button pressed twice by a person is NOT a redelivery: the payloads differ even when the answer does not', () => {
     const seen = new Map<string, number>();
-    observeCallback(seen, action);
-    const other = observeCallback(seen, { ...action, formValues: { ask_0: 'Option B' } });
-    assert.equal(other.duplicate, false);
+    observeCallback(seen, action, press('trg-1'));
+    const second = observeCallback(seen, action, press('trg-2'));
+    assert.equal(second.duplicate, false);
+    assert.equal(second.count, 1);
   });
 
   test('a callback from a real card is flagged foreign — a rehearsal must never report it as its own result', () => {
     const seen = new Map<string, number>();
-    assert.equal(observeCallback(seen, { ...action, slug: 'finance-report' }).foreign, true);
-    assert.equal(observeCallback(seen, action).foreign, false);
+    assert.equal(observeCallback(seen, { ...action, slug: 'finance-report' }, press('trg-3')).foreign, true);
+    assert.equal(observeCallback(seen, action, press('trg-4')).foreign, false);
   });
 });
 
