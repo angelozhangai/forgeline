@@ -4,6 +4,7 @@ import { resolve } from 'node:path';
 import { SVC_DIR, SCRIPTS_DIR, ENV_FILE, EXT_DIR } from './root.ts';
 import { loadConfig } from './config.ts';
 import { project, defaultProjectId } from './projects.ts';
+import { layoutCheck } from './project.ts';
 import { parseHumanAsks } from './gates/envelopes.ts';
 import { commandExists, runSync } from './util/proc.ts';
 import { out, log } from './util/log.ts';
@@ -138,7 +139,8 @@ function doctor(extError: string | null): void {
     const p = project(id);
     const tag = multi ? `[${id}${id === defId ? ' · default' : ''}] ` : '';
     out(`${tag}ROOT = ${p.root}`);
-    ck(`${tag}the project layout (CLAUDE.md + scripts)`, p.looksValid());
+    const lay = layoutCheck(p.root, p.actions); // adapter-aware: actions=native needs no scripts (see layoutCheck)
+    ck(`${tag}${lay.label}`, lay.ok, lay.note);
     for (const repo of p.repos) {
       const gitdir = resolve(p.repoPath(repo), '.git');
       const ok = existsSync(gitdir);
