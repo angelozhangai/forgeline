@@ -37,7 +37,7 @@ import type { InboundChannel } from '../src/messaging/port.ts';
 let env: Record<string, string | undefined> = {};
 mock.module('../src/config.ts', { namedExports: { loadConfig: () => ({ env }) } });
 const { slackPort, OPEN_MODAL_ACTION } = await import('../src/messaging/slack.ts');
-const { validateAttachments, validateView } = await import('../src/slack/blockkit.ts');
+const { validateAttachments } = await import('../src/slack/blockkit.ts');
 
 // -- A hand-written WebSocket server (no dependencies) ----------------------------
 // It implements only what we use: the handshake, sending and receiving text frames, and close. Frames from
@@ -280,51 +280,54 @@ test('3. post a card: chat.postMessage uses form encoding with blocks/attachment
   assert.deepEqual(validateAttachments(attachments), []);
 });
 
-// Take the open-modal button out of **the card the server actually received** and simulate a person
-// pressing it -- the context takes no shortcut anywhere along the way.
-function openModalPayload(): Record<string, unknown> {
+// Read the form back out of **the card the server actually received** — the questions took no shortcut on
+// their way into the message.
+function cardBlocks(): Record<string, unknown>[] {
   const attachments = JSON.parse(last('chat.postMessage')?.body.attachments ?? '[]') as { blocks: Record<string, unknown>[] }[];
-  const el = attachments[0].blocks
-    .flatMap((b) => ((b as { elements?: Record<string, unknown>[] }).elements ?? []))
-    .find((e) => (e as { action_id?: string }).action_id === OPEN_MODAL_ACTION) as { value: string } | undefined;
-  assert.ok(el, 'the card should carry a button that opens the modal');
-  return { type: 'block_actions', trigger_id: 'trg-1', user: { id: 'UPM' }, actions: [{ action_id: OPEN_MODAL_ACTION, value: el.value }] };
+  return attachments[0].blocks;
 }
+// The state Slack sends with any interaction on that message: one entry per input block, keyed
+// [block_id][action_id], exactly as a real workspace returned it.
+const STATE = {
+  values: {
+    ask_H1: { ask_H1: { type: 'radio_buttons', selected_option: { value: 'calendar months' } } },
+    ask_H2: { ask_H2: { type: 'radio_buttons', selected_option: null } }, // unanswered: must not appear in formValues
+    verdict: { verdict: { type: 'static_select', selected_option: { value: 'partial' } } },
+    notes: { notes: { type: 'plain_text_input', value: 'let me double-check the second one' } },
+  },
+};
 
-test('4. press the button: the adapter intercepts it and calls views.open -- the core sees nothing, and the view that opens is valid and carries the context back', async () => {
-  const before = inbound.actions.length;
-  await envelope('interactive', openModalPayload());
-  await until(() => last('views.open') !== undefined, 'the views.open request to arrive');
-  assert.equal(inbound.actions.length, before, 'opening the modal is internal to the adapter and the core should never see it');
-  const call = last('views.open');
-  assert.equal(call?.body.trigger_id, 'trg-1');
-  const view = JSON.parse(call?.body.view ?? '{}') as Record<string, unknown>;
-  assert.deepEqual(validateView(view), []);
-  assert.deepEqual(JSON.parse(String(view.private_metadata)), { action: 'confirm_submit', slug: 'finance-report', round: 2 });
-  // One input block per open question, with the keys in the same order the answers are reassembled in
-  const ids = (view.blocks as { block_id?: string }[]).map((b) => b.block_id);
+test('4. the form is in the card: one input block per open question, keyed the way the answers are reassembled', () => {
+  const ids = cardBlocks()
+    .filter((b) => b.type === 'input')
+    .map((b) => (b as { block_id?: string }).block_id);
   // answerableDecisions numbers the question ids by severity (H = high, ...), in the same order the core
   // reassembles the answers in
   assert.deepEqual(ids, ['ask_H1', 'ask_H2', 'verdict', 'notes']);
 });
 
-test('5. submit: one view_submission carries every field back -- the single thing at this stage that is taken on faith from the documentation', async () => {
-  const view = JSON.parse(last('views.open')?.body.view ?? '{}') as Record<string, unknown>;
+test('4b. touching an option is not an answer: an input dispatches its own callback, and the core must not see a half-filled form', async () => {
+  const before = inbound.actions.length;
+  await envelope('interactive', { type: 'block_actions', user: { id: 'UPM' }, state: STATE, actions: [{ type: 'radio_buttons', action_id: 'ask_H1' }] });
+  await until(() => inbound.actions.length > before, 'the callback to reach the core side of the seam');
+  assert.equal(slackPort.parseCardAction(inbound.actions.at(-1) as Record<string, unknown>), null, 'only the submit button counts as an answer');
+});
+
+test('5. submit: one click carries the context and every field back, with no modal in between', async () => {
+  const submit = cardBlocks()
+    .flatMap((b) => ((b as { elements?: Record<string, unknown>[] }).elements ?? []))
+    .find((e) => (e as { type?: string }).type === 'button') as { action_id: string; value: string } | undefined;
+  assert.ok(submit, 'the card should carry a submit button');
+  assert.notEqual(submit.action_id, OPEN_MODAL_ACTION, 'and it should not be opening a modal');
+
+  const before = inbound.actions.length;
   await envelope('interactive', {
-    type: 'view_submission',
+    type: 'block_actions',
     user: { id: 'UPM' },
-    view: {
-      private_metadata: view.private_metadata,
-      state: {
-        values: {
-          ask_H1: { ask_H1: { type: 'static_select', selected_option: { value: 'calendar months' } } },
-          ask_H2: { ask_H2: { type: 'static_select', selected_option: null } }, // unanswered: must not appear in formValues
-          verdict: { verdict: { type: 'static_select', selected_option: { value: 'partial' } } },
-          notes: { notes: { type: 'plain_text_input', value: 'let me double-check the second one' } },
-        },
-      },
-    },
+    state: STATE,
+    actions: [{ type: 'button', action_id: submit.action_id, value: submit.value }],
   });
+  await until(() => inbound.actions.length > before, 'the submission to reach the core side of the seam');
   const action = slackPort.parseCardAction(inbound.actions.at(-1) as Record<string, unknown>);
   assert.equal(action?.action, 'confirm_submit');
   assert.equal(action?.slug, 'finance-report');

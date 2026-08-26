@@ -80,7 +80,7 @@ Running `FORGE_MESSAGING_PROVIDER=slack ./forge doctor` checks each of those in 
 
 > **The first workspace also needs one manual pass.** doctor proves the keys are present, never that Slack itself behaves as documented — that a real `views.open` accepts the view, that one `view_submission` returns `private_metadata` plus all of `state.values`, that the planned `disconnect` arrives about every half hour, and that an ack lands inside the 3-second window. The runbook that clears all four in one sitting is [docs/slack-golive.md](../docs/slack-golive.md).
 
-**The one difference in feel from Feishu**: the review and filing forms are "a button on the card → a modal opens → submit once", rather than filling the form in on the card itself. The reason is point 4 above — a platform limitation, not a shortcut in the implementation.
+**It feels the same as Feishu**: the review and filing forms are answered on the card itself — pick the options, press submit once. (Interactivity, point 4 above, is still required: it is what delivers the button press.) Cards posted before forms moved into the card still open a plain free-text modal when clicked, because their questions were never written into the message.
 
 ### Where the requirement document comes from
 

@@ -175,13 +175,33 @@ unit-testable with no network. The adapter keeps only the API call.
 
 ### The one real UX difference: forms
 
-**Slack has no in-message form-with-submit.** `input` blocks are valid only in modals and Home tabs;
-selects placed in `actions` blocks fire an interaction per selection. The `decisionForm` block also
-needs a free-text `notes` field, which has no in-message representation at all.
+**Correction (this section used to say the opposite).** It read *"Slack has no in-message form-with-submit;
+`input` blocks are valid only in modals and Home tabs"*, and that premise is what put every Slack form in a
+modal. It is wrong: Slack lists the input block's surfaces as **modals, messages and home tabs**, and since
+September 2020 every `block_actions` payload carries the full `state` of the surface it came from — messages
+included. Verified against a real workspace rather than taken from the docs: a message carrying
+`radio_buttons` + `static_select` + `plain_text_input` was accepted, and pressing its button returned all
+three answers under `state.values`.
 
-Mapping: **`decisionForm` / `goForm` → a summary `section` + one button → `views.open` modal → a single
-`view_submission` carrying every value at once.** `{action, slug, round}` rides in the modal's
-`private_metadata`.
+Mapping: **`decisionForm` / `goForm` → one `input` block per question (radio buttons up to five options, a
+select beyond that) + a submit button.** `{action, slug, round}` rides on the button's own value, and the
+answers arrive in the same `block_actions` — one click, no modal.
+
+Two consequences worth stating, because both were live problems under the old mapping:
+
+- **No `trigger_id` race.** A trigger lives three seconds, which is why `views.open` deliberately skipped
+  the rate-limit retry. Nothing on the inline path expires.
+- **Nothing is held in process memory.** The modal's *content* was known only at render time and had to be
+  staged in a map, so a daemon restart turned a live card into a degraded free-text box. The form is now in
+  the message, so a restart changes nothing at all.
+
+The modal path stays for exactly one reason: cards posted before this change are still sitting in Slack with
+a modal button on them. Their questions were never written into the message and cannot be reconstructed, so
+that button opens a plain free-text modal — fewer affordances, still an answer, never a dead button.
+
+One thing the inline form does that a modal did not: **every interaction dispatches**. Picking an option
+sends its own `block_actions` carrying the state so far, so the adapter treats only the button as a
+submission — otherwise touching the first question would file a form with the rest still blank.
 
 This is entirely adapter-internal. `InboundCardAction.formValues` — the core-facing contract — is
 unchanged. **The existing seam survives its first real test.**

@@ -5,7 +5,7 @@
 //
 // What it covers that the structural gate (test/slack-blockkit.test.ts) cannot:
 //   - the provider **accepts** each card, rather than the card merely being structurally valid;
-//   - a form button really opens a modal, and one submission really returns the context plus every field;
+//   - a form really answers in one click: the context comes back with the button and every field with it;
 //   - the ack lands inside the provider's window (a miss shows up as the same callback arriving twice).
 //
 // Two deliberate non-goals, so nobody reads more into a green rehearsal than it earns:
@@ -15,6 +15,7 @@
 //
 // Safety: the only outward effect is messages in the chat you configured. The fake session never reaches
 // the store, so no button click can advance anything; a click is caught here, printed, and dropped.
+import { createHash } from 'node:crypto';
 import { mkdtempSync, writeFileSync } from 'node:fs';
 import { tmpdir } from 'node:os';
 import { resolve } from 'node:path';
@@ -106,6 +107,12 @@ export type RehearsePart = 'dm' | 'channel' | 'all';
 export interface RehearseOpts {
   only?: RehearsePart;
   listen?: boolean;
+  /**
+   * Listen without sending anything. Send a round of cards, come back to them later, and there is nothing
+   * connected to receive the click — the provider shows the person a warning triangle on a button that
+   * would otherwise have worked. Found exactly that way, in a real workspace.
+   */
+  listenOnly?: boolean;
   pauseMs?: number;
 }
 
@@ -199,17 +206,27 @@ export async function sendCorpus(o: RehearseOpts = {}, p: SendPort = port): Prom
 
 // What one incoming callback means. Pure, and the whole point of the listening half — so it is decided here
 // and merely printed below.
-//   duplicate: the provider redelivered a callback it had already sent, which is what a missed ack looks
+//   duplicate: the provider **redelivered** a callback it had already sent, which is what a missed ack looks
 //              like from this side (there is no other way to observe the ack window from outside);
 //   foreign:   the slug is not the rehearsal one, so this click came from a real card and must not be read
 //              as a rehearsal result.
+//
+// The key is a fingerprint of the **raw payload**, not of the parsed action, and the difference is the whole
+// point. A redelivery is the same payload sent again, byte for byte. A person pressing the same button twice
+// produces two payloads that differ — every provider stamps each interaction with something unique (Slack
+// puts a fresh trigger_id and action_ts on each one). Keyed on {action, slug, formValues}, those two cases
+// are indistinguishable, and this reported "the ack missed its window" for what was really an impatient
+// double click. It said so with total confidence, which is the worst way for a diagnostic to be wrong.
+//
+// The residual risk is stated rather than hidden: a provider that sent byte-identical payloads for two
+// distinct clicks would be misread here — but nothing observing from outside could tell those apart at all.
 export interface Observation {
-  count: number; // how many times this exact callback has now arrived (1 = first time)
+  count: number; // how many times this exact payload has now arrived (1 = first time)
   duplicate: boolean;
   foreign: boolean;
 }
-export function observeCallback(seen: Map<string, number>, a: Pick<InboundCardAction, 'action' | 'slug' | 'formValues'>): Observation {
-  const key = `${a.action}|${a.slug}|${JSON.stringify(a.formValues)}`;
+export function observeCallback(seen: Map<string, number>, a: Pick<InboundCardAction, 'slug'>, raw: unknown): Observation {
+  const key = createHash('sha1').update(JSON.stringify(raw) ?? '').digest('hex');
   const count = (seen.get(key) ?? 0) + 1;
   seen.set(key, count);
   return { count, duplicate: count > 1, foreign: a.slug !== REHEARSAL_SLUG };
@@ -222,6 +239,13 @@ export function observeCallback(seen: Map<string, number>, a: Pick<InboundCardAc
  * Duplicate detection is the ack check: providers redeliver an envelope that was not acked in time, so the
  * same callback arriving twice is not a mystery — it is the ack window being missed, reported as such.
  */
+// Someone touching an input rather than pressing a button. Provider-neutral by construction: it asks whether
+// the callback carries an action that is not a button, which is what a form edit looks like on any of them.
+function isFormEdit(raw: Record<string, unknown>): boolean {
+  const a = (raw.actions as { type?: string }[] | undefined)?.[0];
+  return !!a && a.type !== 'button';
+}
+
 export function listenForCallbacks(): { close: () => void } {
   const seen = new Map<string, number>();
   const started = Date.now();
@@ -229,11 +253,18 @@ export function listenForCallbacks(): { close: () => void } {
     onCardAction: (raw) => {
       const a = port.parseCardAction(raw);
       if (!a) {
+        // An inline form dispatches on **every** selection, and the adapter deliberately returns null for
+        // those — only the submit button is an answer. Reporting each one as "unrecognised" would bury the
+        // real thing this line exists to catch: a callback the adapter genuinely cannot read.
+        if (isFormEdit(raw)) {
+          log.info('  <- (a selection was made; not a submission)');
+          return;
+        }
         log.warn('  <- a callback arrived that the adapter did not recognise (printed raw below)');
         log.warn(`     ${JSON.stringify(raw).slice(0, 400)}`);
         return;
       }
-      const o = observeCallback(seen, a);
+      const o = observeCallback(seen, a, raw);
       const at = `${((Date.now() - started) / 1000).toFixed(1)}s`;
       log.ok(`  <- ${at}  action=${a.action}  slug=${a.slug}  by=${a.operatorId ?? '?'}`);
       log.info(`     value      ${JSON.stringify(a.value)}`);
@@ -256,11 +287,15 @@ export function listenForCallbacks(): { close: () => void } {
 export async function rehearse(o: RehearseOpts = {}): Promise<void> {
   log.info('── REHEARSAL ──');
   log.info(`provider=${port.id} · no model call, no database write, no issue, no document — the only effect is messages in your chat`);
-  const r = await sendCorpus(o);
-  log.info(`sent ${r.sent} card(s); ${r.failed.length ? `NOT delivered: ${r.failed.join(', ')}` : 'every one was accepted'}`);
+  if (o.listenOnly) {
+    log.info('listen-only: nothing is being sent — reconnecting to the cards already in your chat');
+  } else {
+    const r = await sendCorpus(o);
+    log.info(`sent ${r.sent} card(s); ${r.failed.length ? `NOT delivered: ${r.failed.join(', ')}` : 'every one was accepted'}`);
+  }
 
-  if (!o.listen) {
-    log.info('press the buttons and run `forge rehearse --listen` to see what comes back (or pass --listen next time to do both in one go)');
+  if (!o.listen && !o.listenOnly) {
+    log.info('press the buttons and run `forge rehearse --listen-only` to see what comes back (or pass --listen next time to do both in one go)');
     return;
   }
   if (!port.inboundConfigured()) {

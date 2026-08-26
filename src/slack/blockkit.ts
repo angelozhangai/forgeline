@@ -33,6 +33,8 @@ export const BK_LIMIT = {
   optionText: 75,
   optionValue: 75,
   optionsPerSelect: 100,
+  optionsPerRadio: 10, // radio buttons cap far lower than a select — going over rejects the whole message
+  optionDescription: 75,
   placeholder: 150,
   inputLabel: 2000,
   viewChip: 24, // title / submit / close
@@ -67,6 +69,9 @@ function checkOption(where: string, v: unknown, out: string[]): void {
   checkText(`${where}.text`, o.text, BK_LIMIT.optionText, out, ['plain_text']);
   if (typeof o.value !== 'string' || o.value === '') out.push(`${where}.value: missing or empty`);
   else if (cp(o.value) > BK_LIMIT.optionValue) out.push(`${where}.value: exceeds the limit (${cp(o.value)} > ${BK_LIMIT.optionValue})`);
+  // The second, quieter line under a radio button's label. Only radio buttons and checkboxes render it, but
+  // an over-long or empty one is rejected wherever it appears.
+  if (o.description !== undefined) checkText(`${where}.description`, o.description, BK_LIMIT.optionDescription, out, ['plain_text']);
 }
 
 function checkElement(where: string, v: unknown, out: string[], actionIds: string[]): void {
@@ -95,6 +100,18 @@ function checkElement(where: string, v: unknown, out: string[], actionIds: strin
       if (!opts || opts.length === 0) out.push(`${where}.options: a static select must have at least one option`);
       else {
         if (opts.length > BK_LIMIT.optionsPerSelect) out.push(`${where}.options: exceeds the limit (${opts.length} > ${BK_LIMIT.optionsPerSelect})`);
+        for (const [i, o] of opts.entries()) checkOption(`${where}.options[${i}]`, o, out);
+      }
+      if (e.initial_option !== undefined) checkOption(`${where}.initial_option`, e.initial_option, out);
+      break;
+    }
+    // Radio buttons show every option at once, which is what a decision wants. They are much stricter than a
+    // select: **10 options maximum**, and going over is not a truncated list but the whole message rejected.
+    case 'radio_buttons': {
+      const opts = arr(e.options);
+      if (!opts || opts.length === 0) out.push(`${where}.options: a radio button group must have at least one option`);
+      else {
+        if (opts.length > BK_LIMIT.optionsPerRadio) out.push(`${where}.options: exceeds the limit (${opts.length} > ${BK_LIMIT.optionsPerRadio})`);
         for (const [i, o] of opts.entries()) checkOption(`${where}.options[${i}]`, o, out);
       }
       if (e.initial_option !== undefined) checkOption(`${where}.initial_option`, e.initial_option, out);

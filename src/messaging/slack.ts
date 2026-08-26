@@ -7,9 +7,10 @@
 // changed by a line for Slack — which is exactly what this seam is for.
 //
 // Three things are **necessarily** different from Feishu, and all three are held inside this layer:
-//  · **Forms**: Slack's input blocks are only legal inside a modal -> a button on the card ->
-//    views.open -> one view_submission carrying every field back (see slack/modal.ts). The shape of
-//    InboundCardAction.formValues is unchanged.
+//  · **Forms**: the form is rendered **into the card** — input blocks are legal in a message, and a
+//    message's whole `state` rides along with any button press from it, so one click returns every field
+//    (see slack/modal.ts, which also keeps the older modal path alive for cards posted before that
+//    change). The shape of InboundCardAction.formValues is unchanged either way.
 //  · **Message ids**: chat.update needs both channel and ts, while editGroupCard(messageId,…) has only
 //    one value -> an opaque composite "channel:ts" is used externally. The core never parses
 //    status_msg_id / intake_msg_id, so this is safe.
@@ -19,7 +20,7 @@ import { loadConfig } from '../config.ts';
 import { log } from '../util/log.ts';
 import { slackApi } from '../slack/web.ts';
 import { createSocketChannel } from '../slack/socket.ts';
-import { buildDecisionModal, buildGoModal, parseViewSubmission, type ModalContext } from '../slack/modal.ts';
+import { buildDecisionModal, buildGoModal, decisionBlocks, flattenStateValues, freezeFormBlocks, goBlocks, parseViewSubmission, SUBMIT_ACTION_PREFIX, type ModalContext } from '../slack/modal.ts';
 import { BK_LIMIT, explain, validateAttachments, validateView } from '../slack/blockkit.ts';
 import { blank, mrkdwnText, plainText } from '../slack/text.ts';
 import { DECISION_CAP, type DecisionItem } from '../gates/envelopes.ts';
@@ -98,25 +99,29 @@ function btnEl(b: CardButton): Record<string, unknown> {
   };
 }
 
-// The button that opens a modal: its value carries the ModalContext, and on click the adapter calls
-// views.open itself — this **never** reaches the core.
-function openModalBtn(text: string, ctx: ModalContext): Record<string, unknown> {
+// An adapter-internal action: clicking it means "open the modal", not a business action. The core never
+// sees this id. Nothing renders this button any more — the form is in the card — but the id is still
+// **received**, from cards posted before that change and still sitting in Slack. Their form content is long
+// gone from memory, so they open the degraded free-text modal: fewer affordances, still an answer, never a
+// dead button.
+export const OPEN_MODAL_ACTION = 'forge_open_form';
+
+// The submit button of an **inline** form. Everything the core needs comes back with it: {action,slug,round}
+// off the button's own value, and every field off the message's `state`.
+function submitBtn(text: string, ctx: ModalContext, fallback: string): Record<string, unknown> {
   return {
     type: 'actions',
     elements: [
       {
         type: 'button',
-        text: plain(text),
+        text: plainText(text, BK_LIMIT.buttonText, fallback),
         style: 'primary',
-        action_id: OPEN_MODAL_ACTION,
-        value: JSON.stringify(ctx).slice(0, BK_LIMIT.buttonValue),
+        action_id: `${SUBMIT_ACTION_PREFIX}${ctx.action}`.slice(0, BK_LIMIT.actionId),
+        value: JSON.stringify({ action: ctx.action, slug: ctx.slug, round: ctx.round ?? 0 }).slice(0, BK_LIMIT.buttonValue),
       },
     ],
   };
 }
-// An adapter-internal action: clicking it means "open the modal", not a business action. The core never
-// sees this id.
-export const OPEN_MODAL_ACTION = 'forge_open_form';
 
 // Indent for option lines. mrkdwn collapses leading ASCII spaces, so a non-breaking space keeps options
 // visually nested under their question. (This used to be U+3000 IDEOGRAPHIC SPACE, which is CJK
@@ -167,27 +172,18 @@ function renderBlock(b: CardBlock): Record<string, unknown>[] {
     case 'findingList':
       return findingLines(b.findings);
     case 'decisionForm': {
-      // The form moves into a modal: the card keeps only a button and a line of explanation. The context
-      // travels on the button's value and comes back through private_metadata on submit.
-      // The modal's **content** (which open questions there are) is known only at render time -> build it
-      // here and store it, to be used when the button is clicked.
+      // The form lives **in the card**: input blocks are legal in a message, and the message's whole `state`
+      // rides along with any button press from it. One click, no modal, and nothing held in memory that a
+      // restart could lose.
       const ctx: ModalContext = { action: b.action, slug: b.slug, round: b.round, kind: 'decision' };
-      rememberModal(
-        ctx,
-        buildDecisionModal(ctx, {
-          items: b.items,
-          verdict: b.verdict,
-          submitText: b.submitText,
-          notesLabel: b.notesLabel,
-          notesPlaceholder: b.notesPlaceholder,
-        }),
-      );
-      return [context(`${Math.min(b.items.length, DECISION_CAP)} open questions — click the button below to answer.`), openModalBtn(b.submitText, ctx)];
+      return [
+        ...decisionBlocks({ items: b.items, verdict: b.verdict, submitText: b.submitText, notesLabel: b.notesLabel, notesPlaceholder: b.notesPlaceholder }),
+        submitBtn(b.submitText, ctx, 'Submit'),
+      ];
     }
     case 'goForm': {
       const ctx: ModalContext = { action: 'go', slug: b.slug, kind: 'go' };
-      rememberModal(ctx, buildGoModal(ctx, b.pool, b.picked));
-      return [openModalBtn('✅ File it · create issues', ctx)];
+      return [...goBlocks(b.pool, b.picked), submitBtn('✅ File it · create issues', ctx, 'File it')];
     }
     case 'petRow': {
       const line = `${b.mentionId ? `<@${b.mentionId}> ` : ''}${b.voice}`;
@@ -207,7 +203,13 @@ function renderBlock(b: CardBlock): Record<string, unknown>[] {
 export function renderSlackMessage(card: CardModel): { text: string; attachments: Record<string, unknown>[] } {
   const blocks: Record<string, unknown>[] = [{ type: 'header', text: plain(card.title, BK_LIMIT.headerText) }];
   if (card.subtitle) blocks.push(context(card.subtitle));
-  blocks.push(...card.blocks.flatMap(renderBlock));
+  // The core emits the questions twice — once as prose (decisionList) and once as the form — because on a
+  // surface where the form lives elsewhere, the prose is the only place the reader ever sees them. Here the
+  // form is in the card, so the prose is the same questions printed a second time, as a bulleted list of
+  // options that looks clickable and is not. Drop it and let the inputs carry their own labels.
+  const answerableForm = card.blocks.some((b) => b.kind === 'decisionForm' && b.items.length > 0);
+  const source = answerableForm ? card.blocks.filter((b) => b.kind !== 'decisionList') : card.blocks;
+  blocks.push(...source.flatMap(renderBlock));
   if (blocks.length > BK_LIMIT.blocksPerMessage) {
     log.warn(`Slack card exceeds the ${BK_LIMIT.blocksPerMessage}-block limit (${blocks.length}); the tail was truncated: "${card.title}"`);
   }
@@ -338,8 +340,14 @@ const slackPort: MessagingPort = {
     }
     // 2. An ordinary button: `value` already holds the core's {action,slug,...}.
     if (type === 'block_actions') {
-      const a = (raw.actions as { action_id?: string; value?: string }[] | undefined)?.[0];
+      const a = (raw.actions as { action_id?: string; value?: string; type?: string }[] | undefined)?.[0];
       if (!a || a.action_id === OPEN_MODAL_ACTION) return null; // opening a modal is adapter-internal; the core should never see it
+      // **Every** interaction with an inline form dispatches — picking a radio option sends a block_actions
+      // of its own, carrying the state so far. Only the button means "submit"; treating a select as one
+      // would file a half-answered form the moment someone touched the first question. Verified against a
+      // real workspace, where choosing an option arrived as `radio_buttons:ask_1` with two of three
+      // questions still blank.
+      if (a.type !== 'button') return null;
       let value: Record<string, unknown>;
       try {
         value = JSON.parse(a.value ?? '{}') as Record<string, unknown>;
@@ -349,7 +357,10 @@ const slackPort: MessagingPort = {
       const action = String(value.action ?? '');
       const slug = String(value.slug ?? '');
       if (!action || !slug) return null;
-      return { type: 'card_action', action, slug, value, formValues: {}, operatorId: (raw.user as { id?: string } | undefined)?.id };
+      // An ordinary button has no form above it and flattens to {}; an inline form's submit button brings
+      // every field back the same way a view_submission does — the same flattener, so the two can never
+      // disagree about the keys the core receives.
+      return { type: 'card_action', action, slug, value, formValues: flattenStateValues(raw.state), operatorId: (raw.user as { id?: string } | undefined)?.id };
     }
     return null;
   },
@@ -409,6 +420,11 @@ const slackPort: MessagingPort = {
           return;
         }
         handlers.onCardAction(payload);
+        // The core gets the answer first; the card is then rewritten to show what was submitted. Order
+        // matters: this is feedback, and feedback must never be able to cost someone their answer.
+        if (isFormSubmit(payload)) {
+          void freezeCard(payload).catch((e) => log.warn(`Slack freezing the submitted form threw: ${String(e).slice(0, 160)}`));
+        }
       },
       onError: (reason) => handlers.onError(reason),
       onReconnected: () => handlers.onReconnected(),
@@ -500,6 +516,42 @@ function isOpenModal(payload: Record<string, unknown>): boolean {
   return a?.action_id === OPEN_MODAL_ACTION;
 }
 
+function isFormSubmit(payload: Record<string, unknown>): boolean {
+  const a = (payload.actions as { action_id?: string; type?: string }[] | undefined)?.[0];
+  return a?.type === 'button' && typeof a.action_id === 'string' && a.action_id.startsWith(SUBMIT_ACTION_PREFIX);
+}
+
+// A modal gave feedback for free: it closed. An inline form gives none, so rewrite the card into what was
+// actually chosen — the inputs and the submit button are replaced by a read-only summary. That also makes a
+// second submission impossible, since the button is gone.
+//
+// The card comes back **inside the callback**, so nothing has to be remembered between the two: Slack sends
+// the original message with the interaction. A card posted the way this adapter posts them carries its blocks
+// on an attachment (container.type is message_attachment) — read the colour from there too, or the update
+// would strip the coloured bar off the card.
+//
+// Failure here is logged and dropped. The answer is already with the core; losing the visual acknowledgement
+// is a cosmetic problem, and taking the inbound path down over it would not be.
+async function freezeCard(payload: Record<string, unknown>): Promise<void> {
+  const container = (payload.container ?? {}) as { channel_id?: string; message_ts?: string };
+  const msg = (payload.message ?? {}) as { blocks?: unknown[]; text?: string; attachments?: { blocks?: unknown[]; color?: string }[] };
+  const channel = container.channel_id;
+  const ts = container.message_ts;
+  if (!channel || !ts) return;
+  const att = msg.attachments?.[0];
+  const source = att?.blocks ?? msg.blocks;
+  if (!Array.isArray(source) || source.length === 0) return;
+  const user = (payload.user as { id?: string } | undefined)?.id;
+  const frozen = freezeFormBlocks(source, payload.state, user, Date.now() / 1000);
+  const body: Record<string, unknown> = { channel, ts, text: msg.text || 'Forge' };
+  // Pass structures through as they are: slack/web.ts form-encodes and JSON-serialises them, the same way
+  // every other call in this file does.
+  if (att) body.attachments = [{ color: att.color ?? COLOR_HEX.grey, blocks: frozen.blocks }];
+  else body.blocks = frozen.blocks;
+  const r = await slackApi('chat.update', body);
+  if (!r.ok) log.warn(`Slack could not freeze the submitted form (the answer was still received): ${r.error}`);
+}
+
 // The "fill this in" button was clicked -> open the modal with the trigger_id. A trigger_id is valid for
 // 3 seconds, so this path does no unnecessary IO whatsoever.
 async function openModal(payload: Record<string, unknown>): Promise<void> {
@@ -513,7 +565,7 @@ async function openModal(payload: Record<string, unknown>): Promise<void> {
     log.warn('Slack open modal: the button value is not valid JSON');
     return;
   }
-  const spec = pendingModal(ctx) ?? degradedModal(ctx);
+  const spec = legacyModal(ctx);
   // retry:false is deliberate: a trigger_id lives for only 3 seconds, so a rate-limit backoff retry buys
   // nothing but expired_trigger_id, and it buries the real failure under an error that explains nothing.
   // Better to fail once and report it faithfully.
@@ -525,13 +577,16 @@ async function openModal(payload: Record<string, unknown>): Promise<void> {
   }
 }
 
-// The card is still sitting in Slack but this process has restarted -> the modal's content is gone from
-// memory.
-// **Never fail silently** (a button that does nothing is the worst possible form): degrade to a modal
-// with a single free-text field. The person can still answer, they just lose the per-question dropdowns.
-// On the core side, formValues still uses the same keys (verdict/notes/assignee).
-function degradedModal(ctx: ModalContext): Record<string, unknown> {
-  log.warn(`Slack open modal: the form content for ${ctx.action}/${ctx.slug} is not in memory (the daemon restarted) -> degrading to a plain-text modal`);
+// A card **posted before forms moved into the card** was clicked. Its questions were never written into the
+// message, and the staging map that used to hold them is gone with the process that rendered it — so there
+// is nothing to reconstruct, and pretending otherwise would mean guessing at someone's open questions.
+//
+// **Never fail silently** (a button that does nothing is the worst possible form): open a modal with a
+// single free-text field. The person can still answer, they just lose the per-question options — and the
+// core receives the same keys it always did (verdict/notes/assignee), so their answer lands exactly where a
+// modern card's would. Post a fresh card and the inline form is back.
+function legacyModal(ctx: ModalContext): Record<string, unknown> {
+  log.warn(`Slack open modal: ${ctx.action}/${ctx.slug} comes from a card that predates inline forms -> opening a plain-text modal (a new card will carry the form in the card itself)`);
   if (ctx.kind === 'go') {
     return buildGoModal(ctx, [], null);
   }
@@ -540,26 +595,8 @@ function degradedModal(ctx: ModalContext): Record<string, unknown> {
     verdict: true,
     submitText: 'Submit',
     notesLabel: 'Additional notes',
-    notesPlaceholder: 'The per-question options are unavailable after a daemon restart; please write your answer here directly',
+    notesPlaceholder: 'This card predates inline forms, so the per-question options are unavailable; please write your answer here directly',
   });
-}
-
-// Staging area for modal content: when a card is rendered, remember what the form on it should look
-// like, and retrieve it when the button is clicked.
-// Why this is needed: a Slack form does not live in the card, yet the open questions and the DRI pool are
-// known only at render time. Keyed by slug+action, so a later render overwrites an earlier one (a new
-// round's card for the same requirement should indeed replace the old one).
-const MODAL_SPECS = new Map<string, Record<string, unknown>>();
-const specKey = (action: string, slug: string): string => `${action}:${slug}`;
-
-export function rememberModal(ctx: ModalContext, view: Record<string, unknown>): void {
-  MODAL_SPECS.set(specKey(ctx.action, ctx.slug), view);
-}
-function pendingModal(ctx: ModalContext): Record<string, unknown> | null {
-  return MODAL_SPECS.get(specKey(ctx.action, ctx.slug)) ?? null;
-}
-export function __clearModalSpecsForTest(): void {
-  MODAL_SPECS.clear();
 }
 
 export { slackPort, buildDecisionModal, buildGoModal };
