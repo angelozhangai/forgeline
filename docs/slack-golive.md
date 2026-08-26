@@ -30,7 +30,7 @@ This runbook clears all four in one sitting. Steps 1–4 answer questions 1, 2 a
 | 2 | The console switches from [deploy/README.md](../deploy/README.md) §2.5 are on — scopes (**including `im:history`**), Socket Mode, event subscriptions, **Interactivity**, and the bot `/invite`d into every watched channel | Without Interactivity the card renders and the button silently does nothing — Slack forms are modals |
 | 3 | A document source will claim your message | Intake is content-addressed. On Slack there is usually no Feishu doc link, so unless `doc_sources.plaintext.enabled: true` is set in `config/runtime.yaml` **every message is dropped** with a single `no document source claimed this message` warning — a warn, so the only symptom is "the bot ignored me" |
 | 4 | The target project resolves and its repos are cloned and clean | Gate A reads real code; an unanchored checkout (HEAD off `origin/<branch>`, or uncommitted changes) is disclosed to the model or parks the gate |
-| 5 | You accept that this spends money | Gate A is a real paid model call per requirement. With `plaintext` on, **every** long enough @-mention becomes one |
+| 5 | You accept that this spends money | Gate A is a real paid model call per requirement. With `plaintext` on, **every** long enough @-mention becomes one — and in a **DM there is no mention gate at all**, so every long enough message you send the bot is a requirement. Thinking out loud to it is not free |
 
 `FORGE_MESSAGING_PROVIDER=slack ./forge doctor` checks 1 and 4 and nothing else — 2, 3 and 5 are yours.
 
