@@ -5,7 +5,7 @@
 //
 // What it covers that the structural gate (test/slack-blockkit.test.ts) cannot:
 //   - the provider **accepts** each card, rather than the card merely being structurally valid;
-//   - a form button really opens a modal, and one submission really returns the context plus every field;
+//   - a form really answers in one click: the context comes back with the button and every field with it;
 //   - the ack lands inside the provider's window (a miss shows up as the same callback arriving twice).
 //
 // Two deliberate non-goals, so nobody reads more into a green rehearsal than it earns:
@@ -106,6 +106,12 @@ export type RehearsePart = 'dm' | 'channel' | 'all';
 export interface RehearseOpts {
   only?: RehearsePart;
   listen?: boolean;
+  /**
+   * Listen without sending anything. Send a round of cards, come back to them later, and there is nothing
+   * connected to receive the click — the provider shows the person a warning triangle on a button that
+   * would otherwise have worked. Found exactly that way, in a real workspace.
+   */
+  listenOnly?: boolean;
   pauseMs?: number;
 }
 
@@ -222,6 +228,13 @@ export function observeCallback(seen: Map<string, number>, a: Pick<InboundCardAc
  * Duplicate detection is the ack check: providers redeliver an envelope that was not acked in time, so the
  * same callback arriving twice is not a mystery — it is the ack window being missed, reported as such.
  */
+// Someone touching an input rather than pressing a button. Provider-neutral by construction: it asks whether
+// the callback carries an action that is not a button, which is what a form edit looks like on any of them.
+function isFormEdit(raw: Record<string, unknown>): boolean {
+  const a = (raw.actions as { type?: string }[] | undefined)?.[0];
+  return !!a && a.type !== 'button';
+}
+
 export function listenForCallbacks(): { close: () => void } {
   const seen = new Map<string, number>();
   const started = Date.now();
@@ -229,6 +242,13 @@ export function listenForCallbacks(): { close: () => void } {
     onCardAction: (raw) => {
       const a = port.parseCardAction(raw);
       if (!a) {
+        // An inline form dispatches on **every** selection, and the adapter deliberately returns null for
+        // those — only the submit button is an answer. Reporting each one as "unrecognised" would bury the
+        // real thing this line exists to catch: a callback the adapter genuinely cannot read.
+        if (isFormEdit(raw)) {
+          log.info('  <- (a selection was made; not a submission)');
+          return;
+        }
         log.warn('  <- a callback arrived that the adapter did not recognise (printed raw below)');
         log.warn(`     ${JSON.stringify(raw).slice(0, 400)}`);
         return;
@@ -256,11 +276,15 @@ export function listenForCallbacks(): { close: () => void } {
 export async function rehearse(o: RehearseOpts = {}): Promise<void> {
   log.info('── REHEARSAL ──');
   log.info(`provider=${port.id} · no model call, no database write, no issue, no document — the only effect is messages in your chat`);
-  const r = await sendCorpus(o);
-  log.info(`sent ${r.sent} card(s); ${r.failed.length ? `NOT delivered: ${r.failed.join(', ')}` : 'every one was accepted'}`);
+  if (o.listenOnly) {
+    log.info('listen-only: nothing is being sent — reconnecting to the cards already in your chat');
+  } else {
+    const r = await sendCorpus(o);
+    log.info(`sent ${r.sent} card(s); ${r.failed.length ? `NOT delivered: ${r.failed.join(', ')}` : 'every one was accepted'}`);
+  }
 
-  if (!o.listen) {
-    log.info('press the buttons and run `forge rehearse --listen` to see what comes back (or pass --listen next time to do both in one go)');
+  if (!o.listen && !o.listenOnly) {
+    log.info('press the buttons and run `forge rehearse --listen-only` to see what comes back (or pass --listen next time to do both in one go)');
     return;
   }
   if (!port.inboundConfigured()) {

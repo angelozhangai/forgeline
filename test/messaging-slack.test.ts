@@ -182,6 +182,33 @@ test('decisionForm: the questions become input blocks in the card itself, closed
   assert.notEqual(last.elements[0].action_id, OPEN_MODAL_ACTION, 'nothing opens a modal any more');
 });
 
+// The core emits the questions twice — as prose and as the form — because on a surface where the form lives
+// elsewhere the prose is the only place the reader sees them. In a card that carries its own form, the prose
+// is the same questions printed again as a bulleted list that looks clickable and is not. That duplication is
+// what "this form is ugly, I cannot select anything" actually was.
+test('decisionForm: the prose copy of the questions is dropped when the form itself is in the card', () => {
+  reset();
+  const items = [ITEM];
+  const withBoth: CardModel = {
+    color: 'blue',
+    title: 't',
+    blocks: [
+      { kind: 'decisionList', items },
+      { kind: 'decisionForm', slug: 'refund', items, action: 'confirm_submit', round: 1, submitText: 'Submit', notesLabel: 'Notes', notesPlaceholder: '…' },
+    ] as CardBlock[],
+  };
+  const blocks = (renderSlackMessage(withBoth).attachments[0] as { blocks: Record<string, unknown>[] }).blocks;
+  assert.equal(blocks.filter((b) => b.type === 'input').length, 2, 'the question and the notes box');
+  assert.doesNotMatch(JSON.stringify(blocks.filter((b) => b.type === 'section')), /★/, 'the starred option list is the prose copy — it should be gone');
+});
+
+test('decisionList on its own is still rendered — a card with no form is the only place the reader would see the questions', () => {
+  reset();
+  const listOnly: CardModel = { color: 'blue', title: 't', blocks: [{ kind: 'decisionList', items: [ITEM] }] as CardBlock[] };
+  const blocks = (renderSlackMessage(listOnly).attachments[0] as { blocks: Record<string, unknown>[] }).blocks;
+  assert.match(JSON.stringify(blocks), /★/);
+});
+
 test('decisionForm: a short option list becomes radio buttons (all of it visible), a long one falls back to a select', () => {
   reset();
   const opts = (n: number) => Array.from({ length: n }, (_, i) => ({ label: `option ${i}`, recommended: i === 0, impact: 'some impact' }));
@@ -511,6 +538,77 @@ test('inbound routing: a modal button from an older card is still intercepted by
   const view = calls[0]?.body.view as { private_metadata: string; blocks: { block_id?: string; element: { type: string } }[] };
   assert.deepEqual(JSON.parse(view.private_metadata), { action: 'go', slug: 'refund', round: 0 }, 'the context is intact, so the answer lands on the right requirement');
   assert.equal(view.blocks[0].element.type, 'plain_text_input', 'the DRI pool was never written into that old card, so it degrades to free text rather than guessing');
+});
+
+// An inline form gives no feedback of its own — a modal at least closed. So the card is rewritten into what
+// was chosen, which is also what makes a second submission impossible. The shapes here are the ones a real
+// workspace sent: blocks live on an attachment, and the container says message_attachment.
+test('a submitted form freezes: the card is rewritten to the answers, keeping its colour bar, and the button is gone', async () => {
+  reset();
+  const box = inbound();
+  const submitted = {
+    type: 'block_actions',
+    user: { id: 'U7' },
+    container: { type: 'message_attachment', channel_id: 'D1', message_ts: '111.222', attachment_id: 1 },
+    message: {
+      text: 'Requirement review',
+      attachments: [
+        {
+          id: 1,
+          color: '#2f7ed8',
+          blocks: [
+            { type: 'section', text: { type: 'mrkdwn', text: 'the summary' } },
+            { type: 'input', block_id: 'ask_H1', label: { type: 'plain_text', text: '1. Calendar or fiscal?' }, element: { type: 'radio_buttons', action_id: 'ask_H1' } },
+            { type: 'actions', elements: [{ type: 'button', action_id: 'forge_submit_confirm_submit', text: { type: 'plain_text', text: 'Submit' } }] },
+          ],
+        },
+      ],
+    },
+    state: { values: { ask_H1: { ask_H1: { type: 'radio_buttons', selected_option: { value: 'fiscal months' } } } } },
+    actions: [{ type: 'button', action_id: 'forge_submit_confirm_submit', value: JSON.stringify({ action: 'confirm_submit', slug: 'refund', round: 1 }) }],
+  };
+  captured?.onEnvelope('interactive', submitted);
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(box.actions.length, 1, 'the core receives the answer first — feedback must never cost someone their submission');
+  const upd = calls.find((c) => c.method === 'chat.update');
+  assert.ok(upd, 'the card the click came from is rewritten');
+  assert.equal(upd?.body.channel, 'D1');
+  assert.equal(upd?.body.ts, '111.222');
+  const att = upd?.body.attachments as { color: string; blocks: Record<string, unknown>[] }[];
+  assert.equal(att[0].color, '#2f7ed8', 'reading the colour off the original attachment: rebuilding it would strip the card bare');
+  assert.equal(att[0].blocks.filter((b) => b.type === 'input' || b.type === 'actions').length, 0);
+  assert.match(JSON.stringify(att[0].blocks), /fiscal months/);
+});
+
+test('an ordinary button is not a form submission: nothing is rewritten', async () => {
+  reset();
+  inbound();
+  captured?.onEnvelope('interactive', {
+    type: 'block_actions',
+    user: { id: 'U7' },
+    container: { type: 'message', channel_id: 'D1', message_ts: '111.222' },
+    actions: [{ type: 'button', action_id: 'forge_gateb_refund', value: JSON.stringify({ action: 'gateb', slug: 'refund' }) }],
+  });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(calls.find((c) => c.method === 'chat.update'), undefined);
+});
+
+test('the card could not be rewritten -> a warning, never a thrown error: the answer is already with the core', async () => {
+  reset();
+  respond = (m) => (m === 'chat.update' ? { ok: false, error: 'message_not_found' } : { ok: true });
+  const box = inbound();
+  captured?.onEnvelope('interactive', {
+    type: 'block_actions',
+    user: { id: 'U7' },
+    container: { type: 'message', channel_id: 'D1', message_ts: '111.222' },
+    message: { text: 't', blocks: [{ type: 'input', block_id: 'notes', label: { type: 'plain_text', text: 'Notes' }, element: { type: 'plain_text_input', action_id: 'notes' } }] },
+    state: { values: { notes: { notes: { type: 'plain_text_input', value: 'ok' } } } },
+    actions: [{ type: 'button', action_id: 'forge_submit_confirm_submit', value: JSON.stringify({ action: 'confirm_submit', slug: 'refund' }) }],
+  });
+  await new Promise((r) => setImmediate(r));
+  assert.equal(box.actions.length, 1);
+  assert.ok(calls.some((c) => c.method === 'chat.update'));
 });
 
 test('opening a modal: an older card whose questions were never in it -> a plain-text modal, never a button that does nothing', async () => {

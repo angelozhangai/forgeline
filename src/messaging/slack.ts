@@ -20,7 +20,7 @@ import { loadConfig } from '../config.ts';
 import { log } from '../util/log.ts';
 import { slackApi } from '../slack/web.ts';
 import { createSocketChannel } from '../slack/socket.ts';
-import { buildDecisionModal, buildGoModal, decisionBlocks, flattenStateValues, goBlocks, parseViewSubmission, type ModalContext } from '../slack/modal.ts';
+import { buildDecisionModal, buildGoModal, decisionBlocks, flattenStateValues, freezeFormBlocks, goBlocks, parseViewSubmission, SUBMIT_ACTION_PREFIX, type ModalContext } from '../slack/modal.ts';
 import { BK_LIMIT, explain, validateAttachments, validateView } from '../slack/blockkit.ts';
 import { blank, mrkdwnText, plainText } from '../slack/text.ts';
 import { DECISION_CAP, type DecisionItem } from '../gates/envelopes.ts';
@@ -116,7 +116,7 @@ function submitBtn(text: string, ctx: ModalContext, fallback: string): Record<st
         type: 'button',
         text: plainText(text, BK_LIMIT.buttonText, fallback),
         style: 'primary',
-        action_id: `forge_submit_${ctx.action}`.slice(0, BK_LIMIT.actionId),
+        action_id: `${SUBMIT_ACTION_PREFIX}${ctx.action}`.slice(0, BK_LIMIT.actionId),
         value: JSON.stringify({ action: ctx.action, slug: ctx.slug, round: ctx.round ?? 0 }).slice(0, BK_LIMIT.buttonValue),
       },
     ],
@@ -203,7 +203,13 @@ function renderBlock(b: CardBlock): Record<string, unknown>[] {
 export function renderSlackMessage(card: CardModel): { text: string; attachments: Record<string, unknown>[] } {
   const blocks: Record<string, unknown>[] = [{ type: 'header', text: plain(card.title, BK_LIMIT.headerText) }];
   if (card.subtitle) blocks.push(context(card.subtitle));
-  blocks.push(...card.blocks.flatMap(renderBlock));
+  // The core emits the questions twice — once as prose (decisionList) and once as the form — because on a
+  // surface where the form lives elsewhere, the prose is the only place the reader ever sees them. Here the
+  // form is in the card, so the prose is the same questions printed a second time, as a bulleted list of
+  // options that looks clickable and is not. Drop it and let the inputs carry their own labels.
+  const answerableForm = card.blocks.some((b) => b.kind === 'decisionForm' && b.items.length > 0);
+  const source = answerableForm ? card.blocks.filter((b) => b.kind !== 'decisionList') : card.blocks;
+  blocks.push(...source.flatMap(renderBlock));
   if (blocks.length > BK_LIMIT.blocksPerMessage) {
     log.warn(`Slack card exceeds the ${BK_LIMIT.blocksPerMessage}-block limit (${blocks.length}); the tail was truncated: "${card.title}"`);
   }
@@ -414,6 +420,11 @@ const slackPort: MessagingPort = {
           return;
         }
         handlers.onCardAction(payload);
+        // The core gets the answer first; the card is then rewritten to show what was submitted. Order
+        // matters: this is feedback, and feedback must never be able to cost someone their answer.
+        if (isFormSubmit(payload)) {
+          void freezeCard(payload).catch((e) => log.warn(`Slack freezing the submitted form threw: ${String(e).slice(0, 160)}`));
+        }
       },
       onError: (reason) => handlers.onError(reason),
       onReconnected: () => handlers.onReconnected(),
@@ -503,6 +514,42 @@ function isOpenModal(payload: Record<string, unknown>): boolean {
   if (payload.type !== 'block_actions') return false;
   const a = (payload.actions as { action_id?: string }[] | undefined)?.[0];
   return a?.action_id === OPEN_MODAL_ACTION;
+}
+
+function isFormSubmit(payload: Record<string, unknown>): boolean {
+  const a = (payload.actions as { action_id?: string; type?: string }[] | undefined)?.[0];
+  return a?.type === 'button' && typeof a.action_id === 'string' && a.action_id.startsWith(SUBMIT_ACTION_PREFIX);
+}
+
+// A modal gave feedback for free: it closed. An inline form gives none, so rewrite the card into what was
+// actually chosen — the inputs and the submit button are replaced by a read-only summary. That also makes a
+// second submission impossible, since the button is gone.
+//
+// The card comes back **inside the callback**, so nothing has to be remembered between the two: Slack sends
+// the original message with the interaction. A card posted the way this adapter posts them carries its blocks
+// on an attachment (container.type is message_attachment) — read the colour from there too, or the update
+// would strip the coloured bar off the card.
+//
+// Failure here is logged and dropped. The answer is already with the core; losing the visual acknowledgement
+// is a cosmetic problem, and taking the inbound path down over it would not be.
+async function freezeCard(payload: Record<string, unknown>): Promise<void> {
+  const container = (payload.container ?? {}) as { channel_id?: string; message_ts?: string };
+  const msg = (payload.message ?? {}) as { blocks?: unknown[]; text?: string; attachments?: { blocks?: unknown[]; color?: string }[] };
+  const channel = container.channel_id;
+  const ts = container.message_ts;
+  if (!channel || !ts) return;
+  const att = msg.attachments?.[0];
+  const source = att?.blocks ?? msg.blocks;
+  if (!Array.isArray(source) || source.length === 0) return;
+  const user = (payload.user as { id?: string } | undefined)?.id;
+  const frozen = freezeFormBlocks(source, payload.state, user, Date.now() / 1000);
+  const body: Record<string, unknown> = { channel, ts, text: msg.text || 'Forge' };
+  // Pass structures through as they are: slack/web.ts form-encodes and JSON-serialises them, the same way
+  // every other call in this file does.
+  if (att) body.attachments = [{ color: att.color ?? COLOR_HEX.grey, blocks: frozen.blocks }];
+  else body.blocks = frozen.blocks;
+  const r = await slackApi('chat.update', body);
+  if (!r.ok) log.warn(`Slack could not freeze the submitted form (the answer was still received): ${r.error}`);
 }
 
 // The "fill this in" button was clicked -> open the modal with the trigger_id. A trigger_id is valid for

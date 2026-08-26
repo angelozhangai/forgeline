@@ -218,3 +218,75 @@ export function parseViewSubmission(payload: Record<string, unknown>): ParsedSub
   if (!action || !slug) return null;
   return { action, slug, round: Number(meta?.round) || 0, formValues: flattenStateValues(view.state) };
 }
+
+// -- Freezing a submitted form ------------------------------------------------
+// A modal gave feedback for free: it closed. An inline form gives none — the card sits there with its
+// options still editable and its button still pressable, so "did that work?" has no answer and pressing
+// again is the obvious next move. So on submission the card is rewritten: the inputs and the button are
+// replaced by what was actually chosen.
+//
+// Everything needed comes out of the callback itself (Slack sends the original message back with it), which
+// is the point: nothing is held in process memory, so a restart cannot make this fail either.
+export interface FrozenForm {
+  blocks: Record<string, unknown>[];
+  answered: number;
+}
+export function freezeFormBlocks(blocks: unknown[], state: unknown, submittedBy?: string, atEpochSec?: number): FrozenForm {
+  const values = flattenStateValues(state);
+  // For display, prefer the option's **label** over its value. They are the same string for a normal answer,
+  // but "Other" carries the sentinel `__other__` — and a summary reading "→ __other__" tells the person
+  // nothing about what they picked. The core still receives the value, unchanged: this is the reading copy.
+  const labels = optionLabels(state);
+  const kept: Record<string, unknown>[] = [];
+  const answers: string[] = [];
+  let answered = 0;
+  for (const raw of blocks) {
+    const b = (raw ?? {}) as Record<string, unknown>;
+    if (b.type === 'input') {
+      // The label is the question as the person read it — reuse it verbatim rather than reconstructing it
+      // from the core's model, so the summary cannot describe a different question from the one answered.
+      const label = ((b.label as { text?: string } | undefined)?.text ?? '').trim();
+      const id = String((b.element as { action_id?: string } | undefined)?.action_id ?? b.block_id ?? '');
+      const v = values[id];
+      if (v) answered++;
+      const shown = labels[id] ?? v;
+      if (label) answers.push(shown ? `• ${label} → *${shown}*` : `• ${label} → _not answered_`);
+      continue;
+    }
+    // The block holding the submit button goes with the inputs; an actions block with anything else in it
+    // (an ordinary action button that happens to share the card) stays.
+    if (b.type === 'actions') {
+      const els = (b.elements as { action_id?: string }[] | undefined) ?? [];
+      if (els.some((e) => typeof e.action_id === 'string' && e.action_id.startsWith(SUBMIT_ACTION_PREFIX))) continue;
+    }
+    kept.push(b);
+  }
+  if (answers.length) {
+    kept.push({ type: 'section', text: { type: 'mrkdwn', text: `*Submitted answers*\n${answers.join('\n')}` } });
+  }
+  const who = submittedBy ? ` by <@${submittedBy}>` : '';
+  // Slack renders its own local time from an epoch, so the reader sees their timezone rather than the
+  // server's.
+  const when = atEpochSec ? ` · <!date^${Math.floor(atEpochSec)}^{date_short_pretty} {time}|just now>` : '';
+  kept.push({ type: 'context', elements: [{ type: 'mrkdwn', text: `✅ Submitted${who}${when} — this form is closed.` }] });
+  return { blocks: kept, answered };
+}
+
+// The prefix every inline submit button's action_id carries. It is what tells a submission apart from an
+// ordinary action button on the same card, both when freezing and when deciding what to keep.
+export const SUBMIT_ACTION_PREFIX = 'forge_submit_';
+
+// The human-readable label of each selected option, keyed exactly like flattenStateValues. Free-text fields
+// have no label and are absent here, so the caller falls back to the value itself.
+function optionLabels(state: unknown): Record<string, string> {
+  const out: Record<string, string> = {};
+  const values = (state as { values?: Record<string, Record<string, unknown>> } | undefined)?.values;
+  if (!values) return out;
+  for (const actions of Object.values(values)) {
+    for (const [actionId, el] of Object.entries(actions ?? {})) {
+      const text = (el as { selected_option?: { text?: { text?: unknown } } } | undefined)?.selected_option?.text?.text;
+      if (typeof text === 'string' && text !== '') out[actionId] = text;
+    }
+  }
+  return out;
+}
