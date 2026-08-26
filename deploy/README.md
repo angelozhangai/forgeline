@@ -69,13 +69,16 @@ The transport is a seam (`MessagingPort`) with Feishu and Slack as two implement
 
 What to switch on in the Slack console (api.slack.com/apps → create an App):
 
-1. **OAuth & Permissions → Bot Token Scopes**: `chat:write`, `channels:history`, `groups:history`, `im:write`, `users:read`. Install it into the workspace and you get an `xoxb-…` token → `SLACK_BOT_TOKEN`.
+1. **OAuth & Permissions → Bot Token Scopes**: `chat:write`, `channels:history`, `groups:history`, `im:history`, `im:write`, `users:read`. Install it into the workspace and you get an `xoxb-…` token → `SLACK_BOT_TOKEN`.
+   **Do not miss `im:history`**: subscribing to `message.im` without granting it means a requirement sent by direct message cannot be read back during the offline backfill — it is simply gone, with no error anywhere. (`config/forge.env.example` carries the same list; the two have to agree.)
 2. **Socket Mode → on**; under **Basic Information → App-Level Tokens** create a token with `connections:write` (an `xapp-…`) → `SLACK_APP_TOKEN`.
 3. **Event Subscriptions → subscribe** to `message.channels` / `message.groups` / `message.im`.
 4. **Interactivity & Shortcuts → on**. This one is **required**: Slack's input elements are not valid inside a message, so a review form can only be a modal, and without it pressing the button does nothing.
 5. `/invite` the bot into the channels you want watched and put their ids in `SLACK_WATCH_CHANNELS`; put the bot's own user id in `SLACK_BOT_USER_ID` (**leaving it empty is as good as switching the bot off**: it cannot tell whether a channel message mentioned it, so it conservatively ignores every one).
 
 Running `FORGE_MESSAGING_PROVIDER=slack ./forge doctor` checks each of those in turn.
+
+> **The first workspace also needs one manual pass.** doctor proves the keys are present, never that Slack itself behaves as documented — that a real `views.open` accepts the view, that one `view_submission` returns `private_metadata` plus all of `state.values`, that the planned `disconnect` arrives about every half hour, and that an ack lands inside the 3-second window. The runbook that clears all four in one sitting is [docs/slack-golive.md](../docs/slack-golive.md).
 
 **The one difference in feel from Feishu**: the review and filing forms are "a button on the card → a modal opens → submit once", rather than filling the form in on the card itself. The reason is point 4 above — a platform limitation, not a shortcut in the implementation.
 

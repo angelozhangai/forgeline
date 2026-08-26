@@ -56,6 +56,30 @@ export function makeProject(id: string, root: string): Project {
   };
 }
 
+// Doctor's project-layout check. It has to know **which mechanical-action adapter** the project uses, because
+// the two adapters need different things on disk: `demo` delegates to the target project's own scripts, so a
+// missing review-req.sh really is a broken layout, while `native` calls gh directly and needs no scripts at
+// all — that is the whole point of it. Checking for the scripts regardless leaves every open-source target
+// with a red row nobody can ever clear, and a row nobody can clear is worse than no row: it teaches you to
+// skim past the rest of the list.
+export function layoutCheck(root: string, actions: 'demo' | 'native'): { label: string; ok: boolean; note: string } {
+  const brief = existsSync(resolve(root, 'CLAUDE.md')); // the project brief both adapters read
+  if (actions === 'native') {
+    return {
+      label: 'the project layout (CLAUDE.md)',
+      ok: brief,
+      note: brief ? 'actions=native — gh is called directly, so this project needs no scripts' : 'CLAUDE.md is missing (the gates read it as the project brief)',
+    };
+  }
+  const scriptsDir = resolve(root, 'scripts');
+  const ok = brief && existsSync(resolve(scriptsDir, 'review-req.sh')) && existsSync(resolve(scriptsDir, 'feishu-doc.js'));
+  return {
+    label: 'the project layout (CLAUDE.md + scripts)',
+    ok,
+    note: ok ? '' : 'actions=demo delegates to the project\'s own scripts: it needs CLAUDE.md + scripts/review-req.sh + scripts/feishu-doc.js (or set actions:native)',
+  };
+}
+
 let _default: Project | undefined;
 // The default target project (resolved lazily and cached). It reads the environment and the disk on the first
 // call, at the same moment the old ROOT did (root.ts called it at import time).
