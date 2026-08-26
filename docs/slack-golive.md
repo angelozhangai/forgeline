@@ -35,6 +35,23 @@ This runbook clears all four in one sitting: steps 1–4 get you to a live card,
 
 `FORGE_MESSAGING_PROVIDER=slack ./forge doctor` checks 1 and 4 and nothing else — 2, 3 and 5 are yours.
 
+## Rehearse first — it is free
+
+`forge rehearse` sends **every card Forge can produce** (one per `NotifyKind`, one per `State`, including the
+two that carry a form) to the chat you configured, and `--listen` then prints every button callback verbatim.
+No model call, no session in the database, no issue, no document — the only outward effect is messages in
+that chat.
+
+```bash
+./forge rehearse --listen        # --only dm / --only channel to narrow it
+```
+
+It answers three of the four questions on its own — a real `views.open` accepted the view, one
+`view_submission` returned the context plus every field, and a redelivered callback (the only way to observe
+a missed ack from outside) is named as one. What it deliberately does **not** touch is the gates and the
+state machine: nothing is registered, so nothing advances. Do this before spending anything; if a card is
+rejected here, the paid run below would only have found the same thing later and more expensively.
+
 ## The run
 
 Keep `tail -f logs/launchd.log` (or the foreground `./forge listen`) visible throughout: three of the four

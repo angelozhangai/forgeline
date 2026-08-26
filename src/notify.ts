@@ -22,24 +22,31 @@ import { FUN_ON, petStage, petAssetName, treeLine, finalForm, feedLine, easterEg
 import { sizeBadge, type Size } from './util/sizing.ts';
 import type { Recommendation } from './util/assign.ts';
 
-export type NotifyKind =
-  | 'needs_confirm'
-  | 'needs_arbitration'
-  | 'needs_gateb'
-  | 'needs_gateb_input' // Gate B's revision escalated: the maintainer has to decide an open point
-  | 'needs_gateb_arbitration' // Gate B's adversarial review hit its cap unresolved: the maintainer has to decide
-  | 'needs_go'
+// Every kind of direct-message card Forge can send. **The array is the source of truth and the type is
+// derived from it**, not the other way round: a corpus that has to render "every kind" (the structural gate
+// in test/slack-blockkit.test.ts, and the live rehearsal behind `forge rehearse`) can then enumerate the
+// kinds instead of keeping its own hand-written copy — which is the copy that silently stops covering a new
+// kind the day someone adds one.
+export const NOTIFY_KINDS = [
+  'needs_confirm',
+  'needs_arbitration',
+  'needs_gateb',
+  'needs_gateb_input', // Gate B's revision escalated: the maintainer has to decide an open point
+  'needs_gateb_arbitration', // Gate B's adversarial review hit its cap unresolved: the maintainer has to decide
+  'needs_go',
   // The downstream gates C and D (all private decisions for the maintainer; from M2 they are text cards with a
   // CLI call to action, and interactive buttons come later)
-  | 'needs_review_pr' // Gate C is green: the PR has to be opened for Gate D
-  | 'needs_gatec_input' // Gate C's implementation escalated: the maintainer has to answer
-  | 'needs_gatec_arbitration' // Gate C's CI or acceptance failed for several rounds: the maintainer has to decide
-  | 'needs_gated_input' // Gate D's revision escalated: the maintainer has to answer
-  | 'needs_gated_arbitration' // Gate D's adversarial review is unresolved after several rounds: the maintainer has to decide
-  | 'needs_merge' // Gate D is done and the merge-readiness report is out: a human has to merge
-  | 'failed'
-  | 'done'
-  | 'recovered';
+  'needs_review_pr', // Gate C is green: the PR has to be opened for Gate D
+  'needs_gatec_input', // Gate C's implementation escalated: the maintainer has to answer
+  'needs_gatec_arbitration', // Gate C's CI or acceptance failed for several rounds: the maintainer has to decide
+  'needs_gated_input', // Gate D's revision escalated: the maintainer has to answer
+  'needs_gated_arbitration', // Gate D's adversarial review is unresolved after several rounds: the maintainer has to decide
+  'needs_merge', // Gate D is done and the merge-readiness report is out: a human has to merge
+  'failed',
+  'done',
+  'recovered',
+] as const;
+export type NotifyKind = (typeof NOTIFY_KINDS)[number];
 
 export interface NotifyExtra {
   stage?: string;

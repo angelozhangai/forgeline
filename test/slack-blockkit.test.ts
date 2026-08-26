@@ -20,7 +20,7 @@ import assert from 'node:assert/strict';
 import { BK_LIMIT, explain, validateAttachments, validateBlocks, validateView } from '../src/slack/blockkit.ts';
 import { buildDecisionModal, buildGoModal } from '../src/slack/modal.ts';
 import { renderSlackMessage } from '../src/messaging/slack.ts';
-import { buildCard, buildStatusCard, type NotifyKind } from '../src/notify.ts';
+import { buildCard, buildStatusCard, NOTIFY_KINDS } from '../src/notify.ts';
 import { STATES } from '../src/statemachine/states.ts';
 import type { CardBlock, CardModel } from '../src/messaging/model.ts';
 import type { DecisionItem } from '../src/gates/envelopes.ts';
@@ -118,29 +118,12 @@ function sess(p: Partial<Session> = {}): Session {
   } as unknown as Session;
 }
 
-const KINDS: NotifyKind[] = [
-  'needs_confirm',
-  'needs_arbitration',
-  'needs_gateb',
-  'needs_gateb_input',
-  'needs_gateb_arbitration',
-  'needs_go',
-  'needs_review_pr',
-  'needs_gatec_input',
-  'needs_gatec_arbitration',
-  'needs_gated_input',
-  'needs_gated_arbitration',
-  'needs_merge',
-  'failed',
-  'done',
-  'recovered',
-];
 
 const bad = (card: CardModel): string[] => validateAttachments(renderSlackMessage(card).attachments);
 
 test('every DM card (one per NotifyKind) renders structurally valid Block Kit', () => {
   const offenders: string[] = [];
-  for (const kind of KINDS) {
+  for (const kind of NOTIFY_KINDS) {
     const problems = bad(buildCard(kind, sess({ error: 'something broke' }), { stage: 'Gate B', error: 'boom', issues: [{ repo: 'api', number: 7, url: 'https://x/7' }], from: 'A', to: 'B' }));
     if (problems.length) offenders.push(`${kind}: ${problems.join('; ')}`);
   }
