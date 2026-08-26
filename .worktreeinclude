@@ -1,0 +1,8 @@
+# Gitignored files that a new worktree needs carried over from the main checkout. (The filename is
+# Claude Code's, so humans and agents share one list.) Tracked files are not listed -- they are in
+# the checkout already, and copying them again only manufactures a fake diff.
+# One path per line, relative to the repo root; '#' starts a comment. tools/wt.sh copies only the
+# entries that exist and are genuinely ignored.
+config/forge.env
+config/projects.yaml
+config/weekly-overrides.tsv

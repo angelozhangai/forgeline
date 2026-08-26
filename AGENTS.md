@@ -38,6 +38,42 @@ they actually modify — never hardcoded to "the first repo", never piled into t
   [src/gates/gateC.ts](src/gates/gateC.ts) (`resolveTargetRepos`/`primaryTargetRepo`/setup). Change those +
   their tests together.
 
+## 🪵 Top rule: this repo's own changes live in a worktree too — one script, one hidden dir
+
+The rule above governs the repos Forge *changes for you*. This one governs **Forgeline itself**, and it is the
+same shape on purpose: one requirement / one issue = **one worktree at `<mainCheckout>/.forge/worktrees/<key>`**,
+created by **[tools/wt.sh](tools/wt.sh)** — the single entry point for humans and for every agent. The main
+checkout is for reading code and `git pull`, nothing else.
+
+- **Why mechanical, not advisory**: nobody broke a rule the day it bit us — `main` moved (a PR merged) while the
+  shared checkout had 9 uncommitted files in it. A convention only binds whoever read it; a hook binds everyone.
+  The second proof came later: for four days five trees sat under `.claude/worktrees/` and *nothing said a word*,
+  because the rule lived in prose while the built-in `EnterWorktree` tool has its own hardcoded directory.
+- **`tools/wt.sh check` is the detector**, and it runs from `.githooks/pre-commit` before the CI gate. It fails on
+  any worktree of this repo outside `.forge/worktrees/`, on `.forge/` not being ignored, and on `core.hooksPath`
+  being unset. `--fix` relocates stray trees with `git worktree move` (never `mv`: the registration would be left
+  dangling and the branch would read as "already checked out" everywhere else).
+- **The identifier is verbatim**: `tools/wt.sh new fix/mention-gate` → branch `fix/mention-gate`, directory
+  `.forge/worktrees/fix-mention-gate` (only `/`→`-`). No `worktree-` prefix (Claude Code's default), so the tree,
+  the branch and the PR all name the same thing.
+- **Base is a pinned sha**, never `origin/main` — same discipline, same reason as Gate C.
+- **A new checkout is not a working checkout**: `.worktreeinclude` carries the gitignored config
+  (`config/forge.env`, …) across and `npm ci` runs, because a tree that can't run `npm run ci` can't clear the
+  pre-commit gate. `node_modules` is installed, **never symlinked** (`.gitignore`'s `node_modules/` matches only
+  directories — a symlink shows up as untracked — and a diverged lockfile becomes a wrong-version bug).
+- **Two backstops**: [.githooks/lib/no-main-checkout.sh](.githooks/lib/no-main-checkout.sh) refuses any commit
+  made *in the main checkout* (escape hatch `FORGELINE_ALLOW_MAIN_CHECKOUT=1`), and
+  [.claude/hooks/guard-main-checkout.sh](.claude/hooks/guard-main-checkout.sh) denies the first edit to the main
+  checkout before an agent has entered a tree — Claude Code's built-in isolation only starts *after* you're in one.
+- **Every agent path funnels into the same script**: [.claude/settings.json](.claude/settings.json) routes
+  `WorktreeCreate`/`WorktreeRemove` to `tools/wt.sh`, so `claude -w`, "work in a worktree", and
+  `isolation: worktree` subagents all land in `.forge/worktrees/` instead of forking a second convention. Codex
+  has no such hook — which is exactly why the git-side gates above are the ones that carry the rule.
+- **Cleanup**: `tools/wt.sh rm` refuses to discard uncommitted or unpushed work without `--force`; `sweep` is
+  dry-run until `--yes`. Never `rm -rf` a tree — the registration survives and the branch then reads as "already
+  checked out" everywhere else.
+- Source of truth: [tools/wt.sh](tools/wt.sh) + [test/wt-script.test.ts](test/wt-script.test.ts). Change together.
+
 ## 🔌 Top rule: this repo is upstream — downstream products extend it, they never patch it
 
 Forgeline is the **open core**. Products built on it (private deployments, commercial layers) live in their
@@ -167,6 +203,9 @@ scopes itself to `git ls-files` rather than the working tree.
 
 | Command | Purpose |
 | --- | --- |
+| `tools/wt.sh new <slug>` | **Start any work here**: create/reuse the isolated worktree for a requirement or issue (`--issue <n>` reads the title from GitHub) |
+| `tools/wt.sh check [--fix]` | Fail on any worktree outside `.forge/worktrees/` (runs from pre-commit); `--fix` relocates them |
+| `tools/wt.sh list` / `rm` / `sweep` / `doctor` | Inspect, remove (refuses to discard work), sweep merged trees (dry-run by default), health-check |
 | `npm run ci` | **Pre-commit gate**: lint + typecheck + test:cov behind a test-count floor (same set as remote CI) |
 | `npm run lint` | Biome lint (incl. `noFloatingPromises`; curated rules in `biome.json`) |
 | `npm run typecheck` | `tsc --noEmit` (strict) |
