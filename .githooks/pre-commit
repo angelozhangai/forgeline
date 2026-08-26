@@ -9,6 +9,13 @@
 #   git commit --no-verify
 set -e
 
+# Gate 1 -- placement, before the quality gate: committing from the main checkout, or holding a
+# worktree outside .forge/worktrees/, is not worth two minutes of CI to find out about.
+HOOK_DIR="$(dirname "$0")"
+"$HOOK_DIR/lib/no-main-checkout.sh"
+"$HOOK_DIR/../tools/wt.sh" check
+
+# Gate 2 -- quality: local CI has to be green.
 if [ ! -d node_modules ]; then
   echo "[pre-commit] node_modules is missing -- run npm ci or npm install before committing" >&2
   exit 1

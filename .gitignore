@@ -20,7 +20,13 @@ config/weekly-overrides.tsv
 .DS_Store
 *.log
 
-# Claude Code worktrees (temporary, never committed) and this machine's private settings -- only the shared
-# .claude/skills/ is committed
+# Isolated worktrees. One convention only: <repo>/.forge/worktrees/<key>, created by tools/wt.sh.
+# Local to the machine, never committed -- and ignored *before* the first tree is created, or the
+# whole checkout inside it reads as files waiting to be committed.
+.forge/
+
+# Worktrees from Claude Code's built-in convention. New trees all go to .forge/ (tools/wt.sh check
+# fails on any that do not); this line stays as a backstop for ones that predate the rule.
 .claude/worktrees/
+# This machine's private settings -- the shared .claude/settings.json, hooks/ and skills/ are committed.
 .claude/settings.local.json
