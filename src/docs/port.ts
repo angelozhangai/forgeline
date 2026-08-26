@@ -64,6 +64,16 @@ export interface DocSource {
   // Claim the documents in a message that belong to this source (there may be several). Nothing
   // claimed -> an empty array.
   claim(input: DocClaimInput): DocRef[];
+  // Build a ref for a body that arrives as **text with no document behind it**, bypassing whatever
+  // product gating claim() applies. Optional, and only a fallback source can meaningfully implement it
+  // (a source backed by a real document service has nothing to address).
+  //
+  // It exists because claim() answers "should a paragraph in a chat become a requirement", which is a
+  // decision that costs money on every message, while a caller that already has an explicit body in hand
+  // — the rehearsal typing one on the command line — is not asking that question at all. Separating the
+  // two keeps the money gate where it belongs instead of forcing such a caller to switch it on.
+  // Not ours, or not applicable -> null.
+  refFromText?(text: string): DocRef | null;
   // Parse a link or bare token into this source's ref (the CLI's `--prd <url>` takes this path).
   // Not ours -> null.
   parseRef(urlOrToken: string): DocRef | null;

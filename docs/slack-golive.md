@@ -50,6 +50,7 @@ that chat.
 
 ```bash
 ./forge rehearse --listen        # --only dm / --only channel to narrow it
+./forge rehearse --pipeline "we should let people export their data"   # the other half: the machine walks, end to end
 ```
 
 It answers three of the four questions on its own — a real `views.open` accepted the view, one

@@ -68,6 +68,7 @@ npm install
 cp config/forge.env.example config/forge.env   # point FORGE_PROJECT_ROOT at your target project
 ./forge doctor                                  # environment self-check
 ./forge rehearse --listen                       # send every card to your chat and watch the buttons come back (free: no model call, no writes)
+./forge rehearse --pipeline "<any sentence>"     # walk one throwaway requirement intake -> DONE: real transitions and cards, canned model replies, nothing written to the project
 
 # Manual flow (no messaging platform needed):
 ./forge add --prd <doc-url>       # register a PRD

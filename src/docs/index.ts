@@ -134,6 +134,20 @@ export function parseAnyRef(urlOrToken: string): DocRef | null {
 
 // The ids of registered sources (used in error text: tell the reader which sources are recognised
 // right now, rather than a bare "unrecognised").
+// A ref for a requirement body that has no document behind it, built by whichever registered source is the
+// fallback. The core asks the registry, so it never has to know that today's answer is plaintext — swap the
+// fallback (or let a pack register its own) and this keeps working.
+// No fallback source registered -> null, and the caller says so rather than inventing a ref nobody can read.
+export function fallbackRefFromText(text: string): DocRef | null {
+  for (const s of sources()) {
+    if (s.fallback && s.refFromText) {
+      const ref = s.refFromText(text);
+      if (ref) return ref;
+    }
+  }
+  return null;
+}
+
 export function registeredIds(): string[] {
   return sources().map((s) => s.id);
 }

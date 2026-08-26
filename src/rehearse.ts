@@ -9,8 +9,9 @@
 //   - the ack lands inside the provider's window (a miss shows up as the same callback arriving twice).
 //
 // Two deliberate non-goals, so nobody reads more into a green rehearsal than it earns:
-//   - it does not exercise the gates or the state machine (1198 unit tests do, and stubbing the model here
-//     would only re-test them through a fake);
+//   - it does not exercise the gates or the state machine (the unit suite does, and stubbing the model here
+//     would only re-test them through a fake) — `forge rehearse --pipeline` is the command that does, and
+//     src/rehearsePipeline.ts explains what it replaces to get there;
 //   - it does not prove intake — no message is parsed, because nothing is registered.
 //
 // Safety: the only outward effect is messages in the chat you configured. The fake session never reaches
