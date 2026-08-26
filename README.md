@@ -106,15 +106,21 @@ doc_sources:
     enabled: true
 ```
 
-**What it costs, stated plainly.** Once on, a message whose body normalizes to **≥ 20 non-whitespace
-characters** becomes a requirement and runs Gate A — a paid model call, per message. Three things follow:
+**What it costs, stated plainly.** Once on, a message with enough substance in it becomes a requirement and
+runs Gate A — a paid model call, per message. The bar is a **weighted** length, not a character count:
+`MIN_SUBSTANCE_WEIGHT` is 35, where a word-like character (CJK, kana, hangul) counts 3 and everything else
+counts 1 — about a dozen CJK characters, or about seven English words. Three things follow:
 
 - In a **group**, the @-mention gate still applies first, so only messages that @ the bot get this far.
   In a **DM** there is no such gate: every message long enough becomes a requirement. Keep that in mind
   before DMing the bot a paragraph of thinking-out-loud.
-- The 20-character floor exists only to stop "ok, thanks" — it is deliberately a **length** signal, not a
-  semantic one, so it biases toward false negatives. A genuinely terse requirement gets ignored; write
-  more and it goes through. That is the cheap side of the trade.
+- The floor exists only to stop "ok, thanks" — it is deliberately a **length** signal, not a semantic one,
+  so it biases toward false negatives. A genuinely terse requirement gets ignored; write more and it goes
+  through. That is the cheap side of the trade. It is weighted rather than counted because the same
+  requirement runs to about 25 characters in Chinese and about 95 in English: a single character count
+  calibrated for one script either lets every pleasantry through in the other, or rejects real requirements
+  in it (the fixtures in [test/docs-plaintext.test.ts](test/docs-plaintext.test.ts) pin both bands — the
+  longest measured pleasantry scores 34, the tersest real requirement 38).
 - Identity is the **content hash** of the normalized body. Pasting the same text again is deduped;
   changing a word makes it honestly a *new* requirement, because there is no document version to track.
 

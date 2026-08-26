@@ -349,6 +349,8 @@ payload, that the planned `disconnect` really arrives about every 30 minutes, an
 the 3-second window under real latency. Everything upstream of those is now machine-checked on every CI
 run.
 
+The runbook that clears those four in one sitting is [slack-golive.md](slack-golive.md).
+
 **The modal's hidden state problem.** Slack forms live in a modal, but the modal's *contents* (which
 decisions, which DRI pool) are only known when the card is rendered — and the click can come much later.
 The adapter caches the built view in memory at render time. A daemon restart empties that cache while the
