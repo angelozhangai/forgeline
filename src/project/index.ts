@@ -8,10 +8,16 @@
 // leaves out the project export, and it explodes at import time" fragility (the lesson from 0.1b).
 import { makeDemoScriptActions } from './actions.ts';
 import { makeNativeGithubActions } from './github.ts';
+import { makeRehearsalActions } from './rehearsal.ts';
+import { rehearsalOn } from '../rehearsal.ts';
 import type { ProjectActions } from './actions.ts';
 import type { ProjectFull } from '../projects.ts'; // type-only, erased at runtime
 
 export function projectActions(proj: ProjectFull): ProjectActions {
+  // The rehearsal wins over the project's own choice, and it is checked here rather than in each adapter:
+  // this is the single place the core resolves "how do I act on the target project", so one branch covers
+  // every caller and no gate has to know the mode exists.
+  if (rehearsalOn()) return makeRehearsalActions(proj);
   return proj.actions === 'native' ? makeNativeGithubActions(proj) : makeDemoScriptActions(proj);
 }
 

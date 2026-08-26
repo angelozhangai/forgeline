@@ -114,6 +114,15 @@ export const plaintextDocs: DocSource = {
     return [{ source: PLAINTEXT_SOURCE, token: contentToken(norm), raw: norm }];
   },
 
+  // Deliberately **not** gated on enabled(): see the port's comment. The substance floor is not applied
+  // either — it exists to stop a pleasantry in a chat from costing a Gate A run, and a caller that passed
+  // an explicit body has already made that decision itself.
+  refFromText(text: string): DocRef | null {
+    const norm = normalizePlaintext(text);
+    if (!norm) return null;
+    return { source: PLAINTEXT_SOURCE, token: contentToken(norm), raw: norm };
+  },
+
   parseRef(urlOrToken: string): DocRef | null {
     if (!enabled()) return null;
     const s = (urlOrToken ?? '').trim();

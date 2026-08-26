@@ -3,10 +3,14 @@ import { ROOT, SVC_DIR } from '../root.ts';
 import { loadConfig } from '../config.ts';
 import { log } from '../util/log.ts';
 import { assertClaudeEnvelope } from './contract.ts';
+import { rehearsalOn, cannedText } from '../rehearsal.ts';
 
 // A lightweight bare call: no CLAUDE.md or skills from the main repo, no tools, no MCP. Used for small
 // utility work such as producing a slug — cheap and fast.
 export async function runClaudeBare(prompt: string): Promise<string | null> {
+  // The rehearsal short-circuits **before** the config is read and before anything is spawned: no token is
+  // spent, and no claude_bin has to exist on the machine running the rehearsal.
+  if (rehearsalOn()) return cannedText(undefined);
   const cfg = loadConfig();
   const r = await run(
     cfg.runtime.claude_bin,
@@ -49,6 +53,18 @@ function summarizeTool(name: string, input: Record<string, unknown> | undefined)
   }
 }
 
+// The rehearsal's stand-in for one runClaude call. A label the canned table does not answer throws, and the
+// throw is turned into an ordinary failed ClaudeResult rather than propagated: that is what parks the gate in
+// its *_FAILED state with the reason recorded, exactly as a real CLI failure would — instead of taking down
+// the whole tick with an exception the state machine never sees.
+function rehearsalResult(label: string | undefined): ClaudeResult {
+  try {
+    return { ok: true, result: cannedText(label), sessionId: 'rehearsal', costUsd: 0, raw: '' };
+  } catch (e) {
+    return { ok: false, result: '', sessionId: null, costUsd: 0, raw: '', error: String(e instanceof Error ? e.message : e) };
+  }
+}
+
 // Run the local claude -p with cwd=$ROOT (loading CLAUDE.md and skills); the prompt goes through stdin
 // (avoiding argv size limits).
 // stream-json is used to report progress live (otherwise a headless run echoes nothing at all and looks
@@ -60,6 +76,7 @@ export async function runClaude(
   prompt: string,
   opts: { label?: string; sessionId?: string; resume?: string; timeoutSec?: number; cwd?: string } = {},
 ): Promise<ClaudeResult> {
+  if (rehearsalOn()) return rehearsalResult(opts.label);
   const cfg = loadConfig();
   const env: NodeJS.ProcessEnv = { ...process.env };
   if (cfg.env.CLAUDE_CODE_OAUTH_TOKEN) {

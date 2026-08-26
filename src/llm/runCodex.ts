@@ -3,6 +3,7 @@ import { ROOT } from '../root.ts';
 import { loadConfig } from '../config.ts';
 import { log } from '../util/log.ts';
 import { codexEnvelopeCollapsed, assertCodexEnvelope } from './contract.ts';
+import { rehearsalOn, cannedText } from '../rehearsal.ts';
 
 export interface CodexTokens {
   input: number;
@@ -83,6 +84,16 @@ export interface CodexOpts {
 // Resume: `codex exec resume <threadId> --json --skip-git-repo-check -` (no -s — resume rejects that
 // argument, and the sandbox is inherited from the first round).
 export async function runCodex(prompt: string, opts: CodexOpts = {}): Promise<CodexResult> {
+  // available:true matters as much as the canned text. Reporting the reviewer as unavailable would send the
+  // gate down its degraded claude-self-review path, and the rehearsal would then be exercising the fallback
+  // rather than the adversarial path a production run takes.
+  if (rehearsalOn()) {
+    try {
+      return { ok: true, result: cannedText(opts.label), threadId: 'rehearsal', tokens: null, raw: '', available: true };
+    } catch (e) {
+      return { ok: false, result: '', threadId: null, tokens: null, raw: '', available: true, error: String(e instanceof Error ? e.message : e) };
+    }
+  }
   const cfg = loadConfig();
   if (!commandExists(cfg.runtime.codex_bin)) {
     return { ok: false, result: '', threadId: null, tokens: null, raw: '', available: false, error: 'the codex CLI is not installed' };
