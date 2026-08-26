@@ -1,16 +1,25 @@
-// Slack provider layer — **the modal round trip**. This is the one genuine interaction difference
-// between Slack and Feishu.
+// Slack provider layer — **the form blocks, and the modal that used to be the only way to show them**.
 //
-// A Feishu card can hold a form and a submit button directly; Slack **cannot**: input blocks are only
-// legal inside a modal or the Home tab, and decisionForm needs a free-text notes box. So: put a button on
-// the card -> views.open opens a modal -> the user fills it in once -> one view_submission carries every
-// field back.
+// The premise this file was written on is no longer true, and the correction matters enough to record:
+// input blocks **are** legal in a message (Slack lists the input block's surfaces as modals, messages and
+// home tabs), and since 2020 every `block_actions` payload carries the full `state` of the surface it came
+// from — messages included. So a Slack card can hold a form and a submit button after all, exactly like a
+// Feishu one, and that is what messaging/slack.ts now renders. Verified against a real workspace rather
+// than taken from the docs: a message carrying radio_buttons + static_select + plain_text_input was
+// accepted, and pressing its button returned all three answers in `state.values`.
 //
-// The crux is **how the context survives the round trip**: when the button is clicked we know
-// {action, slug, round}, but the view_submission no longer carries that card. Slack provides
-// private_metadata, an opaque string that travels with the view — put the context in it and take it back
-// out on submit. On the core side, the shape of InboundCardAction is **entirely unchanged**
-// (action/slug/value/formValues).
+// Inline is better on every axis that has ever bitten here: one click instead of two, no `trigger_id` to
+// expire inside three seconds, and — the big one — **no form content held in process memory**, so a daemon
+// restart cannot turn a live card into a degraded free-text box.
+//
+// The modal path stays, for one reason that is not nostalgia: **cards posted before this change are still
+// sitting in Slack with a modal button on them**, and a button that dies on upgrade is precisely the
+// failure this repo refuses to ship. It is the compatibility path, not the main one.
+//
+// How the context survives the modal round trip: when the button is clicked we know {action, slug, round},
+// but the view_submission no longer carries that card. Slack provides private_metadata, an opaque string
+// that travels with the view. On the core side, the shape of InboundCardAction is **entirely unchanged**
+// either way (action/slug/value/formValues).
 import type { DecisionItem } from '../gates/envelopes.ts';
 import { answerableDecisions, DECISION_CAP } from '../gates/envelopes.ts';
 import { BK_LIMIT } from './blockkit.ts';
@@ -47,29 +56,40 @@ const mrkdwnEl = (text: string): Record<string, unknown> => ({ type: 'mrkdwn', t
 // A dropdown option: both text and value are capped at 75. Truncate rather than error — option labels are
 // written by people, and a long one is simply clipped; it must never make the whole card unsendable. The
 // value gets no ellipsis: it is the raw value fed back to the core, not something a person reads.
-function option(label: string, value: string): Record<string, unknown> {
-  return { text: plain(label, BK_LIMIT.optionText), value: clip(value, BK_LIMIT.optionValue) };
+function option(label: string, value: string, description?: string): Record<string, unknown> {
+  return {
+    text: plain(label, BK_LIMIT.optionText),
+    value: clip(value, BK_LIMIT.optionValue),
+    // Radio buttons and checkboxes render a second, quieter line under the label; a select menu ignores it.
+    // The impact of choosing an option belongs there rather than crammed into the label, which caps at 75.
+    ...(description ? { description: plain(description, BK_LIMIT.optionText) } : {}),
+  };
 }
 
 // One open question -> one input block (block_id = action_id = ask_<id>, lined up in the same order as
 // composeDecisionAnswer).
 // optional:true is deliberate: the PM may answer only some of them and write the rest in the notes box —
 // matching the semantics on the Feishu side.
-function askBlock(id: string, item: DecisionItem): Record<string, unknown> {
+// Radio buttons show every option at once, which is what a decision wants — you compare them, you do not
+// hunt for them in a dropdown. They cap at 10 options though, and a long list is a wall of text, so past
+// RADIO_MAX it falls back to a select menu. Both return the same shape, so nothing downstream cares which
+// one was rendered.
+const RADIO_MAX = 5;
+export function askBlock(id: string, item: DecisionItem): Record<string, unknown> {
+  const options = [
+    ...item.options.slice(0, 10).map((o) => option(`${o.recommended ? '★ ' : ''}${o.label}`, o.label, o.impact || undefined)),
+    option('Other (write it in the notes below)', '__other__'),
+  ];
+  const element =
+    options.length <= RADIO_MAX
+      ? { type: 'radio_buttons', action_id: `ask_${id}`, options }
+      : { type: 'static_select', action_id: `ask_${id}`, placeholder: plain('Choose…'), options };
   return {
     type: 'input',
     block_id: `ask_${id}`,
     optional: true,
     label: plain(`${id}. ${item.prompt}`, BK_LIMIT.inputLabel),
-    element: {
-      type: 'static_select',
-      action_id: `ask_${id}`,
-      placeholder: plain('Choose…'),
-      options: [
-        ...item.options.slice(0, 10).map((o) => option(`${o.recommended ? '★ ' : ''}${o.label}`, o.label)),
-        option('Other (write it in the notes below)', '__other__'),
-      ],
-    },
+    element,
     ...(item.hint ? { hint: plain(`Suggestion: ${item.hint}`, BK_LIMIT.inputLabel) } : {}),
   };
 }
@@ -85,6 +105,12 @@ export interface DecisionModalOpts {
 
 // The decision modal (the PM answering at Gate A / the maintainer signing off at Gate B).
 export function buildDecisionModal(ctx: ModalContext, o: DecisionModalOpts): Record<string, unknown> {
+  return view(ctx, o.title ?? 'Requirement review', o.submitText, decisionBlocks(o));
+}
+
+// The decision form's input blocks, with no surface wrapped around them — a message and a modal render the
+// **same** blocks, so the two can never drift into asking different questions.
+export function decisionBlocks(o: DecisionModalOpts): Record<string, unknown>[] {
   const blocks: Record<string, unknown>[] = answerableDecisions(o.items.slice(0, DECISION_CAP)).map(({ id, item }) => askBlock(id, item));
   if (o.verdict) {
     blocks.push({
@@ -107,7 +133,7 @@ export function buildDecisionModal(ctx: ModalContext, o: DecisionModalOpts): Rec
     label: plain(o.notesLabel, BK_LIMIT.inputLabel),
     element: { type: 'plain_text_input', action_id: 'notes', multiline: true, placeholder: plain(o.notesPlaceholder) },
   });
-  return view(ctx, o.title ?? 'Requirement review', o.submitText, blocks);
+  return blocks;
 }
 
 // The filing modal (the maintainer choosing a DRI).
@@ -116,6 +142,11 @@ export function buildDecisionModal(ctx: ModalContext, o: DecisionModalOpts): Rec
 // valid is already guarded by the allowlist on the go side, so a missing pool must never make the button
 // do nothing.
 export function buildGoModal(ctx: ModalContext, pool: string[], picked: string | null): Record<string, unknown> {
+  return view(ctx, 'File it · create issues', '✅ File it', goBlocks(pool, picked));
+}
+
+// The filing form's input block, surface-free (see decisionBlocks).
+export function goBlocks(pool: string[], picked: string | null): Record<string, unknown>[] {
   const element = pool.length
     ? {
         type: 'static_select',
@@ -125,9 +156,7 @@ export function buildGoModal(ctx: ModalContext, pool: string[], picked: string |
         ...(picked && pool.includes(picked) ? { initial_option: option(picked, picked) } : {}),
       }
     : { type: 'plain_text_input', action_id: 'assignee', placeholder: plain('Enter a DRI short code, e.g. M') };
-  return view(ctx, 'File it · create issues', '✅ File it', [
-    { type: 'input', block_id: 'assignee', optional: true, label: plain('Assign a DRI', BK_LIMIT.inputLabel), element },
-  ]);
+  return [{ type: 'input', block_id: 'assignee', optional: true, label: plain('Assign a DRI', BK_LIMIT.inputLabel), element }];
 }
 
 function view(ctx: ModalContext, title: string, submitText: string, blocks: Record<string, unknown>[]): Record<string, unknown> {

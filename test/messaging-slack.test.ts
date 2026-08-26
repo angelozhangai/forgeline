@@ -54,7 +54,6 @@ const { slackPort, renderSlackMessage, toMrkdwn, packMsgId, unpackMsgId, OPEN_MO
 function reset(env: Record<string, string | undefined> = {}): void {
   calls.length = 0;
   respond = () => ({ ok: true, ts: '1712345678.000200', channel: 'C1' });
-  slack.__clearModalSpecsForTest();
   slackEnv = env;
 }
 // Put a single block into a minimal card and take attachment.blocks (the first one or two are always the
@@ -157,7 +156,10 @@ test('decisionList / findingList: one block per entry, with a severity prefix an
 });
 
 // -- Forms -> modals (the one genuine interaction difference from Feishu) -----
-test('decisionForm: the card keeps only a button (Slack input blocks are illegal in a message), with the context travelling on the button value', () => {
+// Input blocks are legal in a message (Slack lists the input block's surfaces as modals, messages and home
+// tabs), so the form is answerable **in the card**: one click, no modal, and — the part that used to hurt —
+// no form content held in process memory for a restart to lose.
+test('decisionForm: the questions become input blocks in the card itself, closed by a submit button carrying the context', () => {
   reset();
   const blocks = blocksOf({
     kind: 'decisionForm',
@@ -170,18 +172,44 @@ test('decisionForm: the card keeps only a button (Slack input blocks are illegal
     notesLabel: 'Additional notes',
     notesPlaceholder: 'Write something',
   });
-  assert.equal(blocks[0].type, 'context', 'first a line saying how many open questions there are');
-  const btn = (blocks[1] as { elements: { action_id: string; value: string }[] }).elements[0];
-  assert.equal(btn.action_id, OPEN_MODAL_ACTION);
-  assert.deepEqual(JSON.parse(btn.value), { action: 'confirm_submit', slug: 'refund', round: 3, kind: 'decision' });
+  const inputs = blocks.filter((b) => b.type === 'input');
+  assert.equal(inputs.length, 3, 'one per question, plus the overall verdict and the notes box');
+  assert.match((inputs[0] as { block_id: string }).block_id, /^ask_/, 'keyed the same way composeDecisionAnswer reads them back');
+  const last = blocks[blocks.length - 1] as { type: string; elements: { type: string; action_id: string; value: string }[] };
+  assert.equal(last.type, 'actions', 'the submit button closes the form');
+  assert.equal(last.elements[0].type, 'button');
+  assert.deepEqual(JSON.parse(last.elements[0].value), { action: 'confirm_submit', slug: 'refund', round: 3 });
+  assert.notEqual(last.elements[0].action_id, OPEN_MODAL_ACTION, 'nothing opens a modal any more');
 });
 
-test('goForm: also goes into a modal, with the action being go', () => {
+test('decisionForm: a short option list becomes radio buttons (all of it visible), a long one falls back to a select', () => {
+  reset();
+  const opts = (n: number) => Array.from({ length: n }, (_, i) => ({ label: `option ${i}`, recommended: i === 0, impact: 'some impact' }));
+  const form = (n: number): CardBlock => ({
+    kind: 'decisionForm',
+    slug: 'refund',
+    items: [{ ...ITEM, options: opts(n) }],
+    action: 'confirm_submit',
+    round: 1,
+    submitText: 'Submit',
+    notesLabel: 'Notes',
+    notesPlaceholder: '…',
+  });
+  const elOf = (b: CardBlock): { type: string; options: { description?: unknown }[] } =>
+    (blocksOf(b).find((x) => x.type === 'input') as { element: { type: string; options: { description?: unknown }[] } }).element;
+  const few = elOf(form(2));
+  assert.equal(few.type, 'radio_buttons');
+  assert.ok(few.options[0].description, "the option's impact goes on the radio button's second line rather than into its 75-character label");
+  assert.equal(elOf(form(8)).type, 'static_select', 'past the radio cap a wall of options becomes a dropdown');
+});
+
+test('goForm: the DRI picker is in the card too, and its submit button carries the go action', () => {
   reset();
   const blocks = blocksOf({ kind: 'goForm', slug: 'refund', pool: ['M', 'CC'], picked: 'CC' });
-  const btn = (blocks[0] as { elements: { action_id: string; value: string }[] }).elements[0];
-  assert.equal(btn.action_id, OPEN_MODAL_ACTION);
-  assert.deepEqual(JSON.parse(btn.value), { action: 'go', slug: 'refund', kind: 'go' });
+  assert.equal((blocks[0] as { type: string; block_id: string }).block_id, 'assignee');
+  const last = blocks[blocks.length - 1] as { type: string; elements: { value: string }[] };
+  assert.equal(last.type, 'actions');
+  assert.deepEqual(JSON.parse(last.elements[0].value), { action: 'go', slug: 'refund', round: 0 });
 });
 
 test('petRow: the pet\'s line goes into context; a mentionId @-mentions them (Slack\'s <@U…>)', () => {
@@ -231,7 +259,7 @@ test('parseCardAction: an ordinary button -> {action,slug,value}; operator gives
   const parsed = slackPort.parseCardAction({
     type: 'block_actions',
     user: { id: 'U42' },
-    actions: [{ action_id: 'forge_gateb_refund', value: JSON.stringify({ action: 'gateb', slug: 'refund', round: 1 }) }],
+    actions: [{ type: 'button', action_id: 'forge_gateb_refund', value: JSON.stringify({ action: 'gateb', slug: 'refund', round: 1 }) }],
   });
   assert.deepEqual(parsed, {
     type: 'card_action',
@@ -239,6 +267,43 @@ test('parseCardAction: an ordinary button -> {action,slug,value}; operator gives
     slug: 'refund',
     value: { action: 'gateb', slug: 'refund', round: 1 },
     formValues: {},
+    operatorId: 'U42',
+  });
+});
+
+// The load-bearing half of inline forms. Every interaction with an input dispatches its own block_actions
+// carrying the state so far — verified against a real workspace, where picking one radio option arrived as
+// `radio_buttons:ask_1` with the other two questions still blank. Treating that as a submission would file a
+// half-answered form the instant someone touched the first question.
+test('parseCardAction: an inline form dispatches on every selection — only the button counts as a submission', () => {
+  const state = {
+    values: {
+      ask_1: { ask_1: { type: 'radio_buttons', selected_option: { value: 'refund to balance' } } },
+      notes: { notes: { type: 'plain_text_input', value: 'ship it' } },
+    },
+  };
+  const touchingAnOption = slackPort.parseCardAction({
+    type: 'block_actions',
+    user: { id: 'U42' },
+    state,
+    actions: [{ type: 'radio_buttons', action_id: 'ask_1' }],
+  });
+  assert.equal(touchingAnOption, null, 'picking an option is not answering the form');
+
+  const pressingSubmit = slackPort.parseCardAction({
+    type: 'block_actions',
+    user: { id: 'U42' },
+    state,
+    actions: [{ type: 'button', action_id: 'forge_submit_confirm_submit', value: JSON.stringify({ action: 'confirm_submit', slug: 'refund', round: 2 }) }],
+  });
+  assert.deepEqual(pressingSubmit, {
+    type: 'card_action',
+    action: 'confirm_submit',
+    slug: 'refund',
+    value: { action: 'confirm_submit', slug: 'refund', round: 2 },
+    // The same flattener a view_submission goes through, so the core cannot tell — and never needs to —
+    // whether the answer came from a card or a modal.
+    formValues: { ask_1: 'refund to balance', notes: 'ship it' },
     operatorId: 'U42',
   });
 });
@@ -428,10 +493,11 @@ test('inbound routing: the connection\'s error / reconnected pass through to the
   assert.equal(box.reconnects, 1);
 });
 
-test('inbound routing: "open the modal" is intercepted by the adapter — the core receives nothing, and views.open really is called', async () => {
+// Nothing renders a modal-opening button any more, but cards posted before forms moved into the card are
+// still sitting in Slack with one on them. Clicking it must still do something — a button that dies on
+// upgrade is the same failure as a button that never worked.
+test('inbound routing: a modal button from an older card is still intercepted by the adapter — the core receives nothing, and views.open really is called', async () => {
   reset();
-  // First render a card with a form, so the modal content is staged in memory
-  blocksOf({ kind: 'goForm', slug: 'refund', pool: ['M', 'CC'], picked: 'CC' });
   const box = inbound();
   captured?.onEnvelope('interactive', {
     type: 'block_actions',
@@ -442,13 +508,13 @@ test('inbound routing: "open the modal" is intercepted by the adapter — the co
   assert.deepEqual(box.actions, [], 'opening a modal is adapter-internal; the core never sees it');
   assert.equal(calls[0]?.method, 'views.open');
   assert.equal(calls[0]?.body.trigger_id, 'T123');
-  const view = calls[0]?.body.view as { private_metadata: string; blocks: { element: { type: string } }[] };
-  assert.deepEqual(JSON.parse(view.private_metadata), { action: 'go', slug: 'refund', round: 0 });
-  assert.equal(view.blocks[0].element.type, 'static_select', 'the DRI pool staged at render time really is used');
+  const view = calls[0]?.body.view as { private_metadata: string; blocks: { block_id?: string; element: { type: string } }[] };
+  assert.deepEqual(JSON.parse(view.private_metadata), { action: 'go', slug: 'refund', round: 0 }, 'the context is intact, so the answer lands on the right requirement');
+  assert.equal(view.blocks[0].element.type, 'plain_text_input', 'the DRI pool was never written into that old card, so it degrades to free text rather than guessing');
 });
 
-test('opening a modal: after a daemon restart (the form content is not in memory) -> degrade to a plain-text modal, never let the button do nothing', async () => {
-  reset(); // clearing the modal staging area = simulating a restart
+test('opening a modal: an older card whose questions were never in it -> a plain-text modal, never a button that does nothing', async () => {
+  reset();
   const box = inbound();
   captured?.onEnvelope('interactive', {
     type: 'block_actions',
