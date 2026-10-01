@@ -1,3 +1,7 @@
+<p align="center">
+  <img src="assets/brand/forgeline-banner.png" alt="Forgeline — human control for AI delivery" width="640">
+</p>
+
 # Forgeline — governed AI delivery, on rails
 
 [![CI](https://github.com/angelozhangai/forgeline/actions/workflows/ci.yml/badge.svg)](https://github.com/angelozhangai/forgeline/actions/workflows/ci.yml)
