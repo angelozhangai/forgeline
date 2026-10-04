@@ -364,7 +364,7 @@ protocol: a frame that is wrong in two ways must get the same code everywhere, o
 
 | # | Check | Code |
 | --- | --- | --- |
-| 1 | A text frame of at most 65 536 UTF-8 bytes (checked before parsing); parses as a JSON object; `v` is an integer | `malformed` |
+| 1 | A text frame of at most 65 536 UTF-8 bytes, nested at most 32 deep (the envelope is depth 1) — both checked on the raw text, before parsing; parses as a JSON object; `v` is an integer | `malformed` |
 | 2 | `v` == 1 | `unsupported_version` |
 | 3 | Field set and field formats (§5.2) | `malformed` |
 | 4 | Canonicalisable (integers, ASCII keys, no lone surrogates) | `malformed` |
@@ -378,6 +378,12 @@ protocol: a frame that is wrong in two ways must get the same code everywhere, o
 Only frames that pass 6–7 reach 8–10, so those codes are facts about an authenticated sender. The receiver's
 keyring decides what "trusted" means: a device trusts only the cloud keys it pinned; a Hub trusts only the keys
 of its own device.
+
+What happens to a rejected frame **after** the handshake: `malformed` and `non_canonical` close the connection with
+4000 (the peer is broken or hostile, and nothing it sends can be trusted to be framed right). Every other code —
+`unknown_key`, `bad_signature`, `wrong_recipient`, `stale`, `replay` — drops that one frame, records it, and keeps
+the connection without replying: a replayed or misaddressed frame is evidence of something wrong in the path, not
+of the peer, and answering it helps neither a bug nor an attacker.
 
 ### 5.5 Handshake
 
@@ -409,8 +415,13 @@ Until `welcome`, the only frames either side accepts are the next handshake fram
 - **Events**: the device writes each event to a local spool before sending and deletes it on `ack`. Hooks write to
   the spool directly when the daemon is down, so nothing is lost across restarts.
 - **Jobs**: the Hub persists queued jobs in Durable Object storage and redelivers on reconnect, or 30 s after an
-  unacknowledged attempt. The device records each `job_id` in a local journal **before** acknowledging it, keeps
-  the journal for 24 h, re-acks duplicates, and re-sends the stored `result` for duplicates that already ran.
+  unacknowledged attempt. The device records each `job_id` in a local journal **before** acknowledging it, re-acks
+  duplicates, and re-sends the stored `result` for duplicates that already ran. A journal entry is kept until it is
+  both 24 h past receipt **and** past `expires_at`: receipt is the device's clock and expiry the cloud's, and keeping
+  only one of the two would leave a gap the size of the clock skew.
+- **Delivery is at least once; execution is at most once.** A job that was journaled but had not finished when the
+  device stopped is never run again: a redelivery is answered `failed` / `internal` with "the outcome is unknown; it
+  was not run again". A reply typed into a session twice is worse than one the owner has to resend.
 - **No ordering** is promised across jobs. Two replies to the same session are applied in `issued_at` order.
 
 ### 5.8 Expiry and offline devices
@@ -439,7 +450,9 @@ Until `welcome`, the only frames either side accepts are the next handshake fram
 | 4009 | Unsupported version |
 
 After 4001, 4003, 4004 and 4009 the agent does **not** reconnect in a loop: it stops, logs, and `status` / `doctor`
-say why. Anything else: reconnect with full-jitter exponential backoff, 1 s doubling to a 60 s cap, reset after a
+say why. The same goes for 4005 arriving on the agent's **current** connection: something else is connected with this
+device's key — a second daemon, or a copied key — and reconnecting would make the two replace each other forever.
+(4005 on a connection the agent has already abandoned is just the cloud tidying up, and is ignored.) Anything else: reconnect with full-jitter exponential backoff, 1 s doubling to a 60 s cap, reset after a
 connection that lasted 5 minutes.
 
 ### 5.10 Golden fixtures
@@ -455,7 +468,8 @@ when the files and the generator drift. `cloud/` and `agent/` each run their own
 
 | Limit | Value |
 | --- | --- |
-| Frame size | 64 KiB |
+| Frame size | 64 KiB (65 536 UTF-8 bytes) |
+| Nesting depth | 32, the envelope being 1 |
 | `params.text` / `prompt` | 4 000 characters (Unicode code points, as Rust's `chars()` counts them) |
 | Event `summary` | 2 500 characters (the device truncates) |
 | Pending jobs per device in the Hub | 100 |
@@ -481,6 +495,10 @@ no downgrade below what both sides support.
 | `permission.answer` | P8 | `request_id`, `decision` (`allow` / `deny`) | `actions."permission.answer"`; a request with that id is pending on this device |
 | `device.pause` | P3 | none | Always allowed. Pausing only ever reduces what a device does |
 | `keys.update` | P2 | `keys` [{`kid`, `public`}] | Signed by a currently pinned key; replaces the pinned set (rotation, §9.3) |
+
+**Gate order on the device**, after the envelope verified: `unsupported` (unknown kind) → `invalid_params` →
+`expired` → `paused` → `not_allowed` → the kind's own checks (`unknown_session`, …) → `rate_limited`. `device.pause`
+skips `paused` and `rate_limited` — pausing must always work — but not `expired`.
 
 There is deliberately **no** `device.resume` and no action that edits the policy. Unknown kinds and params that fail
 validation are rejected (`unsupported` / `invalid_params`) and reported, never executed best-effort. Text is passed
@@ -561,16 +579,21 @@ start = ["claude"]          # agents session.start may launch here
 
 What the device reports in `auth.policy` is a summary — action kinds, repo **aliases**, agents — never paths.
 
+The agent refuses to start on a config it cannot trust: a file that another user owns or that is group- or
+world-writable, an unknown key (a typo must not silently mean "off"), or a `cloud` that is not `https://` (plain
+`http://` only to a loopback address, for tests). `key_store = "keychain" | "file"` chooses where the device key lives
+on macOS (§9.1).
+
 ### 8.3 Local state
 
 `$XDG_STATE_HOME/forgeline-agent/` (default `~/.local/state/…`), directory mode 0700:
 
 | Path | Content |
 | --- | --- |
-| `trust.json` (0600) | `device_id`, `cloud`, pinned cloud keys. Written only by `enroll` and by a verified `keys.update` |
+| `trust.json` (0600) | `{device_id, cloud, keys: [{kid, public}]}`; each `kid` is checked against its key on load. Written only by `enroll` and by a verified `keys.update` |
 | `device.key` (0600, Linux) | The device's Ed25519 seed. On macOS it is in the login Keychain instead |
 | `paused` | Present = paused. Created by `pause` or by `device.pause`; removed **only** by the local `resume` |
-| `journal/`, `spool/` | Job journal (24 h), event spool (until acked) |
+| `journal/`, `spool/` | Job journal (§5.7), event spool (until acked; at most 1 000 events, oldest dropped and logged) |
 | `sessions/` | Sessions this device reported, with their working directory and last report time |
 | `agent.sock` | The local API. Peer credentials checked on every connection |
 | `log/` | What ran, why, and on whose instruction — the device's own audit trail |
@@ -591,6 +614,12 @@ accepted there.
 Generated on the device at enrolment and never leave it. Rotation (`forgeline-agent rotate-key`) sends the new public
 key signed by the old one; the cloud swaps them and retires the old kid. A lost or stolen key means revocation and a
 fresh enrolment.
+
+On macOS a Keychain item is bound to the code signature of the binary that created it. An unsigned (or ad-hoc
+signed) binary therefore triggers a Keychain prompt after every upgrade — which a launchd daemon cannot answer, so the
+agent would silently stop authenticating. Until releases are signed with a Developer ID, installs of unsigned builds
+use `key_store = "file"` (a 0600 file in the 0700 state directory, as on Linux). Signing the macOS release binaries is
+a P3 follow-up.
 
 ### 9.2 The cloud signing key
 
@@ -683,14 +712,16 @@ Restrained, as everywhere in this repo; each one is listed with its reason, and 
 | Crate | Why |
 | --- | --- |
 | `tokio` | Async runtime: WebSocket, timers, child processes, the Unix socket (whose `peer_cred()` covers the credential check with no extra crate) |
-| `tokio-tungstenite` + `rustls` | WebSocket client over TLS without OpenSSL, so cross-compiling needs no C toolchain for the target |
-| `serde`, `serde_json` | Frames and hook JSON |
+| `tokio-tungstenite` + `futures-util` + `rustls` (ring provider) + `webpki-roots` | WebSocket client over TLS without OpenSSL or aws-lc, so cross-compiling needs no C toolchain or cmake for the target |
+| `serde`, `serde_json` | Hook JSON, config, state files |
 | `ed25519-dalek`, `sha2`, `getrandom` | Signatures, key ids, nonces |
-| `base64` | base64url |
 | `toml` | The config file |
+| `libc` | File ownership and modes for the config and state checks |
 | `security-framework` (macOS only) | Keychain storage of the device key |
 
-Canonical JSON and ULIDs are implemented locally (a few dozen lines each, pinned by the fixtures) rather than pulled in.
+Canonical JSON, strict base64url, ULIDs, and the reader that parses wire frames are implemented locally, pinned by the
+fixtures. The frame reader is local on purpose: it must behave exactly like `JSON.parse` (lone surrogates, huge
+exponents, depth) or the check order of §5.4 diverges from the cloud's.
 The MSRV is pinned in `Cargo.toml` (`rust-version`) and tested in CI.
 
 ### 11.2 `cloud/` dependencies

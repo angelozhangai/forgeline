@@ -57,6 +57,8 @@ test('the order of the checks is pinned: a two-fault frame exists for every adja
   const have = new Set(frameFiles.filter((f) => f.startsWith('order-')).map((f) => f.replace(/^order-|\.json$/g, '')));
   for (let i = 0; i + 1 < order.length - 1; i++) assert.ok(have.has(`${order[i]}-before-${order[i + 1]}`), `missing order-${order[i]}-before-${order[i + 1]}`);
   assert.ok(have.has('stale-before-replay'));
+  // Step 1's own pre-parse limits come before even the version.
+  assert.ok(have.has('depth-before-version'));
 });
 
 for (const file of frameFiles) {

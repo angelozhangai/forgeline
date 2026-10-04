@@ -31,6 +31,29 @@ export const DOMAIN = 'forgeline-wire/1\n';
 export const WINDOW_MS = 300_000;
 // Measured in UTF-8 bytes of the raw text frame, before parsing: nothing larger is even looked at.
 export const MAX_FRAME_BYTES = 65_536;
+// Nesting depth of objects and arrays, the envelope itself being depth 1. Checked on the raw text before parsing,
+// like the size: recursive parsers and canonicalisers (Rust's in particular) abort the whole process on stack
+// overflow, and a 64 KiB frame can nest 32 000 deep. Without a shared bound, each implementation would pick its
+// own, and a deep frame would be `malformed` on one side and `unsupported_version` on the other.
+export const MAX_DEPTH = 32;
+
+// The deepest nesting in a JSON text, counting only brackets outside strings. It does not validate anything else:
+// a text that is not JSON at all is the parser's to refuse.
+export function nestingDepth(raw: string): number {
+  let depth = 0;
+  let max = 0;
+  let inString = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw[i];
+    if (inString) {
+      if (c === '\\') i++;
+      else if (c === '"') inString = false;
+    } else if (c === '"') inString = true;
+    else if (c === '{' || c === '[') max = Math.max(max, ++depth);
+    else if (c === '}' || c === ']') depth--;
+  }
+  return max;
+}
 export const VERSION = 1;
 
 // Rejection codes, in the order the checks run. The order is part of the protocol: a frame that is wrong in two
@@ -150,6 +173,7 @@ function reject(code: RejectCode, why: string): Verdict {
 // Verify one raw text frame. The checks run in REJECT_CODES order; see that list for why the order matters.
 export function verifyFrame(raw: string, ctx: VerifyContext): Verdict {
   if (Buffer.byteLength(raw, 'utf8') > MAX_FRAME_BYTES) return reject('malformed', 'frame larger than MAX_FRAME_BYTES');
+  if (nestingDepth(raw) > MAX_DEPTH) return reject('malformed', 'nested deeper than MAX_DEPTH');
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
@@ -424,7 +448,16 @@ export function buildFixtures(): { keys: string; canonical: string; frames: Map<
   const oversized = seal(env('job:oversized', -1_000, { type: 'job', from: 'cloud', to: DEVICE, kid: k.cloud.kid, body: { ...jobBody, params: { ...jobBody.params, text: 'x'.repeat(MAX_FRAME_BYTES) } } }), k.cloud);
   add('reject-oversized', toDevice({ about: 'A correctly signed frame over the size limit. Size is checked before parsing.', frames: [frame(oversized)], expect: ['malformed'] }));
 
+  // Depth: envelope (1) > body (2) > params (3) > n nested arrays. 29 arrays is exactly the limit, 30 is one over.
+  const nested = (n: number): unknown => (n === 0 ? 'x' : [nested(n - 1)]);
+  const atLimit = seal(env('job:depth-32', -1_000, { type: 'job', from: 'cloud', to: DEVICE, kid: k.cloud.kid, body: { ...jobBody, params: { ...jobBody.params, deep: nested(MAX_DEPTH - 3) } } }), k.cloud);
+  add('accept-depth-limit', toDevice({ about: 'Nested exactly MAX_DEPTH deep, counting the envelope as 1: accepted (whatever the body validation later says about the extra param).', frames: [frame(atLimit)], expect: ['ok'] }));
+  const tooDeep = seal(env('job:depth-33', -1_000, { type: 'job', from: 'cloud', to: DEVICE, kid: k.cloud.kid, body: { ...jobBody, params: { ...jobBody.params, deep: nested(MAX_DEPTH - 2) } } }), k.cloud);
+  add('reject-too-deep', toDevice({ about: 'A correctly signed frame nested one level deeper than MAX_DEPTH. Depth is checked on the raw text, before parsing.', frames: [frame(tooDeep)], expect: ['malformed'] }));
+
   // ---- Two faults at once: these pin the *order* of the checks (section 5.4), which single-fault frames cannot ----
+  const deepV2 = seal({ ...env('job:depth-v2', -1_000, { type: 'job', from: 'cloud', to: DEVICE, kid: k.cloud.kid, body: { ...jobBody, params: { ...jobBody.params, deep: nested(MAX_DEPTH) } } }), v: 2 }, k.cloud);
+  add('order-depth-before-version', toDevice({ about: 'Too deep and an unsupported version: depth is part of step 1, so it wins.', frames: [frame(deepV2)], expect: ['malformed'] }));
   add('order-version-before-fields', toDevice({ about: 'Unsupported version and an unknown field: the version is checked first.', frames: [canonicalize({ ...v2, x: 1 })], expect: ['unsupported_version'] }));
   add('order-fields-before-canonical', toDevice({ about: 'Missing kid and not canonical: fields are checked first.', frames: [JSON.stringify(noKid, null, 1)], expect: ['malformed'] }));
   add('order-canonical-before-key', toDevice({ about: 'Not canonical and an unknown key: canonical text is checked first.', frames: [JSON.stringify(strangerJob, null, 1)], expect: ['non_canonical'] }));
