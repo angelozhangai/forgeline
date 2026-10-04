@@ -1,0 +1,26 @@
+{
+  "about": "TEST KEYS ONLY. The secret keys of RFC 8032 section 7.1 (TEST 1-3), which are public. Never use them outside tests.",
+  "keys": [
+    {
+      "name": "cloud",
+      "owner": "cloud",
+      "seed_hex": "9d61b19deffd5a60ba844af492ec2cc44449c5697b326919703bac031cae7f60",
+      "public": "11qYAYKxCrfVS_7TyWQHOg7hcvPapiMlrwIaaPcHURo",
+      "kid": "If4x36FUomFia_hU"
+    },
+    {
+      "name": "device",
+      "owner": "dev_01M3ZGYZ00MZDA2E2C003XDNC6",
+      "seed_hex": "4ccd089b28ff96da9db6c346ec114e0f5b8a319f35aba624da8cf6ed4fb8a6fb",
+      "public": "PUAXw-hDiVqStwqnTRt-vJyYLM8uxJaMwM1V8Sr0Zgw",
+      "kid": "OfcT0KZEJT8EUpQh"
+    },
+    {
+      "name": "attacker",
+      "owner": null,
+      "seed_hex": "c5aa8df43f9f837bedb7442f31dcb7b166d38535076f094b85ce3a2e0b4458f7",
+      "public": "_FHNjmIYoaONpH7QAjDwWAgW7RO6MwOsXeuRFUiQgCU",
+      "kid": "2sBz4BI73qWd2bO9"
+    }
+  ]
+}

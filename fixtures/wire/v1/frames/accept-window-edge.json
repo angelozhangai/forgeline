@@ -1,0 +1,14 @@
+{
+  "receiver": "dev_01M3ZGYZ00MZDA2E2C003XDNC6",
+  "now": 1791072000000,
+  "trust": [
+    "If4x36FUomFia_hU"
+  ],
+  "about": "Exactly at the edge of the window: the bound is inclusive.",
+  "frames": [
+    "{\"body\":{\"attempt\":1,\"expires_at\":1791072880000,\"issued_at\":1791071980000,\"job_id\":\"01M423B2F0ZQ7WE38ED5J4MYAE\",\"kind\":\"session.reply\",\"origin\":{\"provider\":\"slack\",\"ref\":\"slack:T00000000:D00000000:1791071980.000100\"},\"params\":{\"agent\":\"claude\",\"session\":\"6f1c2a9e-4b7d-4e2a-9c31-0d5e8f7a1b24\",\"text\":\"Looks good \u2014 now run the full suite and open the PR.\"}},\"from\":\"cloud\",\"id\":\"01M4232H10Q6QV72EH86YJ91P7\",\"kid\":\"If4x36FUomFia_hU\",\"sig\":\"A75T1_YG6B9TTjaw-M8hNkB0-hsuFTTBgsPrh9dzRXDr0g3oPQ9vES3DrQcgNumcphqEkInANoYKt9W2HnR0Bg\",\"to\":\"dev_01M3ZGYZ00MZDA2E2C003XDNC6\",\"ts\":1791071700000,\"type\":\"job\",\"v\":1}"
+  ],
+  "expect": [
+    "ok"
+  ]
+}

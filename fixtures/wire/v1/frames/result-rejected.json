@@ -1,0 +1,14 @@
+{
+  "receiver": "cloud",
+  "now": 1791072000000,
+  "trust": [
+    "OfcT0KZEJT8EUpQh"
+  ],
+  "about": "The device refused the job by its own local policy, and says why in words the owner will read.",
+  "frames": [
+    "{\"body\":{\"code\":\"unknown_session\",\"job_id\":\"01M423B2F0ZQ7WE38ED5J4MYAE\",\"message\":\"This device has not reported that session in the last 12 hours, so it will not write into it.\",\"status\":\"rejected\"},\"from\":\"dev_01M3ZGYZ00MZDA2E2C003XDNC6\",\"id\":\"01M423BNKGRAV2S5NWSDHSY3K2\",\"kid\":\"OfcT0KZEJT8EUpQh\",\"re\":\"01M423BN0RBT69J0H0FBXEPW90\",\"sig\":\"rBnazyI40rLfu2t8WAR9Ex53WfJqFuDCWXfXV5WIHGEqa9j6wi0Cd-xkm_Ivw2e_1Ad-wPrCcZyt5_XZKSFwBw\",\"to\":\"cloud\",\"ts\":1791071999600,\"type\":\"result\",\"v\":1}"
+  ],
+  "expect": [
+    "ok"
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "receiver": "dev_01M3ZGYZ00MZDA2E2C003XDNC6",
+  "now": 1791072000000,
+  "trust": [
+    "If4x36FUomFia_hU"
+  ],
+  "about": "A protocol-level error, signed like everything else, sent just before the cloud closes the socket.",
+  "frames": [
+    "{\"body\":{\"code\":\"revoked\",\"message\":\"This device was revoked; enrol it again to reconnect.\"},\"from\":\"cloud\",\"id\":\"01M423BNSRS80FSKXM12C9XQE4\",\"kid\":\"If4x36FUomFia_hU\",\"re\":\"01M423BK5CQQT9RF1RG882ZG0Q\",\"sig\":\"IJm35IKYqXjGH1YIwcinPM3WiGDBoTfV5jmMCUI8fnu4GSpgRLtF6IKh9ZRvgdrEv2vLB33ZLxZok5G_yjAiAA\",\"to\":\"dev_01M3ZGYZ00MZDA2E2C003XDNC6\",\"ts\":1791071999800,\"type\":\"error\",\"v\":1}"
+  ],
+  "expect": [
+    "ok"
+  ]
+}

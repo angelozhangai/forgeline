@@ -1,0 +1,14 @@
+{
+  "receiver": "dev_01M3ZGYZ00MZDA2E2C003XDNC6",
+  "now": 1791072000000,
+  "trust": [
+    "If4x36FUomFia_hU"
+  ],
+  "about": "The cloud speaks first: a fresh nonce, signed with its pinned key, listing the versions it accepts.",
+  "frames": [
+    "{\"body\":{\"nonce\":\"BDeVjTmYKTFQeVUEq3umENiP5ALZyW4YRXJDXIRgDc8\",\"versions\":[1]},\"from\":\"cloud\",\"id\":\"01M423BK285Q80QNVY08HCXP42\",\"kid\":\"If4x36FUomFia_hU\",\"sig\":\"idG7pClXrMtAF6SJ1Ew1uhyWloG9XD1PUJTBSkBN4lipshkADreSjCnkOciU08Pn3tQWFE1BMJRl7NynAh08Cw\",\"to\":\"dev_01M3ZGYZ00MZDA2E2C003XDNC6\",\"ts\":1791071997000,\"type\":\"challenge\",\"v\":1}"
+  ],
+  "expect": [
+    "ok"
+  ]
+}

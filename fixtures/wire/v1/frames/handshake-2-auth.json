@@ -1,0 +1,14 @@
+{
+  "receiver": "cloud",
+  "now": 1791072000000,
+  "trust": [
+    "OfcT0KZEJT8EUpQh"
+  ],
+  "about": "The device answers: it signs the cloud's nonce (proof of its key, bound to this connection), adds its own, and reports what its local policy allows.",
+  "frames": [
+    "{\"body\":{\"agent\":{\"arch\":\"aarch64\",\"os\":\"macos\",\"version\":\"0.1.0\"},\"capabilities\":[\"session.reply\",\"device.pause\"],\"challenge\":\"BDeVjTmYKTFQeVUEq3umENiP5ALZyW4YRXJDXIRgDc8\",\"nonce\":\"JDm4SLiVKYBu2SRa5V_SH0M4cI2ojpeMUDfwmGMwbEI\",\"policy\":{\"actions\":[\"session.reply\"],\"agents\":[\"claude\",\"codex\"],\"repos\":[\"forgeline\"]},\"version\":1},\"from\":\"dev_01M3ZGYZ00MZDA2E2C003XDNC6\",\"id\":\"01M423BK5CQQT9RF1RG882ZG0Q\",\"kid\":\"OfcT0KZEJT8EUpQh\",\"re\":\"01M423BK285Q80QNVY08HCXP42\",\"sig\":\"ULZQDP9EnJR5S0-uCxcrW71e1xj7qv4L1pkQ0QgQG-CKzedjRAa1tF1SFVjQZVKuBncZonJ7rIeUXME56BR4Cw\",\"to\":\"cloud\",\"ts\":1791071997100,\"type\":\"auth\",\"v\":1}"
+  ],
+  "expect": [
+    "ok"
+  ]
+}
