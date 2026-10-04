@@ -1,0 +1,120 @@
+name: agent-release
+
+# Release forgeline-agent on a tag `agent-v<version>` (docs/cloud-agent.md, section 11.4): four binaries and a
+# SHA256SUMS file on a GitHub release. Downstream installers download, verify the checksum, then install.
+#
+# Every target is built on a runner of its own OS and architecture, except darwin-x64, which an arm64 Mac builds
+# (Apple's toolchain targets both). That is what keeps this free of cross C toolchains: ring, the TLS crypto
+# provider, compiles some C and assembly for the target.
+#
+# Linux binaries are static (musl), so they run on any distribution regardless of its glibc.
+on:
+  push:
+    tags: ['agent-v*']
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # Same toolchain as agent.yml.
+  RUST_TOOLCHAIN: '1.99.0'
+
+jobs:
+  build:
+    name: build (${{ matrix.name }})
+    strategy:
+      fail-fast: true
+      matrix:
+        include:
+          - { name: darwin-arm64, os: macos-latest, target: aarch64-apple-darwin }
+          - { name: darwin-x64, os: macos-latest, target: x86_64-apple-darwin }
+          - { name: linux-x64, os: ubuntu-24.04, target: x86_64-unknown-linux-musl }
+          - { name: linux-arm64, os: ubuntu-24.04-arm, target: aarch64-unknown-linux-musl }
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 30
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: The tag names the version in Cargo.toml
+        run: |
+          version="$(sed -n 's/^version = "\(.*\)"$/\1/p' Cargo.toml | head -1)"
+          if [ "$GITHUB_REF_NAME" != "agent-v$version" ]; then
+            echo "tag $GITHUB_REF_NAME does not match agent/Cargo.toml version $version (expected agent-v$version)" >&2
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          targets: ${{ matrix.target }}
+
+      - name: musl C compiler (for ring)
+        if: contains(matrix.target, 'musl')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+
+      - name: Build
+        run: cargo build --release --locked --target ${{ matrix.target }}
+        env:
+          # musl-gcc from musl-tools targets the runner's own architecture, which is the target here.
+          CC_x86_64_unknown_linux_musl: musl-gcc
+          CC_aarch64_unknown_linux_musl: musl-gcc
+
+      - name: Check the binary
+        run: |
+          bin="target/${{ matrix.target }}/release/forgeline-agent"
+          file "$bin"
+          case "${{ matrix.target }}" in
+            x86_64-apple-darwin) file "$bin" | grep -q 'x86_64' ;;
+            *-linux-musl) file "$bin" | grep -Eq 'statically linked|static-pie linked'; "$bin" version ;;
+            *) "$bin" version ;;
+          esac
+
+      - name: Stage
+        run: |
+          mkdir -p ../dist
+          cp "target/${{ matrix.target }}/release/forgeline-agent" "../dist/forgeline-agent-${{ matrix.name }}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: forgeline-agent-${{ matrix.name }}
+          path: dist/forgeline-agent-${{ matrix.name }}
+          if-no-files-found: error
+
+  publish:
+    name: publish
+    needs: build
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          pattern: forgeline-agent-*
+          path: dist
+          merge-multiple: true
+
+      - name: Checksums
+        working-directory: dist
+        run: |
+          ls -l
+          test "$(ls forgeline-agent-* | wc -l)" -eq 4
+          sha256sum forgeline-agent-* > SHA256SUMS
+          cat SHA256SUMS
+
+      - name: Release
+        working-directory: dist
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          version="${GITHUB_REF_NAME#agent-v}"
+          gh release create "$GITHUB_REF_NAME" --verify-tag --title "forgeline-agent $version" \
+            --notes "forgeline-agent $version. Verify before installing: \`shasum -a 256 --ignore-missing -c SHA256SUMS\`. See agent/README.md." \
+            forgeline-agent-* SHA256SUMS

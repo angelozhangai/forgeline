@@ -1,6 +1,8 @@
 # Dependencies, build output and runtime artefacts
 node_modules/
 dist/
+# forgeline-agent's cargo build output (agent/Cargo.lock *is* committed: the binary's dependencies are reviewed).
+agent/target/
 
 # State and logs, which hold raw PRD text and LLM transcripts -- never committed
 state/
