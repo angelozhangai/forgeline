@@ -62,7 +62,16 @@ impl Env {
             .stderr(Stdio::piped())
             .spawn()
             .unwrap();
-        child.stdin.take().unwrap().write_all(stdin).unwrap();
+        // A hook may exit without reading all of stdin (an unknown agent, a payload it does not need), and that is
+        // within its contract. Writing to a pipe whose reader has gone is then EPIPE: a race in this harness, not a
+        // failure of the hook -- whose exit code and silence are what the callers assert.
+        if let Err(e) = child.stdin.take().unwrap().write_all(stdin) {
+            assert_eq!(
+                e.kind(),
+                std::io::ErrorKind::BrokenPipe,
+                "writing the hook's stdin: {e}"
+            );
+        }
         let out = child.wait_with_output().unwrap();
         (out, started.elapsed())
     }
