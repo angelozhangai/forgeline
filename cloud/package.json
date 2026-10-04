@@ -6,7 +6,7 @@
   "description": "forgeline Cloud: the Cloudflare Worker that devices running forgeline-agent dial into (docs/cloud-agent.md)",
   "license": "Apache-2.0",
   "scripts": {
-    "typecheck": "tsc --noEmit",
+    "typecheck": "tsc --noEmit && tsc --noEmit -p test",
     "test": "vitest run",
     "build": "wrangler deploy --dry-run --env dev --outdir .wrangler/dry-run/dev && wrangler deploy --dry-run --env prod --outdir .wrangler/dry-run/prod",
     "ci": "npm run typecheck && npm test && npm run build",
