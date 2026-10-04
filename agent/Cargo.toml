@@ -1,0 +1,39 @@
+[package]
+name = "forgeline-agent"
+version = "0.1.0"
+edition = "2024"
+# The lowest toolchain this crate and its locked dependency set build on. Edition 2024 alone needs 1.85, and
+# every locked dependency declares 1.85 or lower (the MSRV-aware resolver picked them that way). CI builds on
+# exactly this version; raise it deliberately, never by accident through `cargo update`.
+rust-version = "1.85"
+license = "Apache-2.0"
+description = "The resident half of forgeline Cloud: hook entry points and a fixed set of typed actions, behind a local policy"
+repository = "https://github.com/angelozhangai/forgeline"
+publish = false
+
+# Every dependency is listed with its reason in README.md. Adding one means adding a line there.
+[dependencies]
+ed25519-dalek = "3.0.0"
+futures-util = { version = "0.3.34", default-features = false, features = ["sink", "std"] }
+getrandom = "0.4.3"
+libc = "0.2"
+# The TLS provider is chosen explicitly (ring), never by whichever provider feature happens to be enabled
+# somewhere in the graph: rustls panics at runtime when it cannot pick exactly one. aws-lc-rs (the default)
+# would also need cmake and a C toolchain per target.
+rustls = { version = "0.23.45", default-features = false, features = ["ring", "std"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+sha2 = "0.11.0"
+tokio = { version = "1.53.2", default-features = false, features = ["rt", "net", "time", "macros", "io-util", "sync"] }
+tokio-tungstenite = { version = "0.30.0", default-features = false, features = ["connect", "rustls-tls-webpki-roots"] }
+toml = { version = "1.1.6", default-features = false, features = ["parse", "serde", "std"] }
+webpki-roots = "1.0.9"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+security-framework = "3.7.0"
+
+[profile.release]
+# A resident binary on every developer machine: small and boring beats fast to build.
+lto = true
+codegen-units = 1
+strip = true

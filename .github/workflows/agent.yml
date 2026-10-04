@@ -1,0 +1,103 @@
+name: agent
+
+# forgeline-agent (agent/, Rust): formatting, lints and tests on Linux and macOS, plus a build on the declared MSRV.
+# Separate from ci.yml because the root `npm run ci` keeps its meaning -- the core -- and a Rust toolchain has no
+# business in that job (docs/cloud-agent.md, section 11.4).
+#
+# Path-filtered: it runs when the agent, the wire fixtures it is held to, or this file change. If this check is
+# ever made *required* in the branch ruleset, drop the filter first -- a required check that a filter skipped never
+# reports, and the PR waits for it forever.
+on:
+  pull_request:
+    paths:
+      - 'agent/**'
+      - 'fixtures/wire/**'
+      - '.github/workflows/agent.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'agent/**'
+      - 'fixtures/wire/**'
+      - '.github/workflows/agent.yml'
+
+concurrency:
+  group: agent-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  # The toolchain developers use. Pinned, not `stable`: a new stable release can add a clippy lint, and with
+  # -D warnings that turns an untouched branch red overnight. Bump it deliberately, in its own PR.
+  RUST_TOOLCHAIN: '1.99.0'
+  # Must equal `rust-version` in agent/Cargo.toml; the msrv job checks that it does.
+  RUST_MSRV: '1.85'
+
+jobs:
+  test:
+    name: agent (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest]
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@v7
+
+      # Third-party action, so pinned to a commit (master as of 2026-10-01) rather than a moving ref.
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: ${{ env.RUST_TOOLCHAIN }}
+          components: rustfmt, clippy
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            agent/target
+          key: agent-${{ runner.os }}-${{ runner.arch }}-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('agent/Cargo.lock') }}
+
+      - run: cargo fmt --check
+      # --locked everywhere: the lockfile is committed and reviewed; CI must never quietly resolve something else.
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: cargo test --locked
+
+  msrv:
+    name: agent (MSRV build)
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    defaults:
+      run:
+        working-directory: agent
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: RUST_MSRV matches rust-version in Cargo.toml
+        run: |
+          declared="$(sed -n 's/^rust-version = "\(.*\)"$/\1/p' Cargo.toml)"
+          if [ "$declared" != "$RUST_MSRV" ]; then
+            echo "agent/Cargo.toml declares rust-version $declared but this workflow builds on $RUST_MSRV" >&2
+            exit 1
+          fi
+
+      - uses: dtolnay/rust-toolchain@7e38f4b43b4db5c8dd498af069a4f6196df1d067
+        with:
+          toolchain: ${{ env.RUST_MSRV }}
+
+      - uses: actions/cache@v6
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            agent/target
+          key: agent-msrv-${{ runner.os }}-${{ env.RUST_MSRV }}-${{ hashFiles('agent/Cargo.lock') }}
+
+      # Tests and all; a dependency that quietly needs a newer compiler fails here, not on a user's machine.
+      - run: cargo build --locked --all-targets
