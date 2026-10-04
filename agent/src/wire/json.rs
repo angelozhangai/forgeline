@@ -10,19 +10,20 @@
 //! This reader therefore models `JSON.parse` exactly: numbers are IEEE doubles (parsed with correct rounding,
 //! as JavaScript does), strings are sequences of UTF-16 code units (so lone surrogates survive parsing), a
 //! duplicated key keeps its last value, and object keys sort by UTF-16 code units, which is what
-//! `Array.prototype.sort` does. The one deliberate difference is [`MAX_DEPTH`]: see its comment.
+//! `Array.prototype.sort` does. Nesting depth is bounded by the protocol itself ([`MAX_DEPTH`]).
 //!
 //! The canonical form is RFC 8785 restricted as the protocol says: safe integers only, printable-ASCII keys,
 //! strings escaped exactly as `JSON.stringify` escapes them, lone surrogates refused.
 
 use std::collections::BTreeMap;
 
-/// Deepest nesting the reader accepts. `JSON.parse` has no limit short of the JavaScript stack, but a Rust stack
-/// overflow is an abort, not an error, and every honest frame is at most four levels deep. A frame deeper than
-/// this is `malformed` at check 1 here; the reference would get further (a deep `"v":2` frame is
-/// `unsupported_version` there). Reported as doc feedback: the protocol should bound depth so the three
-/// implementations agree by rule rather than by stack size.
-pub const MAX_DEPTH: usize = 128;
+/// Deepest nesting a frame may have, the envelope being depth 1 (docs/cloud-agent.md section 5.4, check 1). The
+/// protocol bounds it because a Rust stack overflow is an abort, not an error -- and a bound only one implementation
+/// enforced made a deep `"v":2` frame `malformed` here and `unsupported_version` in the reference. The reference and
+/// the cloud check it on the raw text before parsing; refusing while parsing gives the same verdict, because every
+/// failure at check 1 is `malformed`. Pinned by the fixtures `accept-depth-limit`, `reject-too-deep` and
+/// `order-depth-before-version`.
+pub const MAX_DEPTH: usize = 32;
 
 /// 2^53 - 1: the largest integer a double holds exactly, and so the largest number the protocol allows.
 pub const MAX_SAFE_INTEGER: f64 = 9_007_199_254_740_991.0;
