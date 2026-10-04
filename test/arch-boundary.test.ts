@@ -14,7 +14,7 @@
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { readFileSync, readdirSync } from 'node:fs';
-import { join } from 'node:path';
+import { dirname, join, relative, resolve, sep } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
 const SRC = join(fileURLToPath(new URL('..', import.meta.url)), 'src');
@@ -243,4 +243,124 @@ test('architecture boundary: strings that are not imports -- doctor probes, docu
     },
   ]);
   assert.deepEqual(offenders, []);
+});
+
+// -- The fourth boundary, added with forgeline Cloud (docs/cloud-agent.md section 11.3) -------------------
+// cloud/ (a Cloudflare Worker) and agent/ (forgeline-agent, Rust) live in this repository but are not the core.
+// Two rules, both one-directional:
+//  * src/ never imports from cloud/ or agent/. The core must keep running, and keep its meaning, with neither
+//    present -- the Epic's "the core under src/ does not change for M1/M2" would otherwise erode one import at
+//    a time.
+//  * cloud/ imports from src/ only what is on CLOUD_MAY_IMPORT_FROM_SRC: modules that are runtime-neutral (no
+//    node: imports, no filesystem, no process -- the Worker runs on workerd) and provider-neutral. The list is a
+//    ratchet like ALLOW above: it starts empty, and every entry is a deliberate edit to the exact-contents test.
+// And one more for cloud/: it never imports tools/. tools/wire-fixtures.ts is the *reference* implementation of
+// the wire protocol, and the Worker is the second, independent one, tested against the same golden fixtures. A
+// Worker that re-exported the reference would agree with it by construction and prove nothing.
+const ROOT = fileURLToPath(new URL('..', import.meta.url));
+const CLOUD = join(ROOT, 'cloud');
+const AGENT = join(ROOT, 'agent');
+const TOOLS = join(ROOT, 'tools');
+
+// Paths relative to src/, e.g. 'messaging/model.ts'.
+const CLOUD_MAY_IMPORT_FROM_SRC: string[] = [];
+
+// Directories that are installed or generated, never source.
+const NOT_SOURCE = new Set(['node_modules', '.wrangler', 'dist', 'target']);
+
+function walkSources(dir: string): string[] {
+  const out: string[] = [];
+  let entries: import('node:fs').Dirent[];
+  try {
+    entries = readdirSync(dir, { withFileTypes: true });
+  } catch {
+    return out; // agent/ does not exist yet
+  }
+  for (const e of entries) {
+    if (NOT_SOURCE.has(e.name)) continue;
+    const abs = join(dir, e.name);
+    if (e.isDirectory()) out.push(...walkSources(abs));
+    else if (/\.(ts|mts|cts|tsx|js|mjs)$/.test(e.name)) out.push(abs);
+  }
+  return out;
+}
+
+function specifiers(content: string): string[] {
+  const specs = new Set<string>();
+  for (const re of SPEC_RES) for (const m of content.matchAll(re)) specs.add(m[1]);
+  return [...specs];
+}
+
+// Where a specifier points on disk, or null for a bare package / runtime module ('vitest', 'cloudflare:test').
+function target(fromAbs: string, spec: string): string | null {
+  if (spec.startsWith('./') || spec.startsWith('../')) return resolve(dirname(fromAbs), spec);
+  if (spec.startsWith('/')) return spec;
+  return null;
+}
+
+const inside = (abs: string, dir: string) => abs === dir || abs.startsWith(`${dir}${sep}`);
+
+function crossBoundaryOffenders(files: { abs: string; content: string }[]): string[] {
+  const out: string[] = [];
+  for (const { abs, content } of files) {
+    const from = relative(ROOT, abs);
+    for (const spec of specifiers(content)) {
+      const to = target(abs, spec);
+      if (inside(abs, SRC)) {
+        // The cloud package by name counts too: a bare 'forgeline-cloud' import resolves into cloud/ as surely as a path.
+        if ((to && (inside(to, CLOUD) || inside(to, AGENT))) || spec === 'forgeline-cloud' || spec.startsWith('forgeline-cloud/')) out.push(`${from} → ${spec}`);
+      } else if (inside(abs, CLOUD) && to) {
+        if (inside(to, TOOLS)) out.push(`${from} → ${spec}`);
+        else if (inside(to, SRC) && !CLOUD_MAY_IMPORT_FROM_SRC.includes(relative(SRC, to).split(sep).join('/'))) out.push(`${from} → ${spec}`);
+      }
+    }
+  }
+  return out;
+}
+
+const read = (abs: string) => ({ abs, content: readFileSync(abs, 'utf8') });
+
+test('architecture boundary: the scan of cloud/ is not empty, and never descends into installed or generated directories', () => {
+  const files = walkSources(CLOUD).map((f) => relative(ROOT, f));
+  assert.ok(files.some((f) => f.startsWith(`cloud${sep}src${sep}`)), 'cloud/src has no source files -- the cloud boundary checks below would pass by scanning nothing');
+  assert.deepEqual(files.filter((f) => f.split(sep).some((part) => NOT_SOURCE.has(part))), []);
+});
+
+test('architecture boundary: in the real tree, src/ never imports cloud/ or agent/, and cloud/ imports neither tools/ nor anything off its src/ allowlist', () => {
+  const offenders = crossBoundaryOffenders([...walkSources(SRC), ...walkSources(CLOUD)].map(read));
+  assert.deepEqual(
+    offenders,
+    [],
+    `these imports cross the core / cloud / agent boundary (docs/cloud-agent.md section 11.3):\n  ${offenders.join('\n  ')}`,
+  );
+});
+
+test('architecture boundary: the list of src/ modules cloud/ may import is a ratchet, and it is empty', () => {
+  assert.deepEqual(CLOUD_MAY_IMPORT_FROM_SRC, []);
+});
+
+test('architecture boundary: a core file reaching into cloud/ or agent/ is caught in every import form; strings that only mention them are not', () => {
+  const at = (rel: string) => join(SRC, rel);
+  assert.deepEqual(
+    crossBoundaryOffenders([
+      { abs: at('notify.ts'), content: `import { DeviceHub } from '../cloud/src/hub.ts';` },
+      { abs: at('daemon/listen.ts'), content: `const a = await import('../../agent/src/main.ts');` },
+      { abs: at('gates/gateA.ts'), content: `const c = require('../../cloud/src/jobs.ts');` },
+      { abs: at('index.ts'), content: `export { admit } from 'forgeline-cloud/src/admission.ts';` },
+      { abs: at('health/board.ts'), content: `const doc = 'see cloud/README.md and ../cloud/src/hub.ts'; import { x } from './cloud.ts';` },
+    ]),
+    ['src/notify.ts → ../cloud/src/hub.ts', 'src/daemon/listen.ts → ../../agent/src/main.ts', 'src/gates/gateA.ts → ../../cloud/src/jobs.ts', 'src/index.ts → forgeline-cloud/src/admission.ts'],
+  );
+});
+
+test('architecture boundary: cloud/ reaching src/ off the allowlist, or the reference implementation in tools/, is caught; fixtures and packages are not', () => {
+  const at = (rel: string) => join(CLOUD, rel);
+  assert.deepEqual(
+    crossBoundaryOffenders([
+      { abs: at('src/render.ts'), content: `import type { CardModel } from '../../src/messaging/model.ts';` },
+      { abs: at('src/wire/frame.ts'), content: `import { verifyFrame } from '../../../tools/wire-fixtures.ts';` },
+      { abs: at('test/wire.test.ts'), content: `import keys from '../../fixtures/wire/v1/keys.json'; import { env } from 'cloudflare:workers'; import { expect } from 'vitest';` },
+    ]),
+    ['cloud/src/render.ts → ../../src/messaging/model.ts', 'cloud/src/wire/frame.ts → ../../../tools/wire-fixtures.ts'],
+  );
 });

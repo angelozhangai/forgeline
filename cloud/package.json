@@ -1,0 +1,33 @@
+{
+  "name": "forgeline-cloud",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "description": "forgeline Cloud: the Cloudflare Worker that devices running forgeline-agent dial into (docs/cloud-agent.md)",
+  "license": "Apache-2.0",
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "test": "vitest run",
+    "build": "wrangler deploy --dry-run --env dev --outdir .wrangler/dry-run/dev && wrangler deploy --dry-run --env prod --outdir .wrangler/dry-run/prod",
+    "ci": "npm run typecheck && npm test && npm run build",
+    "dev": "wrangler dev --env dev",
+    "deploy:dev": "tools/deploy.sh dev",
+    "deploy:prod": "tools/deploy.sh prod"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "devDependencies": {
+    "@cloudflare/vitest-pool-workers": "^0.22.0",
+    "@cloudflare/workers-types": "^5.20261004.1",
+    "typescript": "^7.0.2",
+    "vitest": "^4.1.11",
+    "wrangler": "4.147.0"
+  },
+  "overrides": {
+    "@cloudflare/vitest-pool-workers": {
+      "wrangler": "$wrangler",
+      "miniflare": "5.20261001.0-alpha"
+    }
+  }
+}

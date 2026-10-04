@@ -20,6 +20,11 @@ config/weekly-overrides.tsv
 .DS_Store
 *.log
 
+# forgeline Cloud (cloud/): wrangler's local state and build output, and local secrets for `wrangler dev`.
+# Real secrets only ever go in with `wrangler secret put`.
+.wrangler/
+.dev.vars*
+
 # Isolated worktrees. One convention only: <repo>/.forge/worktrees/<key>, created by tools/wt.sh.
 # Local to the machine, never committed -- and ignored *before* the first tree is created, or the
 # whole checkout inside it reads as files waiting to be committed.
