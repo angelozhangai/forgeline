@@ -15,8 +15,8 @@ export const DOMAIN = 'forgeline-wire/1\n';
 export const VERSION = 1;
 // |now - ts| must be at most this (inclusive). It also bounds how long ids must stay in the replay cache.
 export const WINDOW_MS = 300_000;
-// Frame size limit (section 5.11). Not part of the verification order: a receiver checks it before it even
-// parses, because parsing is the expensive part an oversized frame would be sent to provoke.
+// Frame size limit (sections 5.4 step 1 and 5.11), in UTF-8 bytes of the raw text. Checked before parsing,
+// because parsing is the expensive part an oversized frame would be sent to provoke.
 export const MAX_FRAME_BYTES = 64 * 1024;
 
 // The rejection codes, in the order the checks run (section 5.4). The order is part of the protocol: a frame
@@ -41,7 +41,10 @@ export type Unsigned = Omit<Envelope, 'sig'>;
 const ULID_RE = /^[0-9A-HJKMNP-TV-Z]{26}$/;
 const PARTY_RE = /^(cloud|dev_[0-9A-HJKMNP-TV-Z]{26})$/;
 const KID_RE = /^[A-Za-z0-9_-]{16}$/;
-const SIG_RE = /^[A-Za-z0-9_-]{86}$/; // 64 bytes, base64url without padding
+// 64 bytes, base64url without padding: 86 characters carry 516 bits for 512, so the last character's four low bits
+// are unused and must be zero (A, Q, g or w). atob ignores those bits; Rust's base64 refuses them. Without this
+// rule the same frame would verify here and be malformed on the device.
+const SIG_RE = /^[A-Za-z0-9_-]{85}[AQgw]$/;
 const TYPE_RE = /^[a-z][a-z_.]{0,63}$/;
 const FIELDS = new Set(['v', 'type', 'id', 'ts', 'from', 'to', 'kid', 're', 'body', 'sig']);
 
@@ -107,7 +110,8 @@ export type Verdict = { ok: true; env: Envelope } | { ok: false; code: RejectCod
 const reject = (code: RejectCode, why: string): Verdict => ({ ok: false, code, why });
 
 export async function verifyFrame(raw: string, ctx: VerifyContext): Promise<Verdict> {
-  // 1. A JSON object whose `v` is an integer.
+  // 1. A text frame within the size limit that parses as a JSON object whose `v` is an integer.
+  if (new TextEncoder().encode(raw).length > MAX_FRAME_BYTES) return reject('malformed', 'frame larger than MAX_FRAME_BYTES');
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
