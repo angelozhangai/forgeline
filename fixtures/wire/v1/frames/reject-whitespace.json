@@ -1,0 +1,14 @@
+{
+  "receiver": "dev_01M3ZGYZ00MZDA2E2C003XDNC6",
+  "now": 1791072000000,
+  "trust": [
+    "If4x36FUomFia_hU"
+  ],
+  "about": "A genuine frame, pretty-printed. Valid JSON, valid signature over its parse, refused anyway: the text must be canonical.",
+  "frames": [
+    "{\n \"v\": 1,\n \"type\": \"job\",\n \"id\": \"01M423BN0RBT69J0H0FBXEPW90\",\n \"ts\": 1791071999000,\n \"from\": \"cloud\",\n \"to\": \"dev_01M3ZGYZ00MZDA2E2C003XDNC6\",\n \"kid\": \"If4x36FUomFia_hU\",\n \"body\": {\n  \"job_id\": \"01M423B2F0ZQ7WE38ED5J4MYAE\",\n  \"kind\": \"session.reply\",\n  \"attempt\": 1,\n  \"issued_at\": 1791071980000,\n  \"expires_at\": 1791072880000,\n  \"origin\": {\n   \"provider\": \"slack\",\n   \"ref\": \"slack:T00000000:D00000000:1791071980.000100\"\n  },\n  \"params\": {\n   \"agent\": \"claude\",\n   \"session\": \"6f1c2a9e-4b7d-4e2a-9c31-0d5e8f7a1b24\",\n   \"text\": \"Looks good \u2014 now run the full suite and open the PR.\"\n  }\n },\n \"sig\": \"fhmXNPAWolIJg_riQA-cZq9KffD1ns0KnoeVB_T4bZPiceMXNc994NFDQxu7hd6nmRsrmitEe2NwnBh_R_WwCg\"\n}"
+  ],
+  "expect": [
+    "non_canonical"
+  ]
+}

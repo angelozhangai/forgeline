@@ -1,0 +1,14 @@
+{
+  "receiver": "dev_01M3ZGYZ00MZDA2E2C003XDNC6",
+  "now": 1791072000000,
+  "trust": [
+    "If4x36FUomFia_hU"
+  ],
+  "about": "The cloud has stored the event; the device may drop it from its spool.",
+  "frames": [
+    "{\"body\":{\"key\":\"01M4239VD0XJPP4WMSBCKG0WJ7\"},\"from\":\"cloud\",\"id\":\"01M4239VG4WCRH66668GVF5ZD6\",\"kid\":\"If4x36FUomFia_hU\",\"re\":\"01M4239VD0Q3GZG2YQ1BG7GK3R\",\"sig\":\"q9S0C8D3utwZmbQb2oIGS47Ec55rMDpoybJ7cB4chrNpNC4HCvTdYxgBUxc4fwgcNHYm047_wiwHcm8Q9b3JAw\",\"to\":\"dev_01M3ZGYZ00MZDA2E2C003XDNC6\",\"ts\":1791071940100,\"type\":\"ack\",\"v\":1}"
+  ],
+  "expect": [
+    "ok"
+  ]
+}

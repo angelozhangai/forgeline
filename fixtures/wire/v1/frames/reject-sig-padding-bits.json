@@ -1,0 +1,14 @@
+{
+  "receiver": "dev_01M3ZGYZ00MZDA2E2C003XDNC6",
+  "now": 1791072000000,
+  "trust": [
+    "If4x36FUomFia_hU"
+  ],
+  "about": "A genuine signature whose last character sets an unused bit. Lenient base64 decoders read the same 64 bytes and the signature would verify; the rule makes every implementation refuse it.",
+  "frames": [
+    "{\"body\":{\"attempt\":1,\"expires_at\":1791072880000,\"issued_at\":1791071980000,\"job_id\":\"01M423B2F0ZQ7WE38ED5J4MYAE\",\"kind\":\"session.reply\",\"origin\":{\"provider\":\"slack\",\"ref\":\"slack:T00000000:D00000000:1791071980.000100\"},\"params\":{\"agent\":\"claude\",\"session\":\"6f1c2a9e-4b7d-4e2a-9c31-0d5e8f7a1b24\",\"text\":\"Looks good \u2014 now run the full suite and open the PR.\"}},\"from\":\"cloud\",\"id\":\"01M423BN0RBT69J0H0FBXEPW90\",\"kid\":\"If4x36FUomFia_hU\",\"sig\":\"fhmXNPAWolIJg_riQA-cZq9KffD1ns0KnoeVB_T4bZPiceMXNc994NFDQxu7hd6nmRsrmitEe2NwnBh_R_WwCh\",\"to\":\"dev_01M3ZGYZ00MZDA2E2C003XDNC6\",\"ts\":1791071999000,\"type\":\"job\",\"v\":1}"
+  ],
+  "expect": [
+    "malformed"
+  ]
+}

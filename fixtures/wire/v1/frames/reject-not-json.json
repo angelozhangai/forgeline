@@ -1,0 +1,14 @@
+{
+  "receiver": "dev_01M3ZGYZ00MZDA2E2C003XDNC6",
+  "now": 1791072000000,
+  "trust": [
+    "If4x36FUomFia_hU"
+  ],
+  "about": "Not JSON at all.",
+  "frames": [
+    "ping?"
+  ],
+  "expect": [
+    "malformed"
+  ]
+}

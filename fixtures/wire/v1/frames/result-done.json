@@ -1,0 +1,14 @@
+{
+  "receiver": "cloud",
+  "now": 1791072000000,
+  "trust": [
+    "OfcT0KZEJT8EUpQh"
+  ],
+  "about": "The job ran.",
+  "frames": [
+    "{\"body\":{\"code\":\"ok\",\"data\":{\"route\":\"wake\"},\"job_id\":\"01M423B2F0ZQ7WE38ED5J4MYAE\",\"message\":\"Woke the open session; it is running the reply now.\",\"status\":\"done\"},\"from\":\"dev_01M3ZGYZ00MZDA2E2C003XDNC6\",\"id\":\"01M423BNGCBPBF2FTRP752DK40\",\"kid\":\"OfcT0KZEJT8EUpQh\",\"re\":\"01M423BN0RBT69J0H0FBXEPW90\",\"sig\":\"ygWe7PRFs4RHKN79rwjk3vgQ2GTFpV1xoRstZzISGl7ylGdlUkPjLmbqidsix3pBgIrqHD394a8Yma-Sz0RxAQ\",\"to\":\"cloud\",\"ts\":1791071999500,\"type\":\"result\",\"v\":1}"
+  ],
+  "expect": [
+    "ok"
+  ]
+}

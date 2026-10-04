@@ -1,0 +1,60 @@
+{
+  "about": "Canonicalisation cases. Parse `input` with your JSON parser, canonicalise the result, and compare with `canonical`; where `error` is true, canonicalisation (or parsing) must fail.",
+  "cases": [
+    {
+      "about": "keys sorted, whitespace removed, nesting",
+      "input": "{ \"b\": [3, {\"z\": null, \"a\": true}], \"a\": \"x\" }",
+      "canonical": "{\"a\":\"x\",\"b\":[3,{\"a\":true,\"z\":null}]}"
+    },
+    {
+      "about": "keys are compared as strings, not numbers: \"10\" sorts before \"9\"",
+      "input": "{\"9\":0,\"10\":1,\"a_b\":2,\"aB\":3,\"A\":4}",
+      "canonical": "{\"10\":1,\"9\":0,\"A\":4,\"aB\":3,\"a_b\":2}"
+    },
+    {
+      "about": "every escaping rule at once",
+      "input": "{\"s\":\"Done \u2705 \\\"quoted\\\" back\\\\slash\\ttab\\nline\\u0001ctl\u2028sep caf\u00e9 \u4fee\u590d \ud83d\ude80\"}",
+      "canonical": "{\"s\":\"Done \u2705 \\\"quoted\\\" back\\\\slash\\ttab\\nline\\u0001ctl\u2028sep caf\u00e9 \u4fee\u590d \ud83d\ude80\"}"
+    },
+    {
+      "about": "escapes in the input are normalised: \\u0041 becomes A, \\/ becomes /",
+      "input": "{\"s\":\"\\u0041\\/\\u00e9\"}",
+      "canonical": "{\"s\":\"A/\u00e9\"}"
+    },
+    {
+      "about": "all 32 control characters",
+      "input": "{\"s\":\"\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\b\\t\\n\\u000b\\f\\r\\u000e\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f\"}",
+      "canonical": "{\"s\":\"\\u0000\\u0001\\u0002\\u0003\\u0004\\u0005\\u0006\\u0007\\b\\t\\n\\u000b\\f\\r\\u000e\\u000f\\u0010\\u0011\\u0012\\u0013\\u0014\\u0015\\u0016\\u0017\\u0018\\u0019\\u001a\\u001b\\u001c\\u001d\\u001e\\u001f\"}"
+    },
+    {
+      "about": "negative and large safe integers",
+      "input": "{\"a\":-9007199254740991,\"b\":9007199254740991,\"c\":0}",
+      "canonical": "{\"a\":-9007199254740991,\"b\":9007199254740991,\"c\":0}"
+    },
+    {
+      "about": "empty containers",
+      "input": "{\"a\":{},\"b\":[],\"c\":\"\"}",
+      "canonical": "{\"a\":{},\"b\":[],\"c\":\"\"}"
+    },
+    {
+      "about": "a fraction is refused",
+      "input": "{\"a\":1.5}",
+      "error": true
+    },
+    {
+      "about": "an integer beyond 2^53 - 1 is refused",
+      "input": "{\"a\":9007199254740992}",
+      "error": true
+    },
+    {
+      "about": "a non-ASCII key is refused",
+      "input": "{\"caf\\u00e9\":1}",
+      "error": true
+    },
+    {
+      "about": "a lone surrogate is refused",
+      "input": "{\"a\":\"\\ud800\"}",
+      "error": true
+    }
+  ]
+}

@@ -1,0 +1,14 @@
+{
+  "receiver": "dev_01M3ZGYZ00MZDA2E2C003XDNC6",
+  "now": 1791072000000,
+  "trust": [
+    "If4x36FUomFia_hU"
+  ],
+  "about": "The cloud signs the device's nonce back: now both sides have proven their keys on this connection.",
+  "frames": [
+    "{\"body\":{\"conn\":\"01M423BK8G10214XJEZKJXSX3W\",\"heartbeat_s\":30,\"jobs_enabled\":true,\"nonce\":\"JDm4SLiVKYBu2SRa5V_SH0M4cI2ojpeMUDfwmGMwbEI\"},\"from\":\"cloud\",\"id\":\"01M423BK8G506M9ARYKXWVBK72\",\"kid\":\"If4x36FUomFia_hU\",\"re\":\"01M423BK5CQQT9RF1RG882ZG0Q\",\"sig\":\"FuDA2AbKD65NpijMcONHi159rIJgPVvoosqkg6aF0pi3M0IjQi-w5jIhVd9O1tXj_RM2j8txBr1vVeYWH7aaDg\",\"to\":\"dev_01M3ZGYZ00MZDA2E2C003XDNC6\",\"ts\":1791071997200,\"type\":\"welcome\",\"v\":1}"
+  ],
+  "expect": [
+    "ok"
+  ]
+}

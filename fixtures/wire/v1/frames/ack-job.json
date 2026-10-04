@@ -1,0 +1,14 @@
+{
+  "receiver": "cloud",
+  "now": 1791072000000,
+  "trust": [
+    "OfcT0KZEJT8EUpQh"
+  ],
+  "about": "The device has persisted the job; the cloud stops redelivering it.",
+  "frames": [
+    "{\"body\":{\"key\":\"01M423B2F0ZQ7WE38ED5J4MYAE\"},\"from\":\"dev_01M3ZGYZ00MZDA2E2C003XDNC6\",\"id\":\"01M423BN3WT0HD82BRHZQF0MF8\",\"kid\":\"OfcT0KZEJT8EUpQh\",\"re\":\"01M423BN0RBT69J0H0FBXEPW90\",\"sig\":\"nZLMRNC8HMfeUD47WnMQ53QxGxIYCU_1tN7jbYt_Z3kJO6RhEZ3yWo5Ge2qTh652maayHd2H3K-zkXOB5CXjDg\",\"to\":\"cloud\",\"ts\":1791071999100,\"type\":\"ack\",\"v\":1}"
+  ],
+  "expect": [
+    "ok"
+  ]
+}

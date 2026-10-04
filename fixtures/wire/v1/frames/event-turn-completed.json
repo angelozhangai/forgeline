@@ -1,0 +1,14 @@
+{
+  "receiver": "cloud",
+  "now": 1791072000000,
+  "trust": [
+    "OfcT0KZEJT8EUpQh"
+  ],
+  "about": "A session finished a turn. The summary exercises every string-escaping rule of the canonical form.",
+  "frames": [
+    "{\"body\":{\"at\":1791071939500,\"data\":{\"agent\":\"claude\",\"duration_s\":412,\"project\":\"forgeline\",\"session\":\"6f1c2a9e-4b7d-4e2a-9c31-0d5e8f7a1b24\",\"summary\":\"Done \u2705 \\\"quoted\\\" back\\\\slash\\ttab\\nline\\u0001ctl\u2028sep caf\u00e9 \u4fee\u590d \ud83d\ude80\",\"title\":\"fix the flaky lease test\",\"turn\":3},\"event_id\":\"01M4239VD0XJPP4WMSBCKG0WJ7\",\"kind\":\"session.turn_completed\"},\"from\":\"dev_01M3ZGYZ00MZDA2E2C003XDNC6\",\"id\":\"01M4239VD0Q3GZG2YQ1BG7GK3R\",\"kid\":\"OfcT0KZEJT8EUpQh\",\"sig\":\"W2BLtCMEI5QuW_7Of5Ntg9qXEaRcANluC59mROeGqEup-lPYVIgaVrXY0g1Jfh72pfVGQoDQhTBKceO69_juBA\",\"to\":\"cloud\",\"ts\":1791071940000,\"type\":\"event\",\"v\":1}"
+  ],
+  "expect": [
+    "ok"
+  ]
+}
