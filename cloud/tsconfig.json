@@ -1,0 +1,23 @@
+{
+  // The Worker's own code, typed against the Workers runtime only. The tests have their own program
+  // (test/tsconfig.json) because vitest's types pull in @types/node, and TypeScript finds it in *any* parent
+  // node_modules -- in this repository, the root's. In one shared program that made the local typecheck see
+  // Node's types and CI (which installs cloud/ alone) not: green here, red there. Split, both machines check
+  // the same thing. Runtime use of Node APIs is caught by the tests, which run on workerd without nodejs_compat.
+  "compilerOptions": {
+    "target": "ES2024",
+    "module": "ESNext",
+    "moduleResolution": "Bundler",
+    "allowImportingTsExtensions": true,
+    "resolveJsonModule": true,
+    "noEmit": true,
+    "strict": true,
+    "skipLibCheck": true,
+    "verbatimModuleSyntax": true,
+    "isolatedModules": true,
+    "forceConsistentCasingInFileNames": true,
+    "lib": ["ES2024"],
+    "types": ["@cloudflare/workers-types"]
+  },
+  "include": ["src/**/*.ts"]
+}

@@ -1,0 +1,9 @@
+{
+  // The tests and the vitest config: the Worker's settings plus the cloudflare:test module. A separate program
+  // from the Worker's (see ../tsconfig.json for why).
+  "extends": "../tsconfig.json",
+  "compilerOptions": {
+    "types": ["@cloudflare/workers-types", "@cloudflare/vitest-pool-workers/types"]
+  },
+  "include": ["**/*.ts", "../src/**/*.ts", "../vitest.config.ts"]
+}

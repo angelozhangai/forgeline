@@ -1,0 +1,59 @@
+// forgeline Cloud -- the Worker that devices dial into (docs/cloud-agent.md).
+//
+// This repository is public. Nothing in this file may identify a real deployment: no `account_id`, no
+// `database_id`, no `routes` / custom domains, no workspace names, no emails, and no secrets. Each of those
+// arrives at deploy time instead (cloud/README.md, "Deploying"):
+//  * the account comes from CLOUDFLARE_ACCOUNT_ID, and tools/deploy.sh refuses to run without it -- so a
+//    deploy can never fall through to "whichever account the login happens to pick" (D8: a dedicated
+//    account, never inside a product's infrastructure);
+//  * D1 databases are found by `database_name` -- wrangler resolves the id from the account at deploy time;
+//  * secrets go in with `wrangler secret put`, never in `vars`.
+// test/config.test.ts reads this file and fails if any of those keys appears, because the failure mode is
+// silent: `wrangler d1 create` and first-deploy provisioning both offer to write the new id back here.
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "forgeline-cloud",
+  "main": "src/index.ts",
+  // Pinned, and bumped deliberately: the date selects runtime behaviour, so moving it is a code change.
+  // It must not be newer than the workerd the tests run on (package-lock.json), or the tests would exercise
+  // a runtime the deploy does not get.
+  "compatibility_date": "2026-09-30",
+  // No nodejs_compat, on purpose: the Worker uses web APIs only (WebCrypto Ed25519, fetch). Turning it on
+  // would make it easy to pull in Node-only code that nothing else in the design needs.
+  "compatibility_flags": [],
+  "observability": { "enabled": true },
+  // No usage telemetry from wrangler runs in this directory (deploys, dry runs, CI).
+  "send_metrics": false,
+  // Durable Object class migrations are top-level so every environment applies the same history.
+  "migrations": [{ "tag": "v1", "new_sqlite_classes": ["DeviceHub"] }],
+  // The top level is not a deployable environment: it has no bindings and no FORGELINE_ENV, so a bare
+  // `wrangler deploy` (without --env) produces a Worker that refuses every connection. Always pass --env.
+  "workers_dev": false,
+  "env": {
+    "dev": {
+      "workers_dev": true,
+      "preview_urls": false,
+      "vars": {
+        // The only value under which unauthenticated device connections are accepted (src/admission.ts),
+        // until P2 (#51) replaces that path with the real handshake.
+        "FORGELINE_ENV": "dev",
+        // Kill switch (docs/cloud-agent.md section 10.3). Anything but the exact string "true" disables jobs.
+        "FORGELINE_JOBS_ENABLED": "true"
+      },
+      "durable_objects": { "bindings": [{ "name": "DEVICE_HUB", "class_name": "DeviceHub" }] },
+      "d1_databases": [{ "binding": "DB", "database_name": "forgeline-dev", "migrations_dir": "migrations" }]
+    },
+    "prod": {
+      "workers_dev": true,
+      "preview_urls": false,
+      "vars": {
+        "FORGELINE_ENV": "prod",
+        // Off until prod has something to run: P1 has no authenticated connection path, so no device
+        // could receive a job anyway. Turning it on is a deliberate edit, not a default.
+        "FORGELINE_JOBS_ENABLED": "false"
+      },
+      "durable_objects": { "bindings": [{ "name": "DEVICE_HUB", "class_name": "DeviceHub" }] },
+      "d1_databases": [{ "binding": "DB", "database_name": "forgeline-prod", "migrations_dir": "migrations" }]
+    }
+  }
+}

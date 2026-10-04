@@ -1,0 +1,52 @@
+name: cloud
+
+# forgeline Cloud (cloud/): typecheck, the tests on workerd, and a dry-run build of both environments.
+# A workflow of its own, not a job in ci.yml: cloud/ has its own package.json and lockfile, and keeping the
+# workflows apart keeps the root `lint + typecheck + test` check meaning exactly what it meant before.
+#
+# No path filter, on purpose. cloud/ also depends on fixtures/wire/ (the protocol contract it is tested
+# against), and a check that skips itself on unrelated paths never reports -- which blocks the merge the day it
+# becomes a required check.
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+concurrency:
+  group: cloud-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  cloud:
+    name: cloud (typecheck + test on workerd)
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    defaults:
+      run:
+        working-directory: cloud
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          # The same runtime as ci.yml.
+          node-version: '26'
+          cache: npm
+          cache-dependency-path: cloud/package-lock.json
+
+      - run: npm ci
+
+      - run: npm run typecheck
+
+      # vitest inside workerd (@cloudflare/vitest-pool-workers), once per environment of wrangler.jsonc. The
+      # wire tests run every case in ../fixtures/wire/v1 -- the second implementation of the protocol checked
+      # against the same files as the reference in the root suite.
+      - run: npm test
+
+      # Bundles the Worker for dev and prod exactly as a deploy would, with no credentials and no upload: catches
+      # a wrangler.jsonc or bundling error here instead of on deploy day.
+      - run: npm run build
