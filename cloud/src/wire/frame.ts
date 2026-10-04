@@ -18,6 +18,27 @@ export const WINDOW_MS = 300_000;
 // Frame size limit (sections 5.4 step 1 and 5.11), in UTF-8 bytes of the raw text. Checked before parsing,
 // because parsing is the expensive part an oversized frame would be sent to provoke.
 export const MAX_FRAME_BYTES = 64 * 1024;
+// Nesting depth of objects and arrays, the envelope being depth 1 (section 5.4 step 1). Checked on the raw text
+// before parsing, like the size: the device's parser aborts the process on deep recursion, so every implementation
+// must refuse at the same depth or one frame gets different verdicts on the two sides.
+export const MAX_DEPTH = 32;
+
+// The deepest nesting in a JSON text, counting only brackets outside strings. Nothing else is validated here.
+export function nestingDepth(raw: string): number {
+  let depth = 0;
+  let max = 0;
+  let inString = false;
+  for (let i = 0; i < raw.length; i++) {
+    const c = raw.charCodeAt(i);
+    if (inString) {
+      if (c === 0x5c) i++; // backslash: skip the escaped character
+      else if (c === 0x22) inString = false;
+    } else if (c === 0x22) inString = true;
+    else if (c === 0x7b || c === 0x5b) max = Math.max(max, ++depth);
+    else if (c === 0x7d || c === 0x5d) depth--;
+  }
+  return max;
+}
 
 // The rejection codes, in the order the checks run (section 5.4). The order is part of the protocol: a frame
 // that is wrong in two ways must get the same code from every implementation, or the audit trails disagree.
@@ -112,6 +133,7 @@ const reject = (code: RejectCode, why: string): Verdict => ({ ok: false, code, w
 export async function verifyFrame(raw: string, ctx: VerifyContext): Promise<Verdict> {
   // 1. A text frame within the size limit that parses as a JSON object whose `v` is an integer.
   if (new TextEncoder().encode(raw).length > MAX_FRAME_BYTES) return reject('malformed', 'frame larger than MAX_FRAME_BYTES');
+  if (nestingDepth(raw) > MAX_DEPTH) return reject('malformed', 'nested deeper than MAX_DEPTH');
   let parsed: unknown;
   try {
     parsed = JSON.parse(raw);
